@@ -64,7 +64,7 @@ HINT:  Call agent_gate.propose(sql, intent), then agent_gate.dry_run(proposal) o
 | `dry_run(proposal)` | runs it inside a subtransaction and rolls it back: rows touched, before/after of every row of a write, whether bound assertions would still hold |
 | `commit(proposal)` | verifies again, runs it and keeps it if every guard agrees. A proposal is committed at most once |
 | `acts(max_acts)` | what this agent proposed and did, with every execution and why anything was refused |
-| `whoami()` | which agent this session is, and whether the gate is enforced in it |
+| `whoami()` | which agent this session is, whether the gate is enforced in it, and how durable attempts are |
 
 ## Verification
 
@@ -87,7 +87,7 @@ refused outright.
 ## Execution
 
 * Runs with the **agent's own privileges**. The gate adds verification; `GRANT`
-  is still the authorization. Declaring is not authorizing.
+  is still the authorization.
 * Inside a subtransaction, decided **after** it runs:
   * a write touching more rows than the agent's `max_rows` is undone;
   * deferred constraints are fired **inside the gate** (`SET CONSTRAINTS ALL
@@ -112,10 +112,28 @@ and first ask the gate whether the caller is the gate's own code -- a flag no
 SQL can set, kept down while the agent's own SQL runs. A proposal cannot forge
 its history; an agent calling those functions by name is refused by the hook.
 
+### How durable the record is
+
+`agent_gate.attempt_durability` (superuser-only):
+
+* **A change the gate keeps is always committed with the durability the server
+  is configured with.** That flush also carries the record of the proposal that
+  led to it, which sits earlier in the WAL: no change exists on disk without
+  its proposal and its execution next to it.
+* **`fast` (default):** the record of an *attempt* -- a proposal, a dry run, a
+  read, a refusal, anything that changed no data -- rides on an asynchronous
+  commit. A server crash inside the WAL writer's window can lose the record of
+  an attempt that changed nothing. (pgaudit's log is not fsynced either.)
+* **`durable`:** every record pays its own flush.
+
+Never relaxed in a transaction that had already written something before the
+first verb ran: those writes are not the gate's to relax.
+
 ## Setup
 
 PostgreSQL **18 or later** (`dry_run` uses `RETURNING old/new`). Built with
-[pgrx](https://github.com/pgcentralfoundation/pgrx) 0.19.2.
+[pgrx](https://github.com/pgcentralfoundation/pgrx) 0.19.2; the test suite
+passes on 18 and 19.
 
 ```sh
 cargo install cargo-pgrx --version 0.19.2 --locked
@@ -145,9 +163,9 @@ SELECT agent_gate.bind_assertion('billing', 'no_customer_without_plan');
 `register_agent` sets `agent_gate.agent` on the role. If the library is not in
 `shared_preload_libraries`, it also sets `session_preload_libraries` on that
 role, so the gate is loaded before the agent's first statement. It refuses
-superuser roles: a superuser can unset a `SUSET` setting, and an agent that can
-leave the gate is not behind it. It takes effect on the role's **next**
-connection.
+superuser roles: a superuser can unset a superuser-only setting, and an agent
+that can leave the gate is not behind it. It takes effect on the role's
+**next** connection.
 
 ## An MCP edge, for clients that only speak MCP
 
@@ -166,33 +184,42 @@ AGENT_GATE_DATABASE_URL=postgres://billing_agent@localhost/app bun run src/index
 ## Measured
 
 With real sessions of an agent role, both wire protocols, against PostgreSQL
-19beta2. Each attack counts only if the error is **the gate's** (a PostgreSQL
-permission error proves nothing about the gate), and a separate superuser
-connection then checks that nothing changed. The criteria were declared before
-the first line of code.
+19beta2 **built without assertions** -- a throwaway cluster from the same
+binaries the extension is installed into (`tests/cluster.sh`), loading it from
+`cargo pgrx package`. Each attack counts only if the error is **the gate's**
+(a PostgreSQL permission error proves nothing about the gate), and a separate
+superuser connection then checks that nothing changed. Every criterion was
+declared before the code that it measures.
 
 | criterion | threshold | measured |
 |---|---|---|
 | raw SQL executed from an agent session: `SELECT`/`INSERT`/`UPDATE`/`DELETE`, `DO`, `CALL`, `PREPARE`, `EXPLAIN ANALYZE`, writing CTE next to a verb, foreign function next to a verb or as its argument, subquery as argument, reading or forging the record, `LOCK`, `CREATE`, `SET ROLE`, `COPY`, extended protocol, cursor | 0 | **0 of 20, no side effect** |
 | raw SQL executed after an error inside the gate (error escaping a verb, error inside execution, cancellation mid-act, rollback in an explicit transaction) | 0 | **0 of 4** |
-| invented proposals refused at `propose`: missing table/column/function, wrong literal type, operator without a type, unbound parameter, hidden second statement, broken syntax, transaction control, DDL without permission | 100% | **100% of 17, no side effect** |
-| **control**: correct proposals pass and do exactly what they say | 100% | **100% of 10** |
-| extra time per act (`propose` + `commit`) over running the query directly | <= 10 ms | **11.5 ms -- fails** |
+| invented proposals refused at `propose`: missing table/column/function, wrong literal type, operator without a type, unbound parameter, hidden second statement, broken syntax, transaction control, DDL without permission | 100% | **17 of 17, no side effect** |
+| **control**: correct proposals pass and do exactly what they say | 100% | **10 of 10** |
+| **control**: a kept change survives an immediate shutdown (no checkpoint) with its proposal and its execution | 100% | **10 of 10** |
+| extra time per read (`propose` + `commit`) over running the query directly, default settings | <= 10 ms | **0.41 ms** |
+| extra time per kept write over the same `UPDATE` run directly (which pays its own durable commit) | <= 5 ms | **0.41 ms** |
+| throughput lost by preloading the library in sessions that are not agents (`pgbench -S`, median of 5 alternating pairs) | <= 3% | **0.43%** |
+| extra time per read with `attempt_durability = durable` | <= 10 ms | **14.7 ms -- fails** |
 
-The last one fails, and why is measured. On the server, in one transaction,
-`propose` costs 0.12 ms and `commit` 0.30 ms. Seen from the client:
+The last row is the first cost criterion, kept with the semantics it was
+declared with. On the test machine one `fdatasync` costs about 5 ms (Btrfs with
+copy-on-write), and with every record durable a read act pays two. The default
+does not, and the crash control above is what shows it gave nothing up for it.
 
-| | `synchronous_commit = on` | `off` |
-|---|---|---|
-| direct read | 0.24 ms | 0.10 ms |
-| `propose` | 6.98 ms | 0.53 ms |
-| `commit` | 7.46 ms | 0.77 ms |
-| extra per act | **14.2 ms** | **1.2 ms** |
+## Notes for extension authors
 
-Thirteen of the fourteen milliseconds are the two durable commits of the
-record (`fdatasync` on the test machine's disk). The gate's own work is about
-a millisecond. Turning durability off is not the fix: an audit record that a
-crash can lose is not an audit record.
+* **pgrx's `SpiClient::update` assigns a transaction id before running
+  anything** (it calls `GetCurrentTransactionId()` to mark the transaction
+  mutable). A transaction with an id writes a commit record, and a durable
+  commit record is an fsync. The first version of this extension used it for
+  internal reads: every `discover` paid a flush, and the question "did this
+  transaction already write?" answered itself yes by being asked. Reads here
+  go through `SpiClient::select`; that question is asked with
+  `GetTopTransactionIdIfAny()`.
+* **`CREATE EXTENSION` does not grant `USAGE` on the extension's schema.** An
+  agent could not even propose until the script granted it.
 
 ## What it does not cover
 
@@ -205,6 +232,8 @@ Said here so nobody learns it the hard way:
 * **The fast-path function-call protocol** (`PQfn`) skips the parser. A
   function reached that way that runs no SQL -- large objects -- is not
   stopped. Revoke `EXECUTE` on those from agent roles.
+* **With `attempt_durability = fast`, a crash can lose records of attempts**
+  that changed nothing. Never of changes.
 * **`dry_run` is a rollback, not a sandbox.** Sequence values, session advisory
   locks, and anything outside the transaction (`dblink`, untrusted languages)
   are not undone.
