@@ -4,9 +4,9 @@
 *.iml
 **/*.rs.bk
 Cargo.lock
-edge/node_modules
-edge/.bun-tmp
-edge/.bun-cache
+gated-mcp/node_modules
+gated-mcp/.bun-tmp
+gated-mcp/.bun-cache
 .testcluster
 tests/pg_regress/results
 tests/pg_regress/regression.diffs

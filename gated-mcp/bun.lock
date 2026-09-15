@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "pg-agent-gate-edge",
+      "name": "gated-mcp",
       "dependencies": {
         "hono": "^4.6.0",
         "postgres": "^3.4.5",

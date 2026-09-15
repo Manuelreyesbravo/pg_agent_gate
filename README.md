@@ -167,16 +167,17 @@ superuser roles: a superuser can unset a superuser-only setting, and an agent
 that can leave the gate is not behind it. It takes effect on the role's
 **next** connection.
 
-## An MCP edge, for clients that only speak MCP
+## gated-mcp: an MCP server that cannot execute anything
 
-`edge/` is a small Bun + Hono server exposing the six verbs as six MCP tools
-over Streamable HTTP. It connects **as the agent role**, so it is not where the
-gate lives: replace it with anything and it still can only call the verbs.
-Six tools, never one per table -- what the agent may touch comes from
-`discover`.
+For clients that only speak MCP. `gated-mcp/` is a small Bun + Hono server
+exposing the six verbs as six MCP tools over Streamable HTTP. Unlike an
+ordinary MCP server for PostgreSQL, it holds no power of its own: it connects
+**as the agent role**, so it is not where the gate lives -- replace it with
+anything and it still can only call the verbs. Six tools, never one per table:
+what the agent may touch comes from `discover`.
 
 ```sh
-cd edge && bun install
+cd gated-mcp && bun install
 AGENT_GATE_DATABASE_URL=postgres://billing_agent@localhost/app bun run src/index.ts
 # POST http://127.0.0.1:7878/mcp   (set AGENT_GATE_TOKEN to require a bearer token)
 ```

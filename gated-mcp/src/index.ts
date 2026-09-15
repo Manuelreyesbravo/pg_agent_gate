@@ -1,5 +1,5 @@
 /**
- * pg_agent_gate edge -- the six verbs, reachable by any MCP client.
+ * gated-mcp -- the six verbs of pg_agent_gate, reachable by any MCP client.
  *
  * This is NOT where the gate lives. The gate is inside PostgreSQL: this process
  * connects AS THE AGENT ROLE, so even if this file were replaced by something
@@ -9,7 +9,7 @@
  *
  * SIX TOOLS AND NEVER MORE. They are the verbs, not a catalog of the schema:
  * what the agent may touch comes from `discover`, derived from the live catalog.
- * If this list ever grows toward one tool per table, the edge became a catalog
+ * If this list ever grows toward one tool per table, gated-mcp became a catalog
  * and lost the point.
  *
  * Protocol: JSON-RPC 2.0 over HTTP POST (Streamable HTTP, JSON responses).
