@@ -230,6 +230,17 @@ Said here so nobody learns it the hard way:
   fails open.** `whoami()` reports `enforced`. Use `shared_preload_libraries`.
 * **Existing connections** of a role are not behind the gate until they
   reconnect.
+* **A dump of the database does not carry who is an agent.** `register_agent`
+  marks the role (`ALTER ROLE ... SET agent_gate.agent`), and roles belong to
+  the cluster: `pg_dump` leaves the mark out, `pg_dumpall --globals-only` has
+  it. Restored into a server without the globals, the record still says the
+  role is an agent while the role is outside the gate. The record itself does
+  survive `pg_dump`; `tests/dump_restore.sh` checks both halves.
+* **`SET`, `SHOW` and transaction control reach the database from an agent
+  session**, because drivers issue them on their own. What changes who is
+  acting does not: `SET role`, `SET session_authorization` and every
+  `agent_gate.*` setting are refused, even if someone granted `SET ON
+  PARAMETER` on them (`tests/privileges.sh`).
 * **The fast-path function-call protocol** (`PQfn`) skips the parser. A
   function reached that way that runs no SQL -- large objects -- is not
   stopped. Revoke `EXECUTE` on those from agent roles.

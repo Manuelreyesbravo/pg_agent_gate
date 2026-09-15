@@ -4,7 +4,9 @@
 //! disappear -- an agent holding a connection can always type `DELETE FROM`.
 //! These hooks make it disappear: in a session that belongs to an agent, every
 //! statement that reaches the parser must be `SELECT agent_gate.<verb>(...)`
-//! with literals or parameters as arguments, or transaction control, or SET.
+//! with literals or parameters as arguments, transaction control, SHOW, or a SET
+//! that does not change who is acting (never role, session_authorization or
+//! anything under agent_gate.*).
 //! Everything else dies before it is planned.
 //!
 //! THREE HOOKS, ONE RULE. `post_parse_analyze` is the gate. `ProcessUtility`
@@ -202,7 +204,15 @@ unsafe fn utility_allowed(stmt: *mut pg_sys::Node) -> Result<(), String> {
             } else {
                 CStr::from_ptr(v.name).to_string_lossy().to_lowercase()
             };
-            if name == "role" || name == "session_authorization" {
+            // Who is acting is not a setting an agent session changes. `role` and
+            // `session_authorization` change the database user; `agent_gate.*` is
+            // the mark itself and the gate's own knobs. Leaving the mark to the
+            // superuser-only GUC context was not enough: PostgreSQL 15+ can GRANT
+            // SET ON PARAMETER agent_gate.agent, and with that one mistaken grant
+            // an agent ran `set agent_gate.agent = ''` and then raw SQL (measured,
+            // tests/privileges.sh). One rule for the whole prefix, SET and RESET
+            // alike, instead of a list of the knobs that happen to matter today.
+            if name == "role" || name == "session_authorization" || name.starts_with("agent_gate.") {
                 Err(format!("SET {name} would change who is acting; an agent session keeps its identity"))
             } else {
                 Ok(())

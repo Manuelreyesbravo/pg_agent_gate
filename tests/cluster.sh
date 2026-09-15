@@ -36,8 +36,8 @@ case "${1:-}" in
 port = $PORT
 listen_addresses = 'localhost'
 unix_socket_directories = '$DATA'
-dynamic_library_path = '\$libdir:$LIBDIR'
-extension_control_path = '\$system:$SHAREDIR'
+dynamic_library_path = '$LIBDIR:\$libdir'
+extension_control_path = '$SHAREDIR:\$system'
 EOF
     echo "initialised $DATA on port $PORT"
     ;;
