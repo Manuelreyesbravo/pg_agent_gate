@@ -1,0 +1,6 @@
+comment = 'pg_agent_gate:  Created by pgrx'
+default_version = '@CARGO_VERSION@'
+module_pathname = 'pg_agent_gate'
+relocatable = false
+superuser = true
+trusted = false
