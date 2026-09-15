@@ -195,6 +195,16 @@ foreign one gets 403 before the token and before the database: any web page can
 make a browser post to localhost. Bound elsewhere, set
 `AGENT_GATE_ALLOWED_HOSTS` and `AGENT_GATE_ALLOWED_ORIGINS`.
 
+Besides the six tools it offers **resources and prompts, and they add no
+power**. The resources -- `agent-gate://catalog`, `agent-gate://whoami`,
+`agent-gate://acts` and the template `agent-gate://relation/{schema}/{name}` --
+are read by calling a verb as the agent role, never with a query of their own:
+the catalog as a resource is identical to what `discover` returns, and a
+relation the agent was not granted answers `-32602`, not its content. The
+prompts, `change_data` and `investigate`, carry no data: they teach a model the
+gate's loop. What a resource contains depends on the agent's grants, so it is
+marked `cacheScope: private`.
+
 Checked against clients nobody here wrote: `test/clients.mjs` drives the gate
 end to end with the official `@modelcontextprotocol/client` 2.0.0 pinned to
 2026-07-28 and with `@modelcontextprotocol/sdk` 1.30.0, and checks from a

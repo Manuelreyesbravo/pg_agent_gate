@@ -83,6 +83,20 @@ check(
   old,
 );
 
+// ------------------------------------------------- per-request protocol state --
+// basic/index.mdx: protocolVersion and clientCapabilities are required in every
+// request's _meta; a request missing either is malformed -- 400 and -32602.
+const bare = await fetch(url, {
+  method: "POST",
+  headers: { "content-type": "application/json", accept: "application/json, text/event-stream",
+    "mcp-protocol-version": V, "mcp-method": "tools/list" },
+  body: JSON.stringify({ jsonrpc: "2.0", id: ++id, method: "tools/list",
+    params: { _meta: { "io.modelcontextprotocol/protocolVersion": V } } }),
+});
+const bareJson = await bare.json().catch(() => null);
+check("a request whose _meta lacks clientCapabilities gets 400 and -32602",
+  bare.status === 400 && bareJson?.error?.code === -32602, { status: bare.status, body: bareJson });
+
 // ------------------------------------------------------- header validation --
 const mismatch = await post("tools/list", {}, { headers: { "mcp-method": "tools/call" } });
 check("an Mcp-Method header that does not match the body gets 400 and -32020", mismatch.status === 400 && mismatch.json?.error?.code === -32020, mismatch);
