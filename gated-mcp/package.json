@@ -5,10 +5,19 @@
   "type": "module",
   "description": "An MCP server that cannot execute anything: the six verbs of pg_agent_gate over Streamable HTTP, connected as the agent role",
   "scripts": {
-    "start": "bun run src/index.ts"
+    "start": "bun run src/index.ts",
+    "test:client-2026": "node test/clients.mjs 2026",
+    "test:client-2025": "node test/clients.mjs 2025",
+    "test:transport": "node test/transport.mjs",
+    "test:conformance": "conformance server --url ${GATED_MCP_URL:-http://127.0.0.1:7878/mcp} --requirements 2026-07-28"
   },
   "dependencies": {
     "hono": "^4.6.0",
     "postgres": "^3.4.5"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "2.0.0",
+    "@modelcontextprotocol/conformance": "0.2.0-alpha.11",
+    "@modelcontextprotocol/sdk": "1.30.0"
   }
 }

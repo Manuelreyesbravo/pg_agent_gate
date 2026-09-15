@@ -182,6 +182,26 @@ AGENT_GATE_DATABASE_URL=postgres://billing_agent@localhost/app bun run src/index
 # POST http://127.0.0.1:7878/mcp   (set AGENT_GATE_TOKEN to require a bearer token)
 ```
 
+It speaks two protocol eras on the same endpoint, chosen by what each request
+says: the **2026-07-28** revision -- stateless; `MCP-Protocol-Version`,
+`Mcp-Method` and `Mcp-Name` must match the body or the request gets 400 and
+`-32020` before it reaches the database; an unsupported version gets 400 and
+`-32022`; `server/discover` and `tools/list` carry `ttlMs` and `cacheScope` --
+and the **2025-11-25** `initialize` handshake most clients still run. `GET` and
+`DELETE` get 405.
+
+Bound to loopback, `Host` and `Origin` are checked on every request and a
+foreign one gets 403 before the token and before the database: any web page can
+make a browser post to localhost. Bound elsewhere, set
+`AGENT_GATE_ALLOWED_HOSTS` and `AGENT_GATE_ALLOWED_ORIGINS`.
+
+Checked against clients nobody here wrote: `test/clients.mjs` drives the gate
+end to end with the official `@modelcontextprotocol/client` 2.0.0 pinned to
+2026-07-28 and with `@modelcontextprotocol/sdk` 1.30.0, and checks from a
+superuser connection that only the committed change happened;
+`test/transport.mjs` checks the transport MUSTs with plain `fetch`; and the
+official `@modelcontextprotocol/conformance` suite runs against it.
+
 ## Measured
 
 With real sessions of an agent role, both wire protocols, against PostgreSQL
