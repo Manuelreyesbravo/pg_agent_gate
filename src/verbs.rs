@@ -319,7 +319,7 @@ fn execute(proposal: i64, mode: Mode) -> Value {
     }
     let kind = verdict.kind.expect("a passing verdict has a kind");
     let cap = crate::MAX_RESULT_ROWS.get().max(0) as usize;
-    let statement = if kind == Kind::Write && !verdict.has_returning {
+    let statement = if verdict.append_returning {
         // On its own line: a trailing -- comment must not swallow it.
         format!("{}\nRETURNING to_jsonb(old) AS before, to_jsonb(new) AS after", verdict.statement)
     } else {
@@ -398,8 +398,14 @@ fn execute(proposal: i64, mode: Mode) -> Value {
     );
 
     let ms = started.elapsed().as_secs_f64() * 1000.0;
+    // The hint is what an agent fixes a proposal from: it travels structured,
+    // not only folded into the reason text.
+    let mut error = None;
     let (outcome, reason, rows, processed, truncated, assertions) = match result {
-        Err(f) => ("aborted", Some(format!("it ran and PostgreSQL raised {}", f.describe())), Vec::new(), None, None, Vec::new()),
+        Err(f) => {
+            error = Some(f.json());
+            ("aborted", Some(format!("it ran and PostgreSQL raised {}", f.describe())), Vec::new(), None, None, Vec::new())
+        }
         Ok(o) => {
             let outcome = if o.abort.is_some() {
                 "aborted"
@@ -442,6 +448,7 @@ fn execute(proposal: i64, mode: Mode) -> Value {
         "kind": kind.as_str(),
         "outcome": outcome,
         "reason": reason,
+        "error": error,
         "rows_affected": rows_affected,
         "rows_returned": rows.len(),
         "truncated": truncated,

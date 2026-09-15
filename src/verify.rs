@@ -43,7 +43,13 @@ pub(crate) struct Verdict {
     pub kind: Option<Kind>,
     /// Exactly the statement the parser saw, without a trailing semicolon.
     pub statement: String,
-    pub has_returning: bool,
+    /// The TOP-LEVEL statement is INSERT, UPDATE, DELETE or MERGE without a
+    /// RETURNING of its own, so the gate may add one to show before/after.
+    ///
+    /// Not the same as `kind == Write`, and the difference was a bug: a SELECT
+    /// whose CTE writes IS a write, and `SELECT ... RETURNING` is a syntax
+    /// error. Found by the control case of the criteria harness.
+    pub append_returning: bool,
     pub estimated_rows: Option<f64>,
     pub checks: Vec<Check>,
 }
@@ -75,7 +81,7 @@ struct Parsed {
     count: i32,
     tag: Option<pg_sys::NodeTag>,
     statement: String,
-    has_returning: bool,
+    append_returning: bool,
     select_into: bool,
     select_locks: bool,
 }
@@ -85,7 +91,7 @@ pub(crate) fn verify(sql: &str, params: &Option<Vec<Option<String>>>, allow_ddl:
         ok: false,
         kind: None,
         statement: String::new(),
-        has_returning: false,
+        append_returning: false,
         estimated_rows: None,
         checks: Vec::new(),
     };
@@ -122,7 +128,7 @@ pub(crate) fn verify(sql: &str, params: &Option<Vec<Option<String>>>, allow_ddl:
     v.check("parses", true, "PostgreSQL's parser accepts it");
     v.check("single_statement", true, "exactly one statement");
     v.statement = parsed.statement;
-    v.has_returning = parsed.has_returning;
+    v.append_returning = parsed.append_returning;
 
     // 2. What kind of statement it is, and whether this agent may propose it.
     let tag = parsed.tag.expect("one statement has a tag");
@@ -207,7 +213,7 @@ unsafe fn parse(sql: &str, text: &CString) -> Parsed {
         count,
         tag: None,
         statement: String::new(),
-        has_returning: false,
+        append_returning: false,
         select_into: false,
         select_locks: false,
     };
@@ -228,11 +234,11 @@ unsafe fn parse(sql: &str, text: &CString) -> Parsed {
         .trim()
         .to_string();
 
-    parsed.has_returning = match tag {
-        pg_sys::NodeTag::T_InsertStmt => !(*(node as *mut pg_sys::InsertStmt)).returningClause.is_null(),
-        pg_sys::NodeTag::T_UpdateStmt => !(*(node as *mut pg_sys::UpdateStmt)).returningClause.is_null(),
-        pg_sys::NodeTag::T_DeleteStmt => !(*(node as *mut pg_sys::DeleteStmt)).returningClause.is_null(),
-        pg_sys::NodeTag::T_MergeStmt => !(*(node as *mut pg_sys::MergeStmt)).returningClause.is_null(),
+    parsed.append_returning = match tag {
+        pg_sys::NodeTag::T_InsertStmt => (*(node as *mut pg_sys::InsertStmt)).returningClause.is_null(),
+        pg_sys::NodeTag::T_UpdateStmt => (*(node as *mut pg_sys::UpdateStmt)).returningClause.is_null(),
+        pg_sys::NodeTag::T_DeleteStmt => (*(node as *mut pg_sys::DeleteStmt)).returningClause.is_null(),
+        pg_sys::NodeTag::T_MergeStmt => (*(node as *mut pg_sys::MergeStmt)).returningClause.is_null(),
         _ => false,
     };
     if tag == pg_sys::NodeTag::T_SelectStmt {

@@ -1,0 +1,14 @@
+{
+  "name": "pg-agent-gate-edge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A thin MCP edge for pg_agent_gate: the six verbs over Streamable HTTP, connected as the agent role",
+  "scripts": {
+    "start": "bun run src/index.ts"
+  },
+  "dependencies": {
+    "hono": "^4.6.0",
+    "postgres": "^3.4.5"
+  }
+}

@@ -11,6 +11,13 @@ use pgrx::prelude::*;
 
 extension_sql!(
     r#"
+-- The verbs are reachable by any role: they run with the caller's own
+-- privileges, so reaching them grants nothing. CREATE EXTENSION does not do
+-- this by itself, and without it an agent cannot even propose -- found by the
+-- criteria harness, whose attacks were being stopped by a schema permission
+-- and not by the gate.
+GRANT USAGE ON SCHEMA agent_gate TO PUBLIC;
+
 CREATE SCHEMA agent_gate_internal;
 COMMENT ON SCHEMA agent_gate_internal IS
     'pg_agent_gate: the record of what agents proposed and did. Agents never touch it directly.';

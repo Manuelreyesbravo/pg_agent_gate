@@ -158,6 +158,26 @@ mod tests {
         let left: Option<i64> = Spi::get_one("select count(*) from gate_l").unwrap();
         assert_eq!(left, Some(1500), "an aborted commit kept rows");
     }
+
+    /// Regression: the gate used to append RETURNING whenever the proposal was
+    /// a write, and a SELECT whose CTE writes is a write -- which produced
+    /// `SELECT ... RETURNING`, a syntax error.
+    #[pg_test]
+    fn a_select_whose_cte_writes_is_a_write_and_is_kept() {
+        Spi::run("create table gate_c (id int primary key, plan text not null)").unwrap();
+        Spi::run("insert into gate_c values (1, 'free')").unwrap();
+        let p = crate::verbs::propose(
+            "with x as (update gate_c set plan = 'pro' where id = 1 returning id) select count(*) from x",
+            "upgrade through a cte",
+            None,
+        )
+        .0;
+        assert_eq!(p["kind"], "write", "{p}");
+        let c = crate::verbs::commit(id(&p)).0;
+        assert_eq!(c["outcome"], "kept", "{c}");
+        let plan: Option<String> = Spi::get_one("select plan from gate_c where id = 1").unwrap();
+        assert_eq!(plan.as_deref(), Some("pro"));
+    }
 }
 
 /// This module is required by `cargo pgrx test` invocations.

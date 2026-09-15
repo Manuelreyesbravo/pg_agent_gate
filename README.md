@@ -1,0 +1,226 @@
+# pg_agent_gate
+
+**Agents propose, PostgreSQL decides.**
+
+Today an LLM agent reaches PostgreSQL through an MCP server that holds a
+connection, hands the model a list of tools, and runs whatever the model asks.
+The model decides; the server obeys. Every guarantee lives in that server's
+code, outside the database, and the database never learns what was checked.
+
+`pg_agent_gate` moves the decision into PostgreSQL. An agent does not run SQL.
+It has six verbs, and in a session that belongs to an agent **it cannot do
+anything else** -- not `DELETE`, not `DO`, not `COPY`, not `PREPARE`. The
+database verifies every proposal against itself, runs it with the agent's own
+privileges, and keeps the record.
+
+```
+discover  ->  propose  ->  dry_run  ->  commit
+                                         acts, whoami
+```
+
+## What an agent sees
+
+```sql
+-- what may I touch? derived from the live catalog and MY privileges
+SELECT agent_gate.discover('clientes');
+
+-- propose one statement: nothing runs
+SELECT agent_gate.propose(
+  'update clientes set plan = ''pro'' where id = $1::int',
+  'upgrade the customer who asked for it',
+  ARRAY['1']);
+--  {"proposal": 42, "ok": true, "kind": "write", "estimated_rows": 1,
+--   "checks": [{"check": "parses",           "passed": true, ...},
+--              {"check": "single_statement", "passed": true, ...},
+--              {"check": "kind_allowed",     "passed": true, ...},
+--              {"check": "resolves",         "passed": true,
+--               "detail": "the planner resolved every table, column, type and function, and nothing ran"}]}
+
+-- see the exact effect, then nothing is kept
+SELECT agent_gate.dry_run(42);
+--  {"outcome": "rolled_back", "rows_affected": 1,
+--   "rows": [{"before": {"id": 1, "plan": "free"}, "after": {"id": 1, "plan": "pro"}}]}
+
+-- make it real, if every guard still agrees
+SELECT agent_gate.commit(42);
+--  {"outcome": "kept", "rows_affected": 1, ...}
+```
+
+Anything else, from that session:
+
+```
+=> delete from clientes where id > 0;
+ERROR:  pg_agent_gate: this session belongs to agent "billing": it proposes, it does not execute
+DETAIL:  DELETE does not reach the database from an agent session
+HINT:  Call agent_gate.propose(sql, intent), then agent_gate.dry_run(proposal) or agent_gate.commit(proposal).
+```
+
+## The six verbs
+
+| verb | does |
+|---|---|
+| `discover(filter, max_objects)` | tables, views and functions the agent has privileges on, with columns, types, keys, constraints and comments. Objects owned by extensions are left out. Includes a fingerprint, so a client can tell the schema changed |
+| `propose(sql, intent, params)` | verifies one statement and records it. Runs nothing |
+| `dry_run(proposal)` | runs it inside a subtransaction and rolls it back: rows touched, before/after of every row of a write, whether bound assertions would still hold |
+| `commit(proposal)` | verifies again, runs it and keeps it if every guard agrees. A proposal is committed at most once |
+| `acts(max_acts)` | what this agent proposed and did, with every execution and why anything was refused |
+| `whoami()` | which agent this session is, and whether the gate is enforced in it |
+
+## Verification
+
+Nothing is reimplemented. Each check is PostgreSQL itself:
+
+1. **parses** -- PostgreSQL's own raw parser accepts it.
+2. **single_statement** -- exactly one, so what was verified is what runs.
+   `select 1; delete ...` dies here.
+3. **kind_allowed** -- read, write or DDL, against what the agent may do.
+   Transaction control is refused: the gate owns the transaction.
+4. **resolves** -- `EXPLAIN` plans it without executing: every table,
+   column, type, operator and function must exist and fit. A `SELECT` whose
+   CTE writes is reclassified as a write. DDL (for agents allowed it) is
+   verified by running it in a subtransaction that is rolled back.
+
+`commit` verifies **again**: a verification is a statement about the database
+at a moment. A proposal older than `agent_gate.proposal_ttl_seconds` (900) is
+refused outright.
+
+## Execution
+
+* Runs with the **agent's own privileges**. The gate adds verification; `GRANT`
+  is still the authorization. Declaring is not authorizing.
+* Inside a subtransaction, decided **after** it runs:
+  * a write touching more rows than the agent's `max_rows` is undone;
+  * deferred constraints are fired **inside the gate** (`SET CONSTRAINTS ALL
+    IMMEDIATE`), not at the caller's commit where nobody is watching;
+  * assertions bound to the agent (from
+    [pg_living_assertions](https://pgxn.org/dist/pg_living_assertions/)) are
+    run after the change: `broken` or `erroring` undoes it -- a check that
+    cannot run is not a check that passed.
+* A read's subtransaction is **always** rolled back: a read has nothing to keep.
+
+## The record
+
+`agent_gate_internal.proposals` and `.executions` are append-only (triggers
+refuse `UPDATE` and `DELETE`) and survive `pg_dump`. Each execution says its
+outcome -- `kept`, `read`, `rolled_back`, `aborted` or `refused` -- and the last
+two must say why (a `CHECK`). Writes keep the before/after of up to 50 rows.
+**Reads keep nothing but counts**: copying what an agent read into an audit
+table would copy the data itself.
+
+Only the gate writes the record. The writing functions are `SECURITY DEFINER`
+and first ask the gate whether the caller is the gate's own code -- a flag no
+SQL can set, kept down while the agent's own SQL runs. A proposal cannot forge
+its history; an agent calling those functions by name is refused by the hook.
+
+## Setup
+
+PostgreSQL **18 or later** (`dry_run` uses `RETURNING old/new`). Built with
+[pgrx](https://github.com/pgcentralfoundation/pgrx) 0.19.2.
+
+```sh
+cargo install cargo-pgrx --version 0.19.2 --locked
+cargo pgrx install --release --pg-config /path/to/pg_config
+```
+
+```ini
+# postgresql.conf -- recommended
+shared_preload_libraries = 'pg_agent_gate'
+```
+
+```sql
+CREATE EXTENSION pg_agent_gate;
+
+CREATE ROLE billing_agent LOGIN;               -- never a superuser
+GRANT USAGE ON SCHEMA public TO billing_agent;
+GRANT SELECT, UPDATE ON clientes TO billing_agent;
+
+SELECT agent_gate.register_agent(
+  'billing', 'billing_agent', 'answers billing questions and upgrades plans',
+  p_max_rows => 50, p_allow_ddl => false);
+
+-- optional: every write this agent keeps must leave this assertion holding
+SELECT agent_gate.bind_assertion('billing', 'no_customer_without_plan');
+```
+
+`register_agent` sets `agent_gate.agent` on the role. If the library is not in
+`shared_preload_libraries`, it also sets `session_preload_libraries` on that
+role, so the gate is loaded before the agent's first statement. It refuses
+superuser roles: a superuser can unset a `SUSET` setting, and an agent that can
+leave the gate is not behind it. It takes effect on the role's **next**
+connection.
+
+## An MCP edge, for clients that only speak MCP
+
+`edge/` is a small Bun + Hono server exposing the six verbs as six MCP tools
+over Streamable HTTP. It connects **as the agent role**, so it is not where the
+gate lives: replace it with anything and it still can only call the verbs.
+Six tools, never one per table -- what the agent may touch comes from
+`discover`.
+
+```sh
+cd edge && bun install
+AGENT_GATE_DATABASE_URL=postgres://billing_agent@localhost/app bun run src/index.ts
+# POST http://127.0.0.1:7878/mcp   (set AGENT_GATE_TOKEN to require a bearer token)
+```
+
+## Measured
+
+With real sessions of an agent role, both wire protocols, against PostgreSQL
+19beta2. Each attack counts only if the error is **the gate's** (a PostgreSQL
+permission error proves nothing about the gate), and a separate superuser
+connection then checks that nothing changed. The criteria were declared before
+the first line of code.
+
+| criterion | threshold | measured |
+|---|---|---|
+| raw SQL executed from an agent session: `SELECT`/`INSERT`/`UPDATE`/`DELETE`, `DO`, `CALL`, `PREPARE`, `EXPLAIN ANALYZE`, writing CTE next to a verb, foreign function next to a verb or as its argument, subquery as argument, reading or forging the record, `LOCK`, `CREATE`, `SET ROLE`, `COPY`, extended protocol, cursor | 0 | **0 of 20, no side effect** |
+| raw SQL executed after an error inside the gate (error escaping a verb, error inside execution, cancellation mid-act, rollback in an explicit transaction) | 0 | **0 of 4** |
+| invented proposals refused at `propose`: missing table/column/function, wrong literal type, operator without a type, unbound parameter, hidden second statement, broken syntax, transaction control, DDL without permission | 100% | **100% of 17, no side effect** |
+| **control**: correct proposals pass and do exactly what they say | 100% | **100% of 10** |
+| extra time per act (`propose` + `commit`) over running the query directly | <= 10 ms | **11.5 ms -- fails** |
+
+The last one fails, and why is measured. On the server, in one transaction,
+`propose` costs 0.12 ms and `commit` 0.30 ms. Seen from the client:
+
+| | `synchronous_commit = on` | `off` |
+|---|---|---|
+| direct read | 0.24 ms | 0.10 ms |
+| `propose` | 6.98 ms | 0.53 ms |
+| `commit` | 7.46 ms | 0.77 ms |
+| extra per act | **14.2 ms** | **1.2 ms** |
+
+Thirteen of the fourteen milliseconds are the two durable commits of the
+record (`fdatasync` on the test machine's disk). The gate's own work is about
+a millisecond. Turning durability off is not the fix: an audit record that a
+crash can lose is not an audit record.
+
+## What it does not cover
+
+Said here so nobody learns it the hard way:
+
+* **Without the library loaded before the agent's first statement, the gate
+  fails open.** `whoami()` reports `enforced`. Use `shared_preload_libraries`.
+* **Existing connections** of a role are not behind the gate until they
+  reconnect.
+* **The fast-path function-call protocol** (`PQfn`) skips the parser. A
+  function reached that way that runs no SQL -- large objects -- is not
+  stopped. Revoke `EXECUTE` on those from agent roles.
+* **`dry_run` is a rollback, not a sandbox.** Sequence values, session advisory
+  locks, and anything outside the transaction (`dblink`, untrusted languages)
+  are not undone.
+* **Functions a proposal calls run with their own rules.** A `SECURITY DEFINER`
+  function the agent may execute does what it does; the gate verifies the
+  proposal, not every function body.
+* **`EXPLAIN` folds constant calls to immutable functions.** A function falsely
+  marked `IMMUTABLE` could run at `propose`. Marking functions honestly is a
+  prerequisite.
+* **The record is transactional.** Inside an explicit transaction that the
+  caller rolls back, the record rolls back too. Every verdict is also written
+  to the server log, which does not.
+* **Parameters travel as text.** Cast them in the SQL (`$1::int`).
+* **User-defined casts** around a verb's arguments are allowed, like any cast.
+  Creating a cast already needs ownership of the types.
+
+## License
+
+PostgreSQL License.
