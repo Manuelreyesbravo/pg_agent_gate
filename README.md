@@ -229,6 +229,9 @@ declared before the code that it measures.
 | invented proposals refused at `propose`: missing table/column/function, wrong literal type, operator without a type, unbound parameter, hidden second statement, broken syntax, transaction control, DDL without permission | 100% | **17 of 17, no side effect** |
 | **control**: correct proposals pass and do exactly what they say | 100% | **10 of 10** |
 | **control**: a kept change survives an immediate shutdown (no checkpoint) with its proposal and its execution | 100% | **10 of 10** |
+| every channel a session can type, tried on purpose (`tests/adversarial.sh`): two statements in one query, `PREPARE`/`EXECUTE`, a cursor, `COPY TO`/`FROM PROGRAM`, `DO`, `CALL`, `EXPLAIN ANALYZE`, `CREATE TABLE`/`FUNCTION`, `SELECT INTO`, a writing CTE, a function as a verb argument, a subselect of what it was not granted, `SET ROLE`, `SET SESSION AUTHORIZATION`, `RESET ALL`, `DISCARD ALL`, `VACUUM`, `CHECKPOINT`, `LISTEN`/`NOTIFY`, `lo_export`, and a replication connection | 0 | **0 of 22 had any effect** |
+| what can be slipped past `propose` (`tests/adversarial.sh`): two statements, a second one hidden after a comment, DDL without permission, `COPY TO PROGRAM`, `SELECT INTO`, `FOR UPDATE` and a write beyond `max_rows`, an expired verification, another agent's proposal | 0 | **0 of 9** |
+| **control**: an agent still runs `whoami`, `discover`, proposes, sees before/after in `dry_run`, commits a read and a write, is refused a second commit, and reads its `acts` | 100% | **11 of 11** |
 | extra time per read (`propose` + `commit`) over running the query directly, default settings | <= 10 ms | **0.41 ms** |
 | extra time per kept write over the same `UPDATE` run directly (which pays its own durable commit) | <= 5 ms | **0.41 ms** |
 | throughput lost by preloading the library in sessions that are not agents (`pgbench -S`, median of 5 alternating pairs) | <= 3% | **0.43%** |
