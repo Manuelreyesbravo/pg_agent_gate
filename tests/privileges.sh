@@ -42,21 +42,21 @@ MARK=intent-of-billing-7f3a
 as() { local role=$1; shift; "$BIN/psql" -X -U "$role" -d "$DB" -tA "$@" 2>&1 || true; }
 proposal_id() { sed -nE 's/.*"proposal": ([0-9]+).*/\1/p' <<<"$1" | head -1; }
 
+# Claims the names instead of dropping whatever is there: see tests/guard.sh.
+source "$(dirname "${BASH_SOURCE[0]}")/guard.sh"
+
 cleanup() {
-    "$BIN/psql" -X -U "$SUPERUSER" -d postgres -qc "drop database if exists $DB" >/dev/null 2>&1 || true
     # A parameter grant is cluster-wide and blocks DROP ROLE if a run stopped halfway.
     "$BIN/psql" -X -U "$SUPERUSER" -d postgres -qc "revoke set on parameter agent_gate.agent from $BILLING" >/dev/null 2>&1 || true
-    for r in "$BILLING" "$SUPPORT" "$APP" "$STRANGER"; do
-        "$BIN/psql" -X -U "$SUPERUSER" -d postgres -qc "drop role if exists $r" >/dev/null 2>&1 || true
-    done
+    release_claimed
 }
 trap cleanup EXIT
-cleanup
 
+require_throwaway_cluster
 for r in "$BILLING" "$SUPPORT" "$APP" "$STRANGER"; do
-    "$BIN/psql" -X -U "$SUPERUSER" -d postgres -qc "create role $r login"
+    claim_role "$r"
 done
-"$BIN/psql" -X -U "$SUPERUSER" -d postgres -qc "create database $DB"
+claim_database "$DB"
 
 "$BIN/psql" -X -U "$SUPERUSER" -d "$DB" -v ON_ERROR_STOP=1 -q \
     -v billing="$BILLING" -v support="$SUPPORT" -v app="$APP" -v stranger="$STRANGER" >/dev/null <<'SQL'

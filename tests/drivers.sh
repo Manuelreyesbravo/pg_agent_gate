@@ -43,17 +43,23 @@ READ_SQL="select body from docs order by 1"
 
 export DEPS=$ROOT/tests/drivers/.deps
 PGJDBC=42.7.13
-PGJDBC_SHA1=a6e1bd21b412d6ffb3df23cd13d507bc2cc9e37d
+# SHA-256, not the SHA-1 Maven Central publishes next to the jar: SHA-1 has
+# practical chosen-prefix collisions, and a checksum that a collision can pass
+# is a checksum that proves nothing. Maven Central serves no .sha256 for this
+# artifact, so the digest is pinned here -- which is also what makes it a check
+# and not a round trip to the same server that sent the file.
+PGJDBC_SHA256=6e0e4cc2d8cae902084f8a2b18728b073a6fd9d1f87c9d8bff8f298c18185b93
 NODE_PG=8.23.0
 JAR=$DEPS/postgresql-$PGJDBC.jar
 
 mkdir -p "$DEPS"
 if [ ! -f "$JAR" ]; then
-    curl -sSfL -o "$JAR.part" "https://repo1.maven.org/maven2/org/postgresql/postgresql/$PGJDBC/postgresql-$PGJDBC.jar"
-    got=$(sha1sum "$JAR.part" | cut -c1-40)
-    if [ "$got" != "$PGJDBC_SHA1" ]; then
+    curl -sSfL --proto '=https' --tlsv1.2 -o "$JAR.part" \
+        "https://repo1.maven.org/maven2/org/postgresql/postgresql/$PGJDBC/postgresql-$PGJDBC.jar"
+    got=$(sha256sum "$JAR.part" | cut -d' ' -f1)
+    if [ "$got" != "$PGJDBC_SHA256" ]; then
         rm -f "$JAR.part"
-        echo "pgjdbc $PGJDBC checksum mismatch: expected $PGJDBC_SHA1, downloaded $got" >&2
+        echo "pgjdbc $PGJDBC checksum mismatch: expected $PGJDBC_SHA256, downloaded $got" >&2
         exit 2
     fi
     mv "$JAR.part" "$JAR"
@@ -63,15 +69,13 @@ if [ "$(node -e "try { console.log(require('$DEPS/node_modules/pg/package.json')
     (cd "$DEPS" && npm install --cache "$DEPS/.npm-cache" --no-audit --no-fund --save-exact "pg@$NODE_PG" >/dev/null)
 fi
 
-cleanup() {
-    "$BIN/psql" -X -U "$SUPERUSER" -d postgres -qc "drop database if exists $DB" >/dev/null 2>&1 || true
-    "$BIN/psql" -X -U "$SUPERUSER" -d postgres -qc "drop role if exists $ROLE" >/dev/null 2>&1 || true
-}
-trap cleanup EXIT
-cleanup
+# Claims the names instead of dropping whatever is there: see tests/guard.sh.
+source "$(dirname "${BASH_SOURCE[0]}")/guard.sh"
 
-"$BIN/psql" -X -U "$SUPERUSER" -d postgres -qc "create role $ROLE login"
-"$BIN/psql" -X -U "$SUPERUSER" -d postgres -qc "create database $DB"
+trap release_claimed EXIT
+require_throwaway_cluster
+claim_role "$ROLE"
+claim_database "$DB"
 "$BIN/psql" -X -U "$SUPERUSER" -d "$DB" -v ON_ERROR_STOP=1 -q -v role="$ROLE" >/dev/null <<SQL
 CREATE EXTENSION pg_agent_gate;
 

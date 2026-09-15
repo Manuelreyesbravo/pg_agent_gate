@@ -37,18 +37,19 @@ value() { "$BIN/psql" -X -U "$SUPERUSER" -tA "$@"; }
 agent() { "$BIN/psql" -X -U "$AGENT_ROLE" -tA "$@" 2>&1 || true; }
 proposal_id() { sed -nE 's/.*"proposal": ([0-9]+).*/\1/p' <<<"$1" | head -1; }
 
+# Claims the names instead of dropping whatever is there: see tests/guard.sh.
+source "$(dirname "${BASH_SOURCE[0]}")/guard.sh"
+
 cleanup() {
-    value -d postgres -c "drop database if exists $ORIGIN" >/dev/null 2>&1 || true
-    value -d postgres -c "drop database if exists $TARGET" >/dev/null 2>&1 || true
-    value -d postgres -c "drop role if exists $AGENT_ROLE" >/dev/null 2>&1 || true
+    release_claimed
     rm -f "$DUMP"
 }
 trap cleanup EXIT
-cleanup
 
-value -d postgres -c "create role $AGENT_ROLE login" >/dev/null
-value -d postgres -c "create database $ORIGIN" >/dev/null
-value -d postgres -c "create database $TARGET" >/dev/null
+require_throwaway_cluster
+claim_role "$AGENT_ROLE"
+claim_database "$ORIGIN"
+claim_database "$TARGET"
 
 # ------------------------------------------------------------- the origin --
 su -d "$ORIGIN" -v agent_role="$AGENT_ROLE" >/dev/null <<'SQL'

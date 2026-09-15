@@ -45,15 +45,13 @@ READ_SQL="select body from docs order by 1"
 
 as_agent() { "$BIN/psql" -X -U "$ROLE" -d "$DB" -tA "$@" 2>&1 || true; }
 
-cleanup() {
-    "$BIN/psql" -X -U "$SUPERUSER" -d postgres -qc "drop database if exists $DB" >/dev/null 2>&1 || true
-    "$BIN/psql" -X -U "$SUPERUSER" -d postgres -qc "drop role if exists $ROLE" >/dev/null 2>&1 || true
-}
-trap cleanup EXIT
-cleanup
+# Claims the names instead of dropping whatever is there: see tests/guard.sh.
+source "$(dirname "${BASH_SOURCE[0]}")/guard.sh"
 
-"$BIN/psql" -X -U "$SUPERUSER" -d postgres -qc "create role $ROLE login"
-"$BIN/psql" -X -U "$SUPERUSER" -d postgres -qc "create database $DB"
+trap release_claimed EXIT
+require_throwaway_cluster
+claim_role "$ROLE"
+claim_database "$DB"
 "$BIN/psql" -X -U "$SUPERUSER" -d "$DB" -v ON_ERROR_STOP=1 -q -v role="$ROLE" >/dev/null <<SQL
 CREATE EXTENSION pg_agent_gate;
 
