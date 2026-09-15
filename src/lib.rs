@@ -36,10 +36,51 @@ pub(crate) static MAX_RESULT_ROWS: GucSetting<i32> = GucSetting::<i32>::new(100)
 /// many seconds it is no longer allowed to stand in for a fresh one.
 pub(crate) static PROPOSAL_TTL_SECONDS: GucSetting<i32> = GucSetting::<i32>::new(900);
 
+/// How durable the record of an ATTEMPT is -- a proposal, a dry run, a read, a
+/// refusal: anything that changed no data. A change the gate keeps is always
+/// committed with the server's configured durability, and its flush carries the
+/// proposal that led to it. SUSET: the DBA decides, never the agent.
+///
+/// * `fast` (default): attempts ride on an asynchronous commit. A server crash
+///   inside the walwriter's window can lose the record of an attempt that
+///   changed nothing. pgaudit's log is not fsynced either.
+/// * `durable`: every record pays its own flush.
+#[allow(non_camel_case_types)]
+#[derive(pgrx::PostgresGucEnum, Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum AttemptDurability {
+    fast,
+    durable,
+}
+
+pub(crate) static ATTEMPT_DURABILITY: GucSetting<AttemptDurability> =
+    GucSetting::<AttemptDurability>::new(AttemptDurability::fast);
+
+pub(crate) fn attempts_fast() -> bool {
+    ATTEMPT_DURABILITY.get() == AttemptDurability::fast
+}
+
+pub(crate) fn attempt_durability_name() -> &'static str {
+    match ATTEMPT_DURABILITY.get() {
+        AttemptDurability::fast => "fast",
+        AttemptDurability::durable => "durable",
+    }
+}
+
 static mut PRELOADED: bool = false;
 
 pub(crate) fn current_agent() -> Option<String> {
     AGENT.get().and_then(|c| c.into_string().ok()).filter(|s| !s.is_empty())
+}
+
+/// The hooks run on EVERY statement of EVERY session once the library is
+/// preloaded, and almost none of those sessions belong to an agent. This asks
+/// the question without allocating: is the setting's C string non-empty?
+/// Only when it is does a hook pay for `current_agent()`.
+pub(crate) fn agent_is_set() -> bool {
+    unsafe {
+        let value = *AGENT.as_ptr();
+        !value.is_null() && *value != 0
+    }
 }
 
 pub(crate) fn preloaded() -> bool {
@@ -73,6 +114,14 @@ pub extern "C-unwind" fn _PG_init() {
         &PROPOSAL_TTL_SECONDS,
         1,
         86_400,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_enum_guc(
+        c"agent_gate.attempt_durability",
+        c"How durable the record of an attempt is (proposal, dry run, read, refusal).",
+        c"fast: asynchronous commit, a crash can lose attempts that changed nothing. durable: every record pays its own flush. Kept changes are always as durable as the server is configured.",
+        &ATTEMPT_DURABILITY,
         GucContext::Suset,
         GucFlags::default(),
     );
@@ -177,6 +226,40 @@ mod tests {
         assert_eq!(c["outcome"], "kept", "{c}");
         let plan: Option<String> = Spi::get_one("select plan from gate_c where id = 1").unwrap();
         assert_eq!(plan.as_deref(), Some("pro"));
+    }
+
+    /// A pg_test runs inside a transaction that has already written (it created
+    /// tables). Relaxing that commit would relax writes the gate never saw.
+    #[pg_test]
+    fn a_transaction_that_already_wrote_is_never_relaxed() {
+        Spi::run("create table gate_d (id int primary key)").unwrap();
+        let before: Option<String> = Spi::get_one("select current_setting('synchronous_commit')").unwrap();
+        let p = crate::verbs::propose("select id from gate_d", "a read in a transaction that wrote", None).0;
+        assert_eq!(p["ok"], true, "{p}");
+        let after: Option<String> = Spi::get_one("select current_setting('synchronous_commit')").unwrap();
+        assert_eq!(after, before, "the gate relaxed a transaction that had already written");
+    }
+
+    /// Whatever lowered durability earlier in the transaction, a change the gate
+    /// keeps is committed with the server's configured setting.
+    #[pg_test]
+    fn a_kept_change_restores_durability() {
+        Spi::run("create table gate_k (id int primary key, plan text not null)").unwrap();
+        Spi::run("insert into gate_k values (1, 'free')").unwrap();
+        let configured: Option<String> = Spi::get_one("select reset_val from pg_settings where name = 'synchronous_commit'").unwrap();
+        Spi::run("set local synchronous_commit = off").unwrap();
+        let p = crate::verbs::propose("update gate_k set plan = 'pro' where id = 1", "a change after durability was lowered", None).0;
+        let c = crate::verbs::commit(id(&p)).0;
+        assert_eq!(c["outcome"], "kept", "{c}");
+        let now: Option<String> = Spi::get_one("select current_setting('synchronous_commit')").unwrap();
+        assert_eq!(now, configured, "a kept change did not restore the configured durability");
+    }
+
+    #[pg_test]
+    fn whoami_reports_fast_attempts_by_default() {
+        let w = crate::verbs::whoami().0;
+        assert_eq!(w["attempt_durability"], "fast", "{w}");
+        assert_eq!(w["enforced"], true, "{w}");
     }
 }
 

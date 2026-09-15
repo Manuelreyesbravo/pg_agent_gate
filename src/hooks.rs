@@ -12,6 +12,11 @@
 //! execution without a fresh parse (a cached plan, a utility statement issued
 //! from C).
 //!
+//! THE COMMON CASE IS FREE. Once preloaded, these run on every statement of
+//! every session, and almost none belong to an agent. Each hook first asks two
+//! questions that allocate nothing -- is the gate's own SQL running, is the
+//! agent setting non-empty -- and returns. Only an agent session pays for more.
+//!
 //! WHAT IT DOES NOT COVER, said here and in the README:
 //! * the fast-path function-call protocol (PQfn) skips the parser; a function
 //!   reached that way which runs no SQL (large objects) is not stopped. Revoke
@@ -52,6 +57,12 @@ pub(crate) unsafe fn install() {
     INSTALLED = true;
 }
 
+/// True only when the statement must be judged: an agent session, and none of
+/// the gate's own SQL running. Allocation-free on the common path.
+fn must_judge() -> bool {
+    !state::sql_may_run() && crate::agent_is_set()
+}
+
 pub(crate) unsafe fn list_len(list: *mut pg_sys::List) -> i32 {
     if list.is_null() {
         0
@@ -88,7 +99,7 @@ unsafe extern "C-unwind" fn post_parse(
     if let Some(prev) = PREV_POST_PARSE {
         prev(pstate, query, jstate);
     }
-    if state::sql_may_run() || query.is_null() {
+    if query.is_null() || !must_judge() {
         return;
     }
     if let Some(agent) = crate::current_agent() {
@@ -110,7 +121,7 @@ unsafe extern "C-unwind" fn process_utility(
     dest: *mut pg_sys::DestReceiver,
     qc: *mut pg_sys::QueryCompletion,
 ) {
-    if !state::sql_may_run() && !pstmt.is_null() {
+    if !pstmt.is_null() && must_judge() {
         if let Some(agent) = crate::current_agent() {
             if let Err(why) = utility_allowed((*pstmt).utilityStmt) {
                 refuse(&agent, why);
@@ -134,7 +145,7 @@ unsafe extern "C-unwind" fn process_utility(
 
 #[pg_guard]
 unsafe extern "C-unwind" fn executor_start(query_desc: *mut pg_sys::QueryDesc, eflags: i32) {
-    if !state::sql_may_run() && !query_desc.is_null() {
+    if !query_desc.is_null() && must_judge() {
         if let Some(agent) = crate::current_agent() {
             let ps = (*query_desc).plannedstmt;
             if !ps.is_null()

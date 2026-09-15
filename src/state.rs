@@ -1,6 +1,7 @@
-//! The counters that decide whether SQL may run in an agent session.
+//! The counters that decide whether SQL may run in an agent session, and the
+//! facts about the current transaction that decide how durable a record is.
 //!
-//! THREE, AND KEPT APART ON PURPOSE:
+//! THREE COUNTERS, AND KEPT APART ON PURPOSE:
 //!
 //! * `TRUSTED`  -- the gate's own SQL is running (its record, `discover`).
 //! * `PROPOSAL` -- SQL the AGENT wrote is running (verification, execution).
@@ -14,13 +15,27 @@
 //! down: the guards' `Drop` (pgrx turns a PostgreSQL ERROR into an unwind that
 //! runs it) and, as the second line, a transaction-abort callback that zeroes
 //! all three.
+//!
+//! TWO TRANSACTION FACTS, for `agent_gate.attempt_durability = fast`:
+//!
+//! * `FOREIGN_WRITES` -- the transaction had already written something when
+//!   the first verb ran. Relaxing its commit would relax writes the gate never
+//!   saw, so a record in such a transaction is never relaxed.
+//! * `KEPT_CHANGE` -- the gate kept a change in this transaction. From then on
+//!   every record rides on the durable commit that change needs.
+//!
+//! Both are forgotten when the transaction ends, however it ends.
 
 use pgrx::prelude::*;
-use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::SeqCst};
 
 static TRUSTED: AtomicU32 = AtomicU32::new(0);
 static PROPOSAL: AtomicU32 = AtomicU32::new(0);
 static CHECKING: AtomicU32 = AtomicU32::new(0);
+
+static TXN_SEEN: AtomicBool = AtomicBool::new(false);
+static TXN_FOREIGN_WRITES: AtomicBool = AtomicBool::new(false);
+static TXN_KEPT_CHANGE: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn sql_may_run() -> bool {
     TRUSTED.load(SeqCst) > 0 || PROPOSAL.load(SeqCst) > 0 || CHECKING.load(SeqCst) > 0
@@ -64,23 +79,57 @@ pub(crate) fn checking_assertions() -> Guard {
     enter(&CHECKING)
 }
 
-fn reset() {
+pub(crate) fn txn_seen() -> bool {
+    TXN_SEEN.load(SeqCst)
+}
+
+pub(crate) fn mark_txn_seen(foreign_writes: bool) {
+    TXN_SEEN.store(true, SeqCst);
+    TXN_FOREIGN_WRITES.store(foreign_writes, SeqCst);
+}
+
+pub(crate) fn txn_foreign_writes() -> bool {
+    TXN_FOREIGN_WRITES.load(SeqCst)
+}
+
+pub(crate) fn mark_kept_change() {
+    TXN_KEPT_CHANGE.store(true, SeqCst);
+}
+
+pub(crate) fn txn_kept_change() -> bool {
+    TXN_KEPT_CHANGE.load(SeqCst)
+}
+
+fn reset_counters() {
     TRUSTED.store(0, SeqCst);
     PROPOSAL.store(0, SeqCst);
     CHECKING.store(0, SeqCst);
 }
 
-/// Only the TOP-LEVEL abort resets. A subtransaction abort happens inside the
-/// gate's own verbs, while they are still running and legitimately hold a
-/// counter up.
+fn forget_transaction() {
+    TXN_SEEN.store(false, SeqCst);
+    TXN_FOREIGN_WRITES.store(false, SeqCst);
+    TXN_KEPT_CHANGE.store(false, SeqCst);
+}
+
+/// Counters reset only on a TOP-LEVEL abort: a subtransaction abort happens
+/// inside the gate's own verbs, while they still legitimately hold a counter.
+/// The transaction facts are forgotten at every end of a transaction.
 #[pg_guard]
 pub(crate) unsafe extern "C-unwind" fn on_xact_event(
     event: pg_sys::XactEvent::Type,
     _arg: *mut std::ffi::c_void,
 ) {
-    if event == pg_sys::XactEvent::XACT_EVENT_ABORT
-        || event == pg_sys::XactEvent::XACT_EVENT_PARALLEL_ABORT
+    use pg_sys::XactEvent::*;
+    if event == XACT_EVENT_ABORT || event == XACT_EVENT_PARALLEL_ABORT {
+        reset_counters();
+    }
+    if event == XACT_EVENT_COMMIT
+        || event == XACT_EVENT_PARALLEL_COMMIT
+        || event == XACT_EVENT_ABORT
+        || event == XACT_EVENT_PARALLEL_ABORT
+        || event == XACT_EVENT_PREPARE
     {
-        reset();
+        forget_transaction();
     }
 }

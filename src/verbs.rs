@@ -3,6 +3,19 @@
 //! They replace an MCP server's `tools/list` + `tools/call`, with one
 //! difference that is the point of the extension: the agent never calls
 //! anything that acts. It proposes; PostgreSQL verifies, runs and records.
+//!
+//! HOW DURABLE A RECORD IS (`agent_gate.attempt_durability`):
+//!
+//! * a KEPT CHANGE is committed with the durability the server is configured
+//!   with, always. Its flush also carries the record of the proposal that led
+//!   to it, which sits earlier in the WAL -- so no change exists on disk
+//!   without its proposal and its execution next to it.
+//! * an ATTEMPT -- a proposal, a dry run, a read, a refusal, an abort: nothing
+//!   that changed data -- is committed asynchronously when the setting is
+//!   `fast` (the default). A server crash inside the walwriter's window can
+//!   lose it. With `durable` every record pays its own flush.
+//! * never relaxed in a transaction that had written something before the
+//!   first verb ran: those writes are not the gate's to relax.
 
 use crate::exec::{collect_rows, in_subxact, Rows};
 use crate::hooks::VERBS;
@@ -79,10 +92,36 @@ fn config(who: &Identity) -> Config {
     }
 }
 
-fn not_from_inside() {
+/// Every verb that records starts here: no calls from inside a proposal, and
+/// the first verb of a transaction notes whether something was already written.
+fn begin_verb() {
     if state::proposal_running() || state::checking() {
         error!("pg_agent_gate: a proposal cannot call the gate from inside itself");
     }
+    if !state::txn_seen() {
+        let foreign: Option<bool> =
+            call_internal("select pg_current_xact_id_if_assigned() is not null", &[]);
+        state::mark_txn_seen(foreign.unwrap_or(true));
+    }
+}
+
+/// The record of something that changed nothing may ride on an asynchronous
+/// commit -- if the setting allows it and nothing in this transaction needs more.
+fn relax_for_an_attempt() {
+    if crate::attempts_fast() && !state::txn_foreign_writes() && !state::txn_kept_change() {
+        let _gate = state::trusted();
+        Spi::run("SET LOCAL synchronous_commit = off")
+            .expect("pg_agent_gate: could not relax the record of an attempt");
+    }
+}
+
+/// A kept change gets the durability the server is configured with, whatever an
+/// earlier verb of the same transaction relaxed or the session set.
+fn restore_for_a_change() {
+    state::mark_kept_change();
+    let _gate = state::trusted();
+    Spi::run("SET LOCAL synchronous_commit TO DEFAULT")
+        .expect("pg_agent_gate: could not restore durability for a kept change");
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -104,7 +143,9 @@ impl Mode {
 /// own privileges -- never from a list someone keeps by hand.
 #[pg_extern]
 pub fn discover(filter: default!(Option<&str>, "NULL"), max_objects: default!(i32, 50)) -> JsonB {
-    not_from_inside();
+    if state::proposal_running() || state::checking() {
+        error!("pg_agent_gate: a proposal cannot call the gate from inside itself");
+    }
     let who = identity();
     let found: Option<JsonB> = call_internal(
         crate::schema::DISCOVER_SQL,
@@ -118,7 +159,7 @@ pub fn discover(filter: default!(Option<&str>, "NULL"), max_objects: default!(i3
 /// Propose one statement. Nothing runs: it is verified and recorded.
 #[pg_extern]
 pub fn propose(sql: &str, intent: &str, params: default!(Option<Vec<Option<String>>>, "NULL")) -> JsonB {
-    not_from_inside();
+    begin_verb();
     if intent.trim().chars().count() < 3 {
         error!("pg_agent_gate: say what the proposal is for (intent); it stays in the record");
     }
@@ -127,6 +168,7 @@ pub fn propose(sql: &str, intent: &str, params: default!(Option<Vec<Option<Strin
     let verdict = verify::verify(sql, &params, cfg.allow_ddl);
     let kind = verdict.kind.map(|k| k.as_str()).unwrap_or("unknown");
 
+    relax_for_an_attempt();
     let id: i64 = call_internal(
         "select agent_gate_internal._record_proposal($1, $2, $3, $4, $5, $6, $7, $8, $9)",
         &[
@@ -164,21 +206,23 @@ pub fn propose(sql: &str, intent: &str, params: default!(Option<Vec<Option<Strin
 /// and whether bound assertions would still hold. Nothing is kept.
 #[pg_extern]
 pub fn dry_run(proposal: i64) -> JsonB {
-    not_from_inside();
+    begin_verb();
     JsonB(execute(proposal, Mode::DryRun))
 }
 
 /// Run the proposal and keep it, if every guard still agrees.
 #[pg_extern]
 pub fn commit(proposal: i64) -> JsonB {
-    not_from_inside();
+    begin_verb();
     JsonB(execute(proposal, Mode::Commit))
 }
 
 /// What this agent proposed and did, newest first.
 #[pg_extern]
 pub fn acts(max_acts: default!(i32, 20)) -> JsonB {
-    not_from_inside();
+    if state::proposal_running() || state::checking() {
+        error!("pg_agent_gate: a proposal cannot call the gate from inside itself");
+    }
     let who = identity();
     let found: Option<JsonB> = call_internal(
         "select agent_gate_internal._acts($1, $2)",
@@ -197,6 +241,7 @@ pub fn whoami() -> JsonB {
         "role": who.role,
         "enforced": crate::hooks::installed(),
         "loaded_at_server_start": crate::preloaded(),
+        "attempt_durability": crate::attempt_durability_name(),
         "verbs": VERBS,
         "version": env!("CARGO_PKG_VERSION"),
     }))
@@ -233,6 +278,11 @@ fn record_execution(
     sample: Option<Value>,
     duration_ms: f64,
 ) -> Option<i64> {
+    if outcome == "kept" {
+        restore_for_a_change();
+    } else {
+        relax_for_an_attempt();
+    }
     call_internal(
         "select agent_gate_internal._record_execution($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
         &[
