@@ -96,6 +96,16 @@ CREATE TRIGGER proposals_append_only BEFORE UPDATE OR DELETE ON agent_gate_inter
 CREATE TRIGGER executions_append_only BEFORE UPDATE OR DELETE ON agent_gate_internal.executions
     FOR EACH ROW EXECUTE FUNCTION agent_gate_internal._append_only();
 
+-- TRUNCATE FIRES NO FOR EACH ROW TRIGGER. Without these two the whole history
+-- could be emptied in one statement, with nothing disabled and nothing said --
+-- which is not the deliberate act of administration the paragraph above
+-- describes, it is the opposite. The asymmetry (UPDATE and DELETE stopped,
+-- TRUNCATE free) was an oversight, found by tests/hostile.sh.
+CREATE TRIGGER proposals_no_truncate BEFORE TRUNCATE ON agent_gate_internal.proposals
+    FOR EACH STATEMENT EXECUTE FUNCTION agent_gate_internal._append_only();
+CREATE TRIGGER executions_no_truncate BEFORE TRUNCATE ON agent_gate_internal.executions
+    FOR EACH STATEMENT EXECUTE FUNCTION agent_gate_internal._append_only();
+
 CREATE FUNCTION agent_gate_internal._only_the_gate() RETURNS void
 LANGUAGE plpgsql SET search_path = pg_catalog AS $$
 BEGIN
@@ -142,10 +152,22 @@ BEGIN
     RETURN new_id;
 END $$;
 
-CREATE FUNCTION agent_gate_internal._load_proposal(p_id bigint) RETURNS jsonb
+CREATE FUNCTION agent_gate_internal._load_proposal(p_id bigint, p_lock boolean DEFAULT false)
+RETURNS jsonb
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, agent_gate_internal AS $$
 BEGIN
     PERFORM agent_gate_internal._only_the_gate();
+    -- TWO COMMITS OF THE SAME PROPOSAL AT THE SAME TIME BOTH RAN IT. 'committed'
+    -- below is read from each transaction's own snapshot, and neither sees the
+    -- other's commit yet, so both passed the check and the change was applied
+    -- twice -- on a balance that is a double charge. Measured with two
+    -- concurrent commits (tests/hostile.sh). Locking the row makes the second
+    -- one wait and then see it kept. Only when the caller is about to execute:
+    -- a dry run does not need it, and taking row locks on reads would assign a
+    -- transaction id to every one of them.
+    IF p_lock THEN
+        PERFORM 1 FROM agent_gate_internal.proposals WHERE id = p_id FOR UPDATE;
+    END IF;
     RETURN (
         SELECT jsonb_build_object(
                    'id', p.id, 'agent', p.agent, 'sql', p.sql, 'params', to_jsonb(p.params),

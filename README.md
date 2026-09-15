@@ -232,6 +232,19 @@ declared before the code that it measures.
 | every channel a session can type, tried on purpose (`tests/adversarial.sh`): two statements in one query, `PREPARE`/`EXECUTE`, a cursor, `COPY TO`/`FROM PROGRAM`, `DO`, `CALL`, `EXPLAIN ANALYZE`, `CREATE TABLE`/`FUNCTION`, `SELECT INTO`, a writing CTE, a function as a verb argument, a subselect of what it was not granted, `SET ROLE`, `SET SESSION AUTHORIZATION`, `RESET ALL`, `DISCARD ALL`, `VACUUM`, `CHECKPOINT`, `LISTEN`/`NOTIFY`, `lo_export`, and a replication connection | 0 | **0 of 22 had any effect** |
 | what can be slipped past `propose` (`tests/adversarial.sh`): two statements, a second one hidden after a comment, DDL without permission, `COPY TO PROGRAM`, `SELECT INTO`, `FOR UPDATE` and a write beyond `max_rows`, an expired verification, another agent's proposal | 0 | **0 of 9** |
 | **control**: an agent still runs `whoami`, `discover`, proposes, sees before/after in `dry_run`, commits a read and a write, is refused a second commit, and reads its `acts` | 100% | **11 of 11** |
+| garbage into `propose` and `commit` (`tests/hostile.sh`): malformed SQL, unbalanced parentheses, an unterminated comment and dollar quote, a NUL byte, 500 levels of nesting, 100 KB of SQL, 500 parameters, fewer parameters than placeholders, a type that does not exist, invalid UTF-8, a 10 KB identifier, an empty proposal, ids that do not exist, an endless query | 0 crashes | **0 of 16, same postmaster** |
+| the record rewritten (`tests/hostile.sh`): `DELETE`, `TRUNCATE`, disabling the triggers and dropping them, as the agent and as the owner | 0 | **0 of 7** |
+| the world moved between `propose` and `commit` (`tests/hostile.sh`): table renamed, column dropped, privilege revoked, row gone, a bound assertion broken meanwhile, two sessions at once, and the same proposal committed twice at once | 100% | **9 of 9** |
+| **control**: what an owner's trigger, `SECURITY DEFINER` function and view do on the agent's behalf is what this README says | 100% | **5 of 5** |
+
+**Two of those rows found real defects, which is why they exist.** `TRUNCATE`
+emptied the whole record: the append-only triggers were `FOR EACH ROW`, and
+`TRUNCATE` fires no row trigger, so the history could be erased in one statement
+with nothing disabled and nothing said. And two concurrent `commit`s of the same
+proposal both ran it -- each transaction read `committed` from its own snapshot,
+where the other had not committed yet, so a write was applied twice. On a balance
+that is a double charge. Both are fixed: statement-level triggers for `TRUNCATE`,
+and the proposal's row is locked while a commit decides.
 | extra time per read (`propose` + `commit`) over running the query directly, default settings | <= 10 ms | **0.41 ms** |
 | extra time per kept write over the same `UPDATE` run directly (which pays its own durable commit) | <= 5 ms | **0.41 ms** |
 | throughput lost by preloading the library in sessions that are not agents (`pgbench -S`, median of 5 alternating pairs) | <= 3% | **0.43%** |
@@ -308,7 +321,15 @@ Said here so nobody learns it the hard way:
   are not undone.
 * **Functions a proposal calls run with their own rules.** A `SECURITY DEFINER`
   function the agent may execute does what it does; the gate verifies the
-  proposal, not every function body.
+  proposal, not every function body. Measured (`tests/hostile.sh`): called from
+  a READ it leaves nothing, because a read's subtransaction is always rolled
+  back -- but inside a WRITE that is kept, whatever it wrote is kept with it.
+* **A view is checked with its owner's privileges unless it was created with
+  `security_invoker`.** An agent granted `SELECT` on such a view reads the
+  tables behind it, including ones it has no privilege on at all: measured, a
+  secret came through that way. That is PostgreSQL, not the gate -- the gate
+  verifies the proposal, it does not re-decide what a view may show. `discover`
+  lists the view, because the agent was granted it, and not the table behind.
 * **`EXPLAIN` folds constant calls to immutable functions.** A function falsely
   marked `IMMUTABLE` could run at `propose`. Marking functions honestly is a
   prerequisite.

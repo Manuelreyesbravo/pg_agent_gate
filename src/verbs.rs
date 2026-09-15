@@ -352,7 +352,18 @@ fn execute(proposal: i64, mode: Mode) -> Value {
     let started = Instant::now();
     let who = identity();
 
-    let loaded: Option<JsonB> = read_internal("select agent_gate_internal._load_proposal($1)", &[proposal.into()]);
+    // A commit LOCKS the proposal's row while it decides; a dry run does not.
+    // Without the lock two concurrent commits of the same proposal each read
+    // 'committed' from their own snapshot, where the other had not committed
+    // yet, and both ran it -- measured, the change was applied twice
+    // (tests/hostile.sh). The locking path goes through read-write SPI because
+    // a row lock needs a transaction id, which a commit is about to spend
+    // anyway; reads keep using read-only SPI so they still spend none.
+    let loaded: Option<JsonB> = if mode == Mode::Commit {
+        call_internal("select agent_gate_internal._load_proposal($1, true)", &[proposal.into()])
+    } else {
+        read_internal("select agent_gate_internal._load_proposal($1)", &[proposal.into()])
+    };
     let Some(JsonB(p)) = loaded.filter(|j| !j.0.is_null()) else {
         // Nothing to attach a record to: said to the caller and to the log.
         log!("pg_agent_gate: agent={} asked for proposal {} which does not exist", who.agent, proposal);
