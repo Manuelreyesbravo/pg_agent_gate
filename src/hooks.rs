@@ -90,11 +90,17 @@ pub(crate) fn refuse(agent: &str, why: String) -> ! {
     unreachable!()
 }
 
+// PostgreSQL 19 made the jumble state a const pointer in this hook.
+#[cfg(feature = "pg18")]
+type JumbleStatePtr = *mut pg_sys::JumbleState;
+#[cfg(not(feature = "pg18"))]
+type JumbleStatePtr = *const pg_sys::JumbleState;
+
 #[pg_guard]
 unsafe extern "C-unwind" fn post_parse(
     pstate: *mut pg_sys::ParseState,
     query: *mut pg_sys::Query,
-    jstate: *const pg_sys::JumbleState,
+    jstate: JumbleStatePtr,
 ) {
     if let Some(prev) = PREV_POST_PARSE {
         prev(pstate, query, jstate);

@@ -255,6 +255,18 @@ mod tests {
         assert_eq!(now, configured, "a kept change did not restore the configured durability");
     }
 
+    /// The positive half of the control, missing at first: the two tests above
+    /// both run in transactions that already wrote, so they passed with the
+    /// relaxation never happening at all. Found by the criteria harness, whose
+    /// fast read cost the same as a durable one.
+    #[pg_test]
+    fn an_attempt_in_a_clean_transaction_is_relaxed() {
+        let p = crate::verbs::propose("select 1", "an attempt before anything was written", None).0;
+        assert_eq!(p["ok"], true, "{p}");
+        let now: Option<String> = Spi::get_one("select current_setting('synchronous_commit')").unwrap();
+        assert_eq!(now.as_deref(), Some("off"), "a clean attempt was not relaxed");
+    }
+
     #[pg_test]
     fn whoami_reports_fast_attempts_by_default() {
         let w = crate::verbs::whoami().0;

@@ -16,6 +16,15 @@
 //!   lose it. With `durable` every record pays its own flush.
 //! * never relaxed in a transaction that had written something before the
 //!   first verb ran: those writes are not the gate's to relax.
+//!
+//! NO PHANTOM TRANSACTION IDS. pgrx's `SpiClient::update` asks PostgreSQL for
+//! the current transaction id before running anything, which ASSIGNS one. A
+//! transaction with an id writes a commit record, and a durable commit record
+//! is an fsync. So the gate's reads go through read-only SPI, and whether the
+//! transaction already wrote is asked in C without assigning anything. The
+//! first version got both wrong: every `discover` and `acts` paid a flush, and
+//! the question "did this transaction already write?" answered itself yes by
+//! asking -- which is why attempts were never relaxed.
 
 use crate::exec::{collect_rows, in_subxact, Rows};
 use crate::hooks::VERBS;
@@ -55,7 +64,8 @@ struct Config {
     bindings: Vec<String>,
 }
 
-/// The gate's own SQL, run as the gate: the record functions accept it.
+/// The gate's own SQL that WRITES the record. Read-write SPI: assigns a
+/// transaction id, which a write needs anyway.
 fn call_internal<T: FromDatum + IntoDatum>(query: &str, args: &[DatumWithOid]) -> Option<T> {
     let _gate = state::trusted();
     Spi::connect_mut(|client| {
@@ -68,6 +78,21 @@ fn call_internal<T: FromDatum + IntoDatum>(query: &str, args: &[DatumWithOid]) -
     })
 }
 
+/// The gate's own SQL that only READS. Read-only SPI: no transaction id, so no
+/// commit record and no flush. The record functions called this way are
+/// VOLATILE plpgsql, and read with a fresh snapshot inside.
+fn read_internal<T: FromDatum + IntoDatum>(query: &str, args: &[DatumWithOid]) -> Option<T> {
+    let _gate = state::trusted();
+    Spi::connect(|client| {
+        client
+            .select(query, Some(1), args)
+            .expect("pg_agent_gate: internal read failed")
+            .first()
+            .get::<T>(1)
+            .expect("pg_agent_gate: internal read returned an unexpected type")
+    })
+}
+
 fn config(who: &Identity) -> Config {
     if !who.is_agent {
         // A human or a service using the gate on purpose: the same checks, the
@@ -75,7 +100,7 @@ fn config(who: &Identity) -> Config {
         return Config { max_rows: 1000, allow_ddl: false, bindings: Vec::new() };
     }
     let found: Option<JsonB> =
-        call_internal("select agent_gate_internal._agent($1)", &[who.agent.clone().into()]);
+        read_internal("select agent_gate_internal._agent($1)", &[who.agent.clone().into()]);
     let Some(JsonB(agent)) = found.filter(|j| !j.0.is_null()) else {
         error!(
             "pg_agent_gate: this role is marked as agent \"{}\", but no agent by that name is registered",
@@ -92,22 +117,34 @@ fn config(who: &Identity) -> Config {
     }
 }
 
-/// Every verb that records starts here: no calls from inside a proposal, and
-/// the first verb of a transaction notes whether something was already written.
-fn begin_verb() {
+fn not_from_inside() {
     if state::proposal_running() || state::checking() {
         error!("pg_agent_gate: a proposal cannot call the gate from inside itself");
     }
+}
+
+/// Every verb that records starts here: no calls from inside a proposal, and
+/// the first verb of a transaction notes whether something was already
+/// written -- asked in C, because asking through read-write SPI assigns the
+/// very transaction id the question is about.
+fn begin_verb() {
+    not_from_inside();
     if !state::txn_seen() {
-        let foreign: Option<bool> =
-            call_internal("select pg_current_xact_id_if_assigned() is not null", &[]);
-        state::mark_txn_seen(foreign.unwrap_or(true));
+        let already_wrote = unsafe { pg_sys::GetTopTransactionIdIfAny() } != pg_sys::TransactionId::INVALID;
+        state::mark_txn_seen(already_wrote);
     }
 }
 
 /// The record of something that changed nothing may ride on an asynchronous
 /// commit -- if the setting allows it and nothing in this transaction needs more.
 fn relax_for_an_attempt() {
+    debug1!(
+        "pg_agent_gate: relax? fast={} seen={} foreign_writes={} kept_change={}",
+        crate::attempts_fast(),
+        state::txn_seen(),
+        state::txn_foreign_writes(),
+        state::txn_kept_change()
+    );
     if crate::attempts_fast() && !state::txn_foreign_writes() && !state::txn_kept_change() {
         let _gate = state::trusted();
         Spi::run("SET LOCAL synchronous_commit = off")
@@ -143,11 +180,9 @@ impl Mode {
 /// own privileges -- never from a list someone keeps by hand.
 #[pg_extern]
 pub fn discover(filter: default!(Option<&str>, "NULL"), max_objects: default!(i32, 50)) -> JsonB {
-    if state::proposal_running() || state::checking() {
-        error!("pg_agent_gate: a proposal cannot call the gate from inside itself");
-    }
+    not_from_inside();
     let who = identity();
-    let found: Option<JsonB> = call_internal(
+    let found: Option<JsonB> = read_internal(
         crate::schema::DISCOVER_SQL,
         &[filter.map(str::to_string).into(), max_objects.into()],
     );
@@ -220,11 +255,9 @@ pub fn commit(proposal: i64) -> JsonB {
 /// What this agent proposed and did, newest first.
 #[pg_extern]
 pub fn acts(max_acts: default!(i32, 20)) -> JsonB {
-    if state::proposal_running() || state::checking() {
-        error!("pg_agent_gate: a proposal cannot call the gate from inside itself");
-    }
+    not_from_inside();
     let who = identity();
-    let found: Option<JsonB> = call_internal(
+    let found: Option<JsonB> = read_internal(
         "select agent_gate_internal._acts($1, $2)",
         &[who.agent.into(), max_acts.into()],
     );
@@ -319,7 +352,7 @@ fn execute(proposal: i64, mode: Mode) -> Value {
     let started = Instant::now();
     let who = identity();
 
-    let loaded: Option<JsonB> = call_internal("select agent_gate_internal._load_proposal($1)", &[proposal.into()]);
+    let loaded: Option<JsonB> = read_internal("select agent_gate_internal._load_proposal($1)", &[proposal.into()]);
     let Some(JsonB(p)) = loaded.filter(|j| !j.0.is_null()) else {
         // Nothing to attach a record to: said to the caller and to the log.
         log!("pg_agent_gate: agent={} asked for proposal {} which does not exist", who.agent, proposal);
