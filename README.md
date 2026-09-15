@@ -281,6 +281,20 @@ Said here so nobody learns it the hard way:
   **An agent's context is set on its role** (`ALTER ROLE ... SET`), and a DBA
   who needs one more parameter adds it to `agent_gate.settable` -- which is
   saying, out loud, that no policy of theirs stands on it.
+* **The allowlist also covers parameters set when the connection starts.** A
+  startup parameter -- libpq's `PGOPTIONS`, the `options` property of pgjdbc
+  and node-pg -- is not a statement and reaches no hook, and a value the client
+  sets at startup outranks the one on the role. Measured with pgjdbc 42.7.13,
+  node-pg 8.23.0 and libpq before this was covered: `options=-c
+  app.tenant_id=2` and the agent read the other tenant's row
+  (`tests/drivers.sh`). An agent session that started with a parameter outside
+  the allowlist now fails closed: every statement it sends is refused. What the
+  drivers send on their own (`client_encoding`, `DateStyle`, `TimeZone`,
+  `extra_float_digits`, `application_name`, a `statement_timeout` in `options`)
+  is on the list and keeps working. `search_path` is deliberately not on it, so
+  a driver configured with a default schema will be refused: pgjdbc's connection
+  code sends `currentSchema` as the startup parameter `search_path` (read in
+  the driver, not measured here). Set the agent's schema on its role instead.
 * **The fast-path function-call protocol** (`PQfn`) skips the parser. A
   function reached that way that runs no SQL -- large objects -- is not
   stopped. Revoke `EXECUTE` on those from agent roles.

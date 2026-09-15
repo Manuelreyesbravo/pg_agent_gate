@@ -5,8 +5,9 @@
 //! These hooks make it disappear: in a session that belongs to an agent, every
 //! statement that reaches the parser must be `SELECT agent_gate.<verb>(...)`
 //! with literals or parameters as arguments, transaction control, SHOW, or a SET
-//! that does not change who is acting (never role, session_authorization or
-//! anything under agent_gate.*).
+//! of a parameter on the allowlist (crate::SETTABLE_BY_AGENTS). The same allowlist
+//! judges the parameters the session STARTED with: a startup parameter is not a
+//! statement, so it is checked once, before the session's first statement is judged.
 //! Everything else dies before it is planned.
 //!
 //! THREE HOOKS, ONE RULE. `post_parse_analyze` is the gate. `ProcessUtility`
@@ -61,8 +62,28 @@ pub(crate) unsafe fn install() {
 
 /// True only when the statement must be judged: an agent session, and none of
 /// the gate's own SQL running. Allocation-free on the common path.
+///
+/// It is also where the SESSION is judged, before any of its statements: an agent
+/// session that started with a parameter it may not hold -- `options=-c
+/// app.tenant_id=2` -- would read under a context its role was not given, and no
+/// statement of it shows that. Such a session fails closed: every statement is
+/// refused, in all three hooks, because all three ask this first.
 fn must_judge() -> bool {
-    !state::sql_may_run() && crate::agent_is_set()
+    if state::sql_may_run() || !crate::agent_is_set() {
+        return false;
+    }
+    if let Some(name) = crate::startup_parameter_not_settable() {
+        refuse(&crate::current_agent().unwrap_or_default(), started_with(&name));
+    }
+    true
+}
+
+fn started_with(name: &str) -> String {
+    format!(
+        "the connection set {name} when it started (a startup parameter, such as libpq's PGOPTIONS or a driver's \
+         `options`): an agent session may only start with client formatting and time limits. Its context is set \
+         on its role, and a superuser can add a parameter to agent_gate.settable"
+    )
 }
 
 pub(crate) unsafe fn list_len(list: *mut pg_sys::List) -> i32 {

@@ -138,6 +138,47 @@ pub(crate) fn settable(name: &str) -> bool {
     }
 }
 
+/// Parameters the CLIENT set when the connection started: libpq's PGOPTIONS, the
+/// `options` property of pgjdbc and node-pg, or any other startup parameter.
+///
+/// The allowlist used to judge only statements, and a startup parameter is not a
+/// statement: `options=-c app.tenant_id=2` reached no hook, and a value the client
+/// sets at startup (PGC_S_CLIENT) outranks the one the registrar put on the role
+/// (PGC_S_USER). Measured with pgjdbc 42.7.13, node-pg 8.23.0 and libpq: the agent
+/// read the other tenant's row (tests/drivers.sh).
+///
+/// Collected once per backend, because startup parameters cannot change after the
+/// connection starts. `reset_source` counts as well as `source`: RESET ALL is
+/// allowed, and it would bring a startup value back. Whether each name may stay is
+/// decided on every call, so a change to `agent_gate.settable` applies at once.
+static STARTUP_PARAMETERS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+pub(crate) fn startup_parameter_not_settable() -> Option<String> {
+    STARTUP_PARAMETERS
+        .get_or_init(|| unsafe {
+            let client = pg_sys::GucSource::PGC_S_CLIENT;
+            let mut count: std::ffi::c_int = 0;
+            let vars = pg_sys::get_guc_variables(&mut count);
+            let mut names = Vec::new();
+            if vars.is_null() {
+                return names;
+            }
+            for i in 0..count.max(0) as usize {
+                let g = *vars.add(i);
+                if g.is_null() || (*g).name.is_null() {
+                    continue;
+                }
+                if (*g).source == client || (*g).reset_source == client {
+                    names.push(std::ffi::CStr::from_ptr((*g).name).to_string_lossy().to_lowercase());
+                }
+            }
+            names
+        })
+        .iter()
+        .find(|name| !settable(name))
+        .cloned()
+}
+
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
     GucRegistry::define_string_guc(
