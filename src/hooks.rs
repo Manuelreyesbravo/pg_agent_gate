@@ -204,18 +204,25 @@ unsafe fn utility_allowed(stmt: *mut pg_sys::Node) -> Result<(), String> {
             } else {
                 CStr::from_ptr(v.name).to_string_lossy().to_lowercase()
             };
-            // Who is acting is not a setting an agent session changes. `role` and
-            // `session_authorization` change the database user; `agent_gate.*` is
-            // the mark itself and the gate's own knobs. Leaving the mark to the
-            // superuser-only GUC context was not enough: PostgreSQL 15+ can GRANT
-            // SET ON PARAMETER agent_gate.agent, and with that one mistaken grant
-            // an agent ran `set agent_gate.agent = ''` and then raw SQL (measured,
-            // tests/privileges.sh). One rule for the whole prefix, SET and RESET
-            // alike, instead of a list of the knobs that happen to matter today.
-            if name == "role" || name == "session_authorization" || name.starts_with("agent_gate.") {
-                Err(format!("SET {name} would change who is acting; an agent session keeps its identity"))
-            } else {
+            // An ALLOWLIST, not a list of forbidden names: what an agent session
+            // may change is client formatting and time limits (crate::SETTABLE_BY_AGENTS,
+            // plus whatever a superuser added to agent_gate.settable). Everything
+            // else is refused -- who is acting (`role`, `session_authorization`,
+            // `agent_gate.*`), and, just as important, whatever the application
+            // decides with: a policy over current_setting('app.tenant_id') is the
+            // ordinary way to separate tenants, and no denylist can name the
+            // parameters an application invents (measured; tests/rls_isolation.sh).
+            //
+            // A nameless statement -- RESET ALL, SET SESSION CHARACTERISTICS with no
+            // parameter -- goes back to what the ROLE was given, which is where an
+            // agent's context is supposed to come from, so it passes.
+            if name.is_empty() || crate::settable(&name) {
                 Ok(())
+            } else {
+                Err(format!(
+                    "SET {name} is not one an agent session may change: an agent's context is set on its role, \
+                     and a superuser can add a parameter to agent_gate.settable"
+                ))
             }
         }
         other => Err(format!("{other:?} is not one of the gate's verbs ({})", VERBS.join(", "))),

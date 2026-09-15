@@ -266,11 +266,21 @@ Said here so nobody learns it the hard way:
   it. Restored into a server without the globals, the record still says the
   role is an agent while the role is outside the gate. The record itself does
   survive `pg_dump`; `tests/dump_restore.sh` checks both halves.
-* **`SET`, `SHOW` and transaction control reach the database from an agent
-  session**, because drivers issue them on their own. What changes who is
-  acting does not: `SET role`, `SET session_authorization` and every
-  `agent_gate.*` setting are refused, even if someone granted `SET ON
-  PARAMETER` on them (`tests/privileges.sh`).
+* **An agent session may change only the session parameters on an allowlist**:
+  client formatting and time limits, which is what a driver sets on its own
+  (`application_name`, `client_encoding`, `DateStyle`, `statement_timeout`,
+  the transaction characteristics, and a few more). `SHOW` and transaction
+  control pass; everything else is refused, including `role`,
+  `session_authorization`, every `agent_gate.*` setting even if someone granted
+  `SET ON PARAMETER` on it, and -- the reason it is an allowlist and not a list
+  of forbidden names -- whatever the application decides with. A row-level
+  policy over `current_setting('app.tenant_id')` is the ordinary way to
+  separate tenants, and no denylist can name the parameters an application
+  invents: measured, an agent could point that policy at another tenant and the
+  same read returned the other tenant's row (`tests/rls_isolation.sh`).
+  **An agent's context is set on its role** (`ALTER ROLE ... SET`), and a DBA
+  who needs one more parameter adds it to `agent_gate.settable` -- which is
+  saying, out loud, that no policy of theirs stands on it.
 * **The fast-path function-call protocol** (`PQfn`) skips the parser. A
   function reached that way that runs no SQL -- large objects -- is not
   stopped. Revoke `EXECUTE` on those from agent roles.

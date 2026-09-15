@@ -140,7 +140,7 @@ check attack "RESET ALL does not take an agent out of the gate" "it proposes, it
 # refused the whole agent_gate.* prefix that was a measured exit: with this grant,
 # `set agent_gate.agent = ''` worked and the next raw SELECT ran.
 "$BIN/psql" -X -U "$SUPERUSER" -d "$DB" -qc "grant set on parameter agent_gate.agent to $BILLING"
-check attack "with SET ON PARAMETER granted by mistake, an agent still cannot clear its mark" "would change who is acting" \
+check attack "with SET ON PARAMETER granted by mistake, an agent still cannot clear its mark" "an agent session may change" \
     "$(as "$BILLING" -c "set agent_gate.agent = ''" -c "select count(*) from clientes")"
 check attack "and the raw SQL after that attempt is still refused" "it proposes, it does not execute" \
     "$(as "$BILLING" -c "set agent_gate.agent = ''" -c "select count(*) from clientes")"

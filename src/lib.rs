@@ -87,8 +87,67 @@ pub(crate) fn preloaded() -> bool {
     unsafe { PRELOADED }
 }
 
+/// Session parameters an agent session may change, and nothing else.
+///
+/// It is an ALLOWLIST and that is the whole point. The rule used to name what was
+/// forbidden -- `role`, `session_authorization`, `agent_gate.*` -- and an
+/// application parameter is in no such list: a row-level policy written over
+/// `current_setting('app.tenant_id')`, the ordinary way to separate tenants, could
+/// be pointed at another tenant by the agent itself (measured; tests/rls_isolation.sh).
+/// No list of forbidden names can cover parameters the application invents.
+///
+/// What is here is what a driver sets on its own: output formatting and time
+/// limits. `search_path` is deliberately absent -- it changes how a proposal
+/// resolves its names -- and so is anything that decides what rows exist. A DBA
+/// who needs more adds it to `agent_gate.settable`.
+pub(crate) const SETTABLE_BY_AGENTS: &[&str] = &[
+    "application_name",
+    "bytea_output",
+    "client_encoding",
+    "client_min_messages",
+    "datestyle",
+    "default_transaction_deferrable",
+    "default_transaction_isolation",
+    "default_transaction_read_only",
+    "extra_float_digits",
+    "idle_in_transaction_session_timeout",
+    "intervalstyle",
+    "lock_timeout",
+    "session characteristics",
+    "standard_conforming_strings",
+    "statement_timeout",
+    "timezone",
+    "transaction",
+    "transaction_deferrable",
+    "transaction_isolation",
+    "transaction_read_only",
+];
+
+/// Extra session parameters an agent may change, comma separated. SUSET: adding
+/// one is an act of administration, and it is the DBA saying "no policy of mine
+/// stands on this".
+pub(crate) static SETTABLE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
+
+pub(crate) fn settable(name: &str) -> bool {
+    if SETTABLE_BY_AGENTS.contains(&name) {
+        return true;
+    }
+    match SETTABLE.get().and_then(|c| c.into_string().ok()) {
+        Some(extra) => extra.split(',').any(|p| p.trim().to_lowercase() == name),
+        None => false,
+    }
+}
+
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
+    GucRegistry::define_string_guc(
+        c"agent_gate.settable",
+        c"Extra session parameters an agent session may change, comma separated.",
+        c"Beyond the built-in list of client formatting and timeouts. Anything a row-level policy or a function reads from current_setting() does not belong here.",
+        &SETTABLE,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
     GucRegistry::define_string_guc(
         c"agent_gate.agent",
         c"The agent this session belongs to.",
