@@ -255,6 +255,29 @@ declared with. On the test machine one `fdatasync` costs about 5 ms (Btrfs with
 copy-on-write), and with every record durable a read act pays two. The default
 does not, and the crash control above is what shows it gave nothing up for it.
 
+## Upgrading
+
+**Copying a new `.so` does not upgrade anything.** Most of what this extension
+guarantees lives in its SQL -- the triggers that keep the record append-only, the
+functions that write it -- and that SQL runs once, inside `CREATE EXTENSION`. A
+database where the extension already exists keeps the old schema until you say:
+
+```
+ALTER EXTENSION pg_agent_gate UPDATE;
+```
+
+That is not hypothetical. 0.2.0 closes two defects that live in the SQL, and
+while preparing it the new library was loaded into a live database whose schema
+stayed at 0.1.0: the `TRUNCATE` hole was still open, and the library was calling
+a two-argument `_load_proposal` that did not exist there, so every commit an
+agent made would have failed. Nothing broke only because that database had no
+agents registered yet.
+
+`tests/upgrade.sh` measures the upgrade against the real old schema, kept in
+`tests/fixtures/` byte for byte, rather than against a freshly built one: an
+extension is installed clean once and upgraded for the rest of its life, and
+until now only the case that happens once was being tested.
+
 ## Notes for extension authors
 
 * **pgrx's `SpiClient::update` assigns a transaction id before running

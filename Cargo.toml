@@ -1,6 +1,13 @@
 [package]
+# 0.2.0 closes two defects that live in the extension's SQL, not in the library:
+# TRUNCATE emptied the record (FOR EACH ROW triggers do not fire on it) and two
+# concurrent commits of the same proposal both ran it. Copying a new .so does
+# NOT apply either of them to a database where the extension already exists, and
+# leaving the version at 0.1.0 would mean PostgreSQL had no way to know it should
+# update -- the catalog saying one thing while the contents say another, which is
+# the exact failure this family of extensions exists to close.
 name = "pg_agent_gate"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Agents propose, PostgreSQL decides: a native gate between LLM agents and the database"
 license = "PostgreSQL"
