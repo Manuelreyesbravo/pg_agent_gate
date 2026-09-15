@@ -1,6 +1,11 @@
-comment = 'pg_agent_gate:  Created by pgrx'
+comment = 'Agents propose, PostgreSQL decides: a native gate between LLM agents and the database'
 default_version = '@CARGO_VERSION@'
 module_pathname = 'pg_agent_gate'
 relocatable = false
+schema = agent_gate
 superuser = true
 trusted = false
+# The gate recognises its verbs by schema, so the schema is not relocatable.
+# Enforcement needs the library loaded before the agent's first statement:
+# shared_preload_libraries, or session_preload_libraries on the agent's role
+# (agent_gate.register_agent() sets the latter when the former is missing).
