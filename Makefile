@@ -8,7 +8,14 @@
 
 PG_CONFIG ?= pg_config
 
-.PHONY: verify clean-machine demo
+.PHONY: verify clean-machine demo bench
+# psycopg 3 is the only dependency; uv fetches it without touching your environment.
+# Python pinned to 3.13: a default free-threaded 3.14 has no psycopg-binary wheel yet.
+bench:
+	PG_CONFIG=$(PG_CONFIG) $(if $(shell command -v uv),uv run --python 3.13 --with 'psycopg[binary]' python,python3) tests/bench.py
+
+
+
 demo:
 	PG_CONFIG=$(PG_CONFIG) bash tests/demo.sh
 

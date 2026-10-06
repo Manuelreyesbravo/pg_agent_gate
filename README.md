@@ -343,10 +343,6 @@ declared before the code that it measures.
 | the world moved between `propose` and `commit` (`tests/hostile.sh`): table renamed, column dropped, privilege revoked, row gone, a bound assertion broken meanwhile, two sessions at once, and the same proposal committed twice at once | 100% | **9 of 9** |
 | **control**: what an owner's trigger, `SECURITY DEFINER` function and view do on the agent's behalf is what this README says | 100% | **5 of 5** |
 
-| extra time per read (`propose` + `commit`) over running the query directly, default settings | <= 10 ms | **0.41 ms** |
-| extra time per kept write over the same `UPDATE` run directly (which pays its own durable commit) | <= 5 ms | **0.41 ms** |
-| throughput lost by preloading the library in sessions that are not agents (`pgbench -S`, median of 5 alternating pairs) | <= 3% | **0.43%** |
-| extra time per read with `attempt_durability = durable` | <= 10 ms | **14.7 ms -- fails** |
 
 **Two of those rows found real defects, which is why they exist.** `TRUNCATE`
 emptied the whole record: the append-only triggers were `FOR EACH ROW`, and
@@ -381,10 +377,44 @@ the suites that are red against 0.2.0. On the same run, with the gate in place:
 the model's correct SQL was never refused (0 of 27 false positives), and the
 gate's own work cost 0.54 ms per act, median, over running the same SQL directly.
 
-The last row is the first cost criterion, kept with the semantics it was
-declared with. On the test machine one `fdatasync` costs about 5 ms (Btrfs with
-copy-on-write), and with every record durable a read act pays two. The default
-does not, and the crash control above is what shows it gave nothing up for it.
+## What it costs
+
+```
+make bench PG_CONFIG=/path/to/pg_config
+```
+
+`tests/bench.py` on the throwaway cluster. "Directly" means an **identical role**
+-- same grants, same statement, same parameters -- that is not registered as an
+agent; never a superuser. Each of 300 iterations runs both paths back to back,
+alternating which goes first. The thresholds were declared before the code.
+
+| what | threshold | measured (median) |
+|---|---|---|
+| extra time per read act (`propose` + `commit`) over the same query directly | <= 10 ms | **0.269 ms** (p25 0.258, p75 0.285) |
+| extra time per kept write over the same `UPDATE` directly, which pays its own durable commit | <= 5 ms | **0.475 ms** (p25 0.430, p75 0.575) |
+| throughput lost by sessions that are **not** agents when the library is preloaded (`pgbench -S`, 7 alternating pairs of 15 s) | <= 3% | **0.09%** |
+| extra time per read act with `attempt_durability = durable` | <= 10 ms | **2.119 ms** (p25 2.028, p75 2.342) |
+
+**Where the time goes.** Of the 0.29 ms a read act takes end to end, the gate's
+own work inside the server -- verify, run, decide -- is 0.09 ms. Most of the rest
+is the record: every act is a proposal and an execution written to append-only
+tables, in their own commits. That is not overhead to optimize away; it is what
+makes an agent's actions auditable. With `durable` every one of those records
+pays its own flush, which is the 2.1 ms.
+
+**Every pair of the throughput test**, because a median hides how noisy one
+pair is. Loss with the library preloaded, in %: `0.09`, `5.22`, `-0.37`, `0.87`,
+`-1.06`, `0.56`, `-3.65`. A single 15-second pair on a desktop swings by about
+four points either way. That is why the criterion is the median of several pairs
+and not any one run: an earlier, uncontrolled run of this same test reported
+3.16% and failed the criterion, and both it and an older 0.43% fall inside this
+spread.
+
+Measured on PostgreSQL 19beta2 built without assertions, AMD Ryzen AI 9 HX 370,
+data directory on Btrfs, `fsync` and `synchronous_commit` on, with the benchmark
+pinned to its own cores and a calibration run before and after to reject any
+measurement taken while the machine was contended. Your numbers will differ;
+`make bench` writes them to `target/bench/result.json`.
 
 ## Upgrading
 
