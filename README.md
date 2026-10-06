@@ -2,6 +2,93 @@
 
 **Agents propose, PostgreSQL decides.**
 
+Teams are connecting AI agents to production PostgreSQL. The agent gets a role
+and a connection, and from then on PostgreSQL cannot tell it from the
+application: when the model hallucinates a `DELETE` without a `WHERE`, a
+`DROP TABLE`, or a read of another customer's rows, the database runs it.
+
+`pg_agent_gate` is an extension that makes the database tell the difference.
+In a session that belongs to an agent, **SQL does not execute**. The agent may
+only *propose* one statement; PostgreSQL verifies it against itself, shows its
+exact effect, and keeps it only if every guard agrees. It is enforced by hooks
+inside the server, so there is no client, driver or protocol path around it.
+
+## See it in one minute
+
+```
+make demo PG_CONFIG=/path/to/pg_config
+```
+
+The same role, with the same privileges, first as an ordinary user and then
+registered as an agent. After every attempt a superuser prints the database:
+
+```
+WITHOUT the gate: an ordinary role, the way an agent connects today
+     database now: customers: 4 · orders: 8
+  1. the model 'cleans up' the orders:        DELETE FROM orders
+     database now: customers: 4 · orders: 0
+  2. the model 'fixes' the schema:             DROP TABLE customers CASCADE
+     database now: customers: TABLE GONE · orders: 8
+  3. the model reads another customer's data:  set_config('app.tenant_id', '2') + SELECT
+     Iris|iris@TWO.example
+     Juan|juan@TWO.example
+
+WITH the gate: the same role, registered as an agent (max_rows 5, no DDL)
+  1. DELETE FROM orders, typed directly
+     ERROR:  pg_agent_gate: this session belongs to agent "assistant": it proposes, it does not execute
+  2. DROP TABLE customers CASCADE, typed directly
+     ERROR:  pg_agent_gate: this session belongs to agent "assistant": it proposes, it does not execute
+  3. set_config to tenant 2, typed directly
+     ERROR:  pg_agent_gate: this session belongs to agent "assistant": it proposes, it does not execute
+     database now: customers: 4 · orders: 8
+
+  ...and the same three, PROPOSED through the gate:
+  1. propose + commit:  DELETE FROM orders   (8 rows, the agent may touch 5)
+     commit: aborted -- it touched 8 rows and this agent may touch at most 5
+  2. propose:  DROP TABLE customers
+     refused at propose -- kind_allowed: T_DropStmt changes the schema or the server, and this agent is not allowed DDL
+  3. propose:  a read that moves the tenant from inside the statement
+     refused at propose -- keeps_its_context: set_config() would change, while the proposal runs, a parameter ...
+     database now: customers: 4 · orders: 8
+
+  ...while legitimate work still goes through, and is seen before it is kept:
+  dry_run (nothing kept):
+     "rows": [{"after": {..., "email": "ana@new.example"}, "before": {..., "email": "ana@one.example"}}]
+  commit:
+     kept, Ana's email is now ana@new.example
+```
+
+## Verify it yourself
+
+Every claim in this README has a test that attacks it on purpose and checks the
+database from a superuser's side -- not the gate's own answer:
+
+```
+make verify PG_CONFIG=/path/to/pg_config     # your PostgreSQL 18+, a throwaway cluster
+make clean-machine                           # the same, in a fresh container that only gets git HEAD
+```
+
+| suite | what it attacks | checks |
+|---|---|---|
+| `adversarial.sh` | every channel a session can type, and what can be slipped past `propose` | 45 |
+| `hostile.sh` | garbage into the verbs, the record rewritten, the world moved between propose and commit | 37 |
+| `privileges.sh` | the privilege boundary between agents, roles and the record | 31 |
+| `rls_isolation.sh` | moving the context a row-level policy reads: `SET`, startup parameters, `set_config` | 22 |
+| `dump_restore.sh` | the record across `pg_dump` and restore | 10 |
+| `upgrade.sh` | an installation of the oldest schema, upgraded | 9 |
+| pgrx unit tests | the verbs, from inside the server | 10 |
+
+On a fresh Debian container with PostgreSQL 18.6, receiving only what git has
+committed: **`verified: 164 checks passed, 0 failed`** (the same 164 on
+PostgreSQL 19beta2). `VERIFY_DRIVERS=1` adds real pgjdbc and node-pg sessions.
+
+Two of these suites were green while a hole was open: see
+[what found the 0.2.1 fixes](#what-found-the-021-fixes). A green suite is a
+claim about the cases it has, which is why the threat model below says what is
+not covered.
+
+## How it works
+
 Today an LLM agent reaches PostgreSQL through an MCP server that holds a
 connection, hands the model a list of tools, and runs whatever the model asks.
 The model decides; the server obeys. Every guarantee lives in that server's
@@ -256,18 +343,43 @@ declared before the code that it measures.
 | the world moved between `propose` and `commit` (`tests/hostile.sh`): table renamed, column dropped, privilege revoked, row gone, a bound assertion broken meanwhile, two sessions at once, and the same proposal committed twice at once | 100% | **9 of 9** |
 | **control**: what an owner's trigger, `SECURITY DEFINER` function and view do on the agent's behalf is what this README says | 100% | **5 of 5** |
 
+| extra time per read (`propose` + `commit`) over running the query directly, default settings | <= 10 ms | **0.41 ms** |
+| extra time per kept write over the same `UPDATE` run directly (which pays its own durable commit) | <= 5 ms | **0.41 ms** |
+| throughput lost by preloading the library in sessions that are not agents (`pgbench -S`, median of 5 alternating pairs) | <= 3% | **0.43%** |
+| extra time per read with `attempt_durability = durable` | <= 10 ms | **14.7 ms -- fails** |
+
 **Two of those rows found real defects, which is why they exist.** `TRUNCATE`
 emptied the whole record: the append-only triggers were `FOR EACH ROW`, and
 `TRUNCATE` fires no row trigger, so the history could be erased in one statement
 with nothing disabled and nothing said. And two concurrent `commit`s of the same
 proposal both ran it -- each transaction read `committed` from its own snapshot,
 where the other had not committed yet, so a write was applied twice. On a balance
-that is a double charge. Both are fixed: statement-level triggers for `TRUNCATE`,
-and the proposal's row is locked while a commit decides.
-| extra time per read (`propose` + `commit`) over running the query directly, default settings | <= 10 ms | **0.41 ms** |
-| extra time per kept write over the same `UPDATE` run directly (which pays its own durable commit) | <= 5 ms | **0.41 ms** |
-| throughput lost by preloading the library in sessions that are not agents (`pgbench -S`, median of 5 alternating pairs) | <= 3% | **0.43%** |
-| extra time per read with `attempt_durability = durable` | <= 10 ms | **14.7 ms -- fails** |
+that is a double charge. Both are fixed (0.2.0): statement-level triggers for
+`TRUNCATE`, and the proposal's row is locked while a commit decides.
+
+### What found the 0.2.1 fixes
+
+Not these suites: they were green with both holes open. What found them was an
+LLM (a Qwen3-8B with a SQL adapter) proposing through the gate against a
+two-tenant database with row-level security, on 157 cases -- 30 legitimate
+tasks, destructive ones written by the model and injected by hand, raw SQL in the
+agent's session, and attempts to cross tenants -- with a superuser comparing the
+database before and after every case, and the same cases run by an identical role
+that was not an agent, to prove the cases were dangerous at all.
+
+1. **A CTE that writes dodged `max_rows`.** The limit counted the rows of the
+   outer statement, so `with d as (delete ...) select count(*) from d` deleted
+   12 rows under a limit of 5.
+2. **`set_config()` inside a proposal moved the tenant.** The session allowlist
+   judged `SET` and the startup parameters, but while the gate runs a proposal
+   its hooks step aside, so `... where set_config('app.tenant_id', '2', true) is
+   not null` read the other tenant's rows.
+
+Against 0.2.0, 9 of 10 variants of the two did damage. Against 0.2.1, 0 of 10;
+both are refused at `propose` (checks 5 and 6 above), and both now have cases in
+the suites that are red against 0.2.0. On the same run, with the gate in place:
+the model's correct SQL was never refused (0 of 27 false positives), and the
+gate's own work cost 0.54 ms per act, median, over running the same SQL directly.
 
 The last row is the first cost criterion, kept with the semantics it was
 declared with. On the test machine one `fdatasync` costs about 5 ms (Btrfs with
@@ -310,9 +422,51 @@ until now only the case that happens once was being tested.
 * **`CREATE EXTENSION` does not grant `USAGE` on the extension's schema.** An
   agent could not even propose until the script granted it.
 
+## Threat model
+
+**The adversary is the agent.** A model that hallucinates, a model that was
+prompt-injected, or a fully hostile client: it holds a connection as its role
+and can send anything the wire protocol carries -- any statement, any startup
+parameter, the extended protocol, a cursor, garbage.
+
+**What the gate guarantees against it**, each with a suite above:
+
+* nothing the session types executes except the six verbs;
+* a proposal runs only after PostgreSQL's parser, planner, analyzer and
+  rewriter accept it as one statement of a kind the agent may run;
+* a write that touches more than `max_rows` rows, or breaks a bound assertion,
+  is undone;
+* the context its row-level policies read cannot be moved -- not by `SET`, not
+  at connection start, not by `set_config()` inside a proposal;
+* everything it proposed and did is recorded append-only, including why
+  anything was refused.
+
+**What it trusts, and is out of scope:**
+
+* **superusers**, and whoever can edit `postgresql.conf` or restart the server:
+  they can unload the gate. That is why `register_agent` refuses a superuser
+  role -- an agent that can leave the gate is not behind it;
+* **the DBA's grants**: `GRANT` is still the authorization. The gate adds
+  verification, it does not invent privileges or take them away;
+* **the functions and views the agent is granted**: they run with their own
+  rules (see below);
+* the operating system and the server binaries.
+
+**What it does not protect, by design: intent.** A well-formed statement,
+within the agent's privileges and under `max_rows`, runs. Measured: asked to
+"set every customer's plan to free", the model wrote
+`UPDATE ... WHERE plan <> 'free'`, which touched 2 rows under a limit of 5, and
+the gate kept it -- correctly, by its contract. Bound the blast radius with a
+small `max_rows`, bind assertions that must keep holding, and put a human on
+`dry_run` for writes that matter.
+
 ## What it does not cover
 
 Said here so nobody learns it the hard way:
+
+* **A function that calls `set_config()` in its own body.** The gate refuses
+  `set_config` anywhere in a proposal's query tree, but a function's body is not
+  in that tree. Do not grant an agent `EXECUTE` on such a function.
 
 * **Without the library loaded before the agent's first statement, the gate
   fails open.** `whoami()` reports `enforced`. Use `shared_preload_libraries`.

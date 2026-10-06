@@ -7,7 +7,11 @@
 
 PG_CONFIG ?= pg_config
 
-.PHONY: verify clean-machine
+.PHONY: verify clean-machine demo
+demo:
+	PG_CONFIG=$(PG_CONFIG) bash tests/demo.sh
+
+
 verify:
 	PG_CONFIG=$(PG_CONFIG) VERIFY_DRIVERS=$(VERIFY_DRIVERS) bash tests/verify.sh
 
