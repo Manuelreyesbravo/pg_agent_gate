@@ -1,3 +1,6 @@
+// Copyright 2026 Manuel Reyes Bravo
+// SPDX-License-Identifier: Apache-2.0
+
 //! Verification: every claim a proposal makes is checked against the database
 //! itself, before anything runs.
 //!

@@ -1,3 +1,6 @@
+// Copyright 2026 Manuel Reyes Bravo
+// SPDX-License-Identifier: Apache-2.0
+
 //! The six verbs. They are the whole surface an agent has.
 //!
 //! They replace an MCP server's `tools/list` + `tools/call`, with one

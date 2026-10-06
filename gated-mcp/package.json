@@ -2,6 +2,8 @@
   "name": "gated-mcp",
   "version": "0.1.0",
   "private": true,
+  "license": "Apache-2.0",
+  "author": "Manuel Reyes Bravo <manuelreyesbravo@gmail.com>",
   "type": "module",
   "description": "An MCP server that cannot execute anything: the six verbs of pg_agent_gate over Streamable HTTP, connected as the agent role",
   "scripts": {

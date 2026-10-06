@@ -1,3 +1,6 @@
+// Copyright 2026 Manuel Reyes Bravo
+// SPDX-License-Identifier: Apache-2.0
+
 //! The gate itself: what plain SQL cannot do.
 //!
 //! A schema of functions can OFFER a safe path. It cannot make the unsafe path

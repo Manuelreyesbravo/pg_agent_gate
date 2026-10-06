@@ -1,5 +1,7 @@
 # pg_agent_gate
 
+[![verify](https://github.com/Manuelreyesbravo/pg_agent_gate/actions/workflows/verify.yml/badge.svg)](https://github.com/Manuelreyesbravo/pg_agent_gate/actions/workflows/verify.yml)
+
 **Agents propose, PostgreSQL decides.**
 
 Teams are connecting AI agents to production PostgreSQL. The agent gets a role
@@ -569,4 +571,9 @@ Said here so nobody learns it the hard way:
 
 ## License
 
-PostgreSQL License.
+Apache License 2.0 -- see [LICENSE](LICENSE). Copyright 2026 Manuel Reyes Bravo.
+
+The name is not licensed with the code: see [TRADEMARK.md](TRADEMARK.md).
+Security reports: [SECURITY.md](SECURITY.md). Contributions:
+[CONTRIBUTING.md](CONTRIBUTING.md).
+

@@ -1,3 +1,6 @@
+// Copyright 2026 Manuel Reyes Bravo
+// SPDX-License-Identifier: Apache-2.0
+
 //! The counters that decide whether SQL may run in an agent session, and the
 //! facts about the current transaction that decide how durable a record is.
 //!

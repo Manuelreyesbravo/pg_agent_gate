@@ -1,3 +1,6 @@
+// Copyright 2026 Manuel Reyes Bravo
+// SPDX-License-Identifier: Apache-2.0
+
 //! The record, the only functions allowed to write it, and the administration.
 //!
 //! The record lives in `agent_gate_internal`, which agents never touch

@@ -1,3 +1,6 @@
+// Copyright 2026 Manuel Reyes Bravo
+// SPDX-License-Identifier: Apache-2.0
+
 //! pg_agent_gate -- agents propose, PostgreSQL decides.
 //!
 //! An agent connected to this database does not run SQL. It has six verbs:

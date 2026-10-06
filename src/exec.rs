@@ -1,3 +1,6 @@
+// Copyright 2026 Manuel Reyes Bravo
+// SPDX-License-Identifier: Apache-2.0
+
 //! Running something inside a subtransaction and deciding AFTERWARDS whether
 //! to keep it -- and turning SPI rows into JSON without hiding that there were
 //! more.

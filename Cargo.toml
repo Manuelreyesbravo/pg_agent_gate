@@ -15,7 +15,7 @@ version = "0.2.1"
 
 edition = "2021"
 description = "Agents propose, PostgreSQL decides: a native gate between LLM agents and the database"
-license = "PostgreSQL"
+license = "Apache-2.0"
 
 [lib]
 crate-type = ["cdylib"]
