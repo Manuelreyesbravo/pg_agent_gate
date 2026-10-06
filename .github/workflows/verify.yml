@@ -1,0 +1,43 @@
+# Every push and pull request runs the attacks. For a security extension, CI is not
+# "the build passes": it is the claim that no guarantee broke, re-proved on every commit.
+#
+# Each job is `make clean-machine` -- the exact command anyone can run locally -- for one
+# PostgreSQL major: a fresh Debian container, PostgreSQL from PGDG (19 resolves to the
+# newest 19 beta), cargo-pgrx 0.19.2, pg_living_assertions from its public repository,
+# the repository as committed, `make verify` as a user that is not root. One definition
+# of "verified", not a second one in YAML that can drift from it.
+#
+# To block merges on it: Settings -> Branches -> require the status checks
+# "verify (PostgreSQL 18)" and "verify (PostgreSQL 19)".
+name: verify
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: verify (PostgreSQL ${{ matrix.pg }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [18, 19]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: clean machine, PostgreSQL ${{ matrix.pg }}
+        run: PG_MAJOR=${{ matrix.pg }} ENGINE=docker bash tests/clean-machine/run.sh
+
+      - name: logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-logs-pg${{ matrix.pg }}
+          path: target/clean-machine-pg${{ matrix.pg }}
+          if-no-files-found: warn

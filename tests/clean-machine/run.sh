@@ -21,15 +21,22 @@ CONTEXT=$(mktemp -d)
 trap 'rm -rf "$CONTEXT"' EXIT
 git -C "$ROOT" archive HEAD | tar -x -C "$CONTEXT"
 
-"$ENGINE" build -t pg_agent_gate-verify -f "$CONTEXT/tests/clean-machine/Containerfile" "$CONTEXT"
+PG_MAJOR=${PG_MAJOR:-18}
+IMAGE=pg_agent_gate-verify:pg$PG_MAJOR
+echo "clean machine: PostgreSQL $PG_MAJOR from PGDG, verifying $(git -C "$ROOT" rev-parse --short HEAD)"
+"$ENGINE" build -t "$IMAGE" --build-arg PG_MAJOR="$PG_MAJOR" \
+    -f "$CONTEXT/tests/clean-machine/Containerfile" "$CONTEXT"
+
 # Not --rm: the logs are copied out first, so a failure can be read after the fact.
 NAME=pg_agent_gate-verify-$$
 rc=0
-"$ENGINE" run --name "$NAME" pg_agent_gate-verify || rc=$?
+"$ENGINE" run --name "$NAME" "$IMAGE" || rc=$?
+OUT=$ROOT/target/clean-machine-pg$PG_MAJOR
 mkdir -p "$ROOT/target"
-rm -rf "$ROOT/target/clean-machine"
-"$ENGINE" cp "$NAME:/home/tester/pg_agent_gate/target/verify" "$ROOT/target/clean-machine" >/dev/null 2>&1 \
-    && echo "logs of the container: $ROOT/target/clean-machine"
+rm -rf "$OUT"
+"$ENGINE" cp "$NAME:/home/tester/pg_agent_gate/target/verify" "$OUT" >/dev/null 2>&1 \
+    && echo "logs of the container: $OUT"
+
 "$ENGINE" rm "$NAME" >/dev/null
 exit "$rc"
 
