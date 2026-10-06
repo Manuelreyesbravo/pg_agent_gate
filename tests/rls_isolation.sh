@@ -130,7 +130,30 @@ after=$(read_docs "set app.tenant_id = '2'")
 contains "after the attempt, in the SAME session, the agent still reads its own tenant" "$MINE" "$after"
 absent "and still not the other tenant's" "$THEIRS" "$after"
 
+# set_config() INSIDE A PROPOSAL -- found by the cycle harness of yggdrasil on 2026-10-06,
+# with this file green: the allowlist judges SET and the startup parameters, but the
+# statement the gate runs is where the hooks step aside, and the function moved the tenant
+# while the policy was reading it. Every place in the tree it can hide, because a fix that
+# covers only the case that bit is the next leak. Proposal and commit in ONE session.
+propose_commit() {
+    local sql=$1 id
+    id=$(next_proposal)
+    as_agent -c "select agent_gate.propose(\$q\$$sql\$q\$, 'read with the tenant moved from inside')" \
+             -c "select agent_gate.commit($id)"
+}
+for sql in \
+    "select body from docs where set_config('app.tenant_id', '2', true) is not null" \
+    "select d.body from set_config('app.tenant_id', '2', true) s, docs d" \
+    "select body from docs where (select set_config('app.tenant_id', '2', true)) is not null" \
+    "with s as materialized (select set_config('app.tenant_id', '2', true)) select d.body from s, docs d" \
+    "select body from docs where pg_catalog.set_config('app.tenant_id', '2', true) is not null"; do
+    out=$(propose_commit "$sql")
+    absent "set_config inside the proposal does not reach the other tenant: ${sql:0:60}" "$THEIRS" "$out"
+    contains "  ...because it does not verify" '"ok": false' "$out"
+done
+
 # And what an actual driver sets on its own keeps working, or the rule gets removed.
+
 for setting in "set statement_timeout = 5000" "set application_name = 'some client'" \
                "set client_encoding = 'UTF8'" "set datestyle = 'ISO, MDY'"; do
     contains "a driver can still: $setting" "SET" "$(as_agent -c "$setting")"

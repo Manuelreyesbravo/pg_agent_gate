@@ -76,9 +76,28 @@ Nothing is reimplemented. Each check is PostgreSQL itself:
 3. **kind_allowed** -- read, write or DDL, against what the agent may do.
    Transaction control is refused: the gate owns the transaction.
 4. **resolves** -- `EXPLAIN` plans it without executing: every table,
-   column, type, operator and function must exist and fit. A `SELECT` whose
-   CTE writes is reclassified as a write. DDL (for agents allowed it) is
-   verified by running it in a subtransaction that is rolled back.
+   column, type, operator and function must exist and fit. DDL (for agents
+   allowed it) is verified by running it in a subtransaction that is rolled
+   back.
+5. **no_writing_cte** -- PostgreSQL's analyzer and rewriter build the query
+   tree, and a CTE that changes data is refused. `max_rows` counts the rows of
+   the statement, and a write hidden in a CTE under a `SELECT count(*)` is
+   counted as one row: before 0.2.1 it deleted every row under a limit of 5.
+   Propose each write as its own statement.
+6. **keeps_its_context** -- `set_config()` anywhere in that tree (the `WHERE`,
+   the `FROM`, a subquery, a CTE, an expanded view, schema-qualified or not) is
+   refused. Inside the statement it moves, while the statement runs, the
+   parameter a row-level policy reads; before 0.2.1,
+   `... where set_config('app.tenant_id', '2', true) is not null` read another
+   tenant's rows. **Not covered:** a function that already exists and calls
+   `set_config` in its own body -- its body is not in the tree. Do not grant an
+   agent `EXECUTE` on one.
+
+Checks 5 and 6 were found by an LLM proposing through the gate against a
+two-tenant database, with a superuser comparing the database before and after
+every case -- not by the suites in `tests/`, which were green with both holes
+open. Both now have cases there (`adversarial.sh`, `rls_isolation.sh`) that are
+red against 0.2.0.
 
 `commit` verifies **again**: a verification is a statement about the database
 at a moment. A proposal older than `agent_gate.proposal_ttl_seconds` (900) is

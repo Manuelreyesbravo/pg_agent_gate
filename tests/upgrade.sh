@@ -82,7 +82,10 @@ HISTORIA=$(su -c "select count(*) || ':' || coalesce(md5(string_agg(id || intent
 
 # ------------------------------------------------------------- the upgrade --
 salida=$(su -c "alter extension pg_agent_gate update")
-expect "ALTER EXTENSION UPDATE reaches the new version" "0.2.0" \
+# The target is whatever this build IS, read from Cargo.toml: a constant here said "0.2.0"
+# and failed the day the version moved, with the upgrade itself working.
+NUEVA=$(sed -nE 's/^version = "([^"]+)"/\1/p' "$ROOT/Cargo.toml" | head -1)
+expect "ALTER EXTENSION UPDATE reaches the new version" "$NUEVA" \
     "$(su -c "select extversion from pg_extension where extname = 'pg_agent_gate'")"
 
 expect "the TRUNCATE triggers are there afterwards" "executions_no_truncate, proposals_no_truncate" \

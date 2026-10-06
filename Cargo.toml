@@ -6,8 +6,13 @@
 # leaving the version at 0.1.0 would mean PostgreSQL had no way to know it should
 # update -- the catalog saying one thing while the contents say another, which is
 # the exact failure this family of extensions exists to close.
+#
+# 0.2.1 changes no SQL and still bumps: verify.rs now refuses a CTE that writes (max_rows
+# did not see its rows) and set_config() inside a proposal (it moved the context a
+# row-level policy reads). Same version, different behaviour, is the same lie.
 name = "pg_agent_gate"
-version = "0.2.0"
+version = "0.2.1"
+
 edition = "2021"
 description = "Agents propose, PostgreSQL decides: a native gate between LLM agents and the database"
 license = "PostgreSQL"

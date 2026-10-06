@@ -308,25 +308,46 @@ mod tests {
         assert_eq!(left, Some(1500), "an aborted commit kept rows");
     }
 
-    /// Regression: the gate used to append RETURNING whenever the proposal was
-    /// a write, and a SELECT whose CTE writes is a write -- which produced
-    /// `SELECT ... RETURNING`, a syntax error.
+    /// A CTE that writes is refused at propose. Until 0.2.1 it was classified as a write
+    /// and KEPT -- and max_rows counted only the rows of the outer statement, so
+    /// `with d as (delete ...) select count(*) from d` deleted every row under a limit
+    /// of 5 (found by the cycle harness of yggdrasil, 2026-10-06). Failing closed costs
+    /// the shape; each write can still be proposed as its own statement.
     #[pg_test]
-    fn a_select_whose_cte_writes_is_a_write_and_is_kept() {
+    fn a_cte_that_writes_is_refused_and_keeps_nothing() {
         Spi::run("create table gate_c (id int primary key, plan text not null)").unwrap();
-        Spi::run("insert into gate_c values (1, 'free')").unwrap();
-        let p = crate::verbs::propose(
-            "with x as (update gate_c set plan = 'pro' where id = 1 returning id) select count(*) from x",
-            "upgrade through a cte",
-            None,
-        )
-        .0;
-        assert_eq!(p["kind"], "write", "{p}");
-        let c = crate::verbs::commit(id(&p)).0;
-        assert_eq!(c["outcome"], "kept", "{c}");
-        let plan: Option<String> = Spi::get_one("select plan from gate_c where id = 1").unwrap();
-        assert_eq!(plan.as_deref(), Some("pro"));
+        Spi::run("insert into gate_c select g, 'free' from generate_series(1, 3) g").unwrap();
+        for sql in [
+            "with x as (update gate_c set plan = 'pro' returning id) select count(*) from x",
+            "with x as (update gate_c set plan = 'pro' returning id) select 1",
+            "with x as (delete from gate_c returning id) update gate_c set plan = 'pro' where id = 1",
+        ] {
+            let p = crate::verbs::propose(sql, "a write hidden in a cte", None).0;
+            assert_eq!(p["ok"], false, "{sql} passed verification: {p}");
+        }
+        let untouched: Option<i64> = Spi::get_one("select count(*) from gate_c where plan = 'free'").unwrap();
+        assert_eq!(untouched, Some(3), "a refused proposal changed rows");
     }
+
+    /// set_config() inside a proposal moves, while it runs, the parameter a row-level
+    /// policy reads. Refused wherever it sits in the tree; a plain read still verifies.
+    #[pg_test]
+    fn set_config_inside_a_proposal_does_not_verify() {
+        Spi::run("create table gate_s (id int primary key)").unwrap();
+        for sql in [
+            "select id from gate_s where set_config('app.tenant_id', '2', true) is not null",
+            "select g.id from set_config('app.tenant_id', '2', true) s, gate_s g",
+            "select id from gate_s where (select set_config('app.tenant_id', '2', true)) is not null",
+            "with s as materialized (select set_config('app.tenant_id', '2', true)) select g.id from s, gate_s g",
+            "select pg_catalog.set_config('app.tenant_id', '2', false)",
+        ] {
+            let p = crate::verbs::propose(sql, "move the context from inside", None).0;
+            assert_eq!(p["ok"], false, "{sql} passed verification: {p}");
+        }
+        let p = crate::verbs::propose("select id from gate_s", "the control: a plain read", None).0;
+        assert_eq!(p["ok"], true, "{p}");
+    }
+
 
     /// A pg_test runs inside a transaction that has already written (it created
     /// tables). Relaxing that commit would relax writes the gate never saw.

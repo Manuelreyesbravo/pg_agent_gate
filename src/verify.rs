@@ -13,7 +13,7 @@ use crate::state;
 use pgrx::datum::{DatumWithOid, Json};
 use pgrx::prelude::*;
 use serde_json::{json, Value};
-use std::ffi::CString;
+use std::ffi::{c_void, CString};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Kind {
@@ -201,10 +201,120 @@ pub(crate) fn verify(sql: &str, params: &Option<Vec<Option<String>>>, allow_ddl:
         },
     }
 
+    // 4. What the plan cannot show: the analyzed and rewritten tree. Two ways a
+    // proposal that resolves still escaped the gate, both measured by the cycle harness
+    // of yggdrasil (its sql/139 and sql/141) with a superuser watching:
+    //   * a CTE that writes is not counted against max_rows -- the gate counts the rows
+    //     of the OUTER statement, so `with d as (delete ...) select count(*) from d`
+    //     deleted 12 rows under a limit of 5;
+    //   * set_config() inside the statement moves, while it runs, a parameter the
+    //     row-level policies read. The session allowlist judges SET and startup
+    //     parameters, but the gate's own execution is where the hooks step aside, so
+    //     `where set_config('app.tenant_id', '2', true) is not null` read another
+    //     tenant's rows.
+    // Both are refused, failing closed. The tree is the analyzer's and the rewriter's
+    // (views expanded), and set_config is matched by OID wherever it sits: where, from,
+    // a sublink, a CTE, schema-qualified or not.
+    // NOT covered, and said in the README: a function that already exists and calls
+    // set_config in its own body -- that body is not in this tree.
+    if kind != Kind::Ddl {
+        let n_params = params.as_ref().map_or(0, |p| p.len());
+        match in_subxact(|| unsafe { analyze_tree(&v.statement, n_params) }, |_| false) {
+            Ok(tree) if tree.writing_cte => {
+                v.kind = Some(kind);
+                v.check(
+                    "no_writing_cte",
+                    false,
+                    "a CTE here changes data, and max_rows only counts the rows of the outer statement: \
+                     propose each write as its own statement",
+                );
+                return v;
+            }
+            Ok(tree) => {
+                v.check("no_writing_cte", true, "no CTE changes data: max_rows sees every row it touches");
+                if tree.set_config {
+                    v.kind = Some(kind);
+                    v.check(
+                        "keeps_its_context",
+                        false,
+                        "set_config() would change, while the proposal runs, a parameter its row-level \
+                         policies may read: an agent's context is set on its role",
+                    );
+                    return v;
+                }
+                v.check("keeps_its_context", true, "nothing in the statement calls set_config()");
+            }
+            Err(f) => {
+                v.kind = Some(kind);
+                v.check("no_writing_cte", false, f.describe());
+                return v;
+            }
+        }
+    }
+
     v.kind = Some(kind);
     v.ok = true;
     v
 }
+
+/// What the analyzed and rewritten tree of a proposal holds that its plan does not say.
+#[derive(Default)]
+struct Tree {
+    writing_cte: bool,
+    set_config: bool,
+}
+
+/// Parses the (already verified, single) statement again, runs PostgreSQL's analyzer and
+/// rewriter on it with the parameters typed as text -- the way EXPLAIN and the execution
+/// receive them -- and walks every query the rewriter produced.
+unsafe fn analyze_tree(statement: &str, n_params: usize) -> Tree {
+    let text = CString::new(statement).expect("the statement was parsed from a NUL-free text");
+    let raws = pg_sys::raw_parser(text.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT);
+    let raw = pg_sys::list_nth(raws, 0) as *mut pg_sys::RawStmt;
+    let types = vec![pg_sys::TEXTOID; n_params];
+    let queries = pg_sys::pg_analyze_and_rewrite_fixedparams(
+        raw,
+        text.as_ptr(),
+        types.as_ptr(),
+        n_params as i32,
+        std::ptr::null_mut(),
+    );
+    let mut tree = Tree::default();
+    for i in 0..list_len(queries) {
+        let q = pg_sys::list_nth(queries, i) as *mut pg_sys::Query;
+        tree.writing_cte |= (*q).hasModifyingCTE;
+        pg_sys::query_tree_walker_impl(q, Some(walk), &mut tree as *mut Tree as *mut c_void, 0);
+        if tree.set_config {
+            break;
+        }
+    }
+    tree
+}
+
+/// Tree walker: stops (returns true) at the first set_config(); records a writing CTE in
+/// any nested query and keeps walking, because set_config may still be further down.
+#[pg_guard]
+unsafe extern "C-unwind" fn walk(node: *mut pg_sys::Node, context: *mut c_void) -> bool {
+    if node.is_null() {
+        return false;
+    }
+    let tree = &mut *(context as *mut Tree);
+    match (*node).type_ {
+        pg_sys::NodeTag::T_FuncExpr
+            if (*(node as *mut pg_sys::FuncExpr)).funcid == pg_sys::Oid::from(pg_sys::F_SET_CONFIG) =>
+        {
+            tree.set_config = true;
+            true
+        }
+        pg_sys::NodeTag::T_Query => {
+            let q = node as *mut pg_sys::Query;
+            tree.writing_cte |= (*q).hasModifyingCTE;
+            pg_sys::query_tree_walker_impl(q, Some(walk), context, 0)
+        }
+        _ => pg_sys::expression_tree_walker_impl(node, Some(walk), context),
+    }
+}
+
 
 unsafe fn parse(sql: &str, text: &CString) -> Parsed {
     let list = pg_sys::raw_parser(text.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT);

@@ -1,0 +1,21 @@
+-- 0.2.0 -> 0.2.1
+--
+-- Nothing to change in the schema: both fixes live in the library (verify.rs), and they
+-- reach a database the moment the new .so is loaded. The script exists so the catalog
+-- says which version is running -- an extension whose behaviour changed under the same
+-- version number is the failure this family of extensions exists to close.
+--
+-- What 0.2.1 refuses at propose, both found by a cycle harness with a superuser watching
+-- (an LLM proposing through the gate against a two-tenant database, 2026-10-06):
+--
+-- 1. A CTE THAT WRITES. max_rows counted the rows of the outer statement only, so
+--    `with d as (delete from t returning id) select count(*) from d` deleted every row
+--    under a limit of 5. Each write can still be proposed as its own statement.
+-- 2. set_config() ANYWHERE IN THE STATEMENT. The session allowlist judged SET and the
+--    startup parameters, but while the gate runs a proposal its hooks step aside, so
+--    `... where set_config('app.tenant_id', '2', true) is not null` read another
+--    tenant's rows. Matched by OID in the analyzed and rewritten tree: where, from, a
+--    sublink, a CTE, a view, schema-qualified or not.
+--
+-- Still NOT covered, and said in the README: a function that already exists and calls
+-- set_config in its own body.

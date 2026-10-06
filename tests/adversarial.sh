@@ -262,6 +262,16 @@ attack proposal "SELECT FOR UPDATE beyond max_rows" "" \
 attack proposal "a write that touches more rows than max_rows" "" \
     propose_and_commit "update clientes set plan = 'hacked'" "upgrade everyone"
 
+# The same write hidden in a CTE, under a statement that returns ONE row. max_rows counted
+# the rows of the outer statement, so this touched all three customers under a limit of
+# two (found by the cycle harness of yggdrasil, 2026-10-06). Two shapes of it.
+attack proposal "a CTE that writes, under a SELECT that returns one row" "" \
+    propose_and_commit "with d as (update clientes set plan = 'hacked' returning 1) select count(*) from d" \
+    "upgrade everyone, counted as one row"
+attack proposal "a CTE that writes, under a SELECT that does not even read it" "" \
+    propose_and_commit "with d as (update clientes set plan = 'hacked' returning 1) select 1" \
+    "upgrade everyone, counted as one row"
+
 # A verification is a statement about the database at a moment. The TTL is SUSET,
 # so only the owner can shorten it -- which is what makes this testable at all.
 su -c "alter role $AGENT set agent_gate.proposal_ttl_seconds = 1" >/dev/null
