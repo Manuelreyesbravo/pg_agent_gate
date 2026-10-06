@@ -1,0 +1,33 @@
+# A machine that has never seen this project: Debian with PostgreSQL 18 from the
+# PostgreSQL project's own packages, a stranger's toolchain, and the repository as git
+# has it. Everything the verification needs is installed here, from where anyone gets it,
+# and nothing comes from the machine that wrote the code. Built by tests/clean-machine/run.sh.
+FROM docker.io/library/postgres:18-bookworm
+
+ARG PGRX_VERSION=0.19.2
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      postgresql-server-dev-18 build-essential clang libclang-dev pkg-config \
+      ca-certificates curl git make \
+ && rm -rf /var/lib/apt/lists/*
+
+# Not root: initdb refuses root, and a stranger's machine is not run as root either. The
+# user owns the PostgreSQL directories pgrx's unit tests and `make install` write into.
+RUN useradd -m tester \
+ && chown -R tester /usr/lib/postgresql/18/lib /usr/share/postgresql/18/extension
+USER tester
+ENV PATH=/home/tester/.cargo/bin:/usr/lib/postgresql/18/bin:$PATH \
+    PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
+
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+RUN cargo install cargo-pgrx --version "$PGRX_VERSION" --locked
+RUN cargo pgrx init --pg18 "$PG_CONFIG"
+
+# The one dependency outside this repository, from its public repository.
+RUN git clone --depth 1 https://github.com/Manuelreyesbravo/pg_living_assertions /home/tester/pg_living_assertions \
+ && make -C /home/tester/pg_living_assertions install PG_CONFIG="$PG_CONFIG"
+
+COPY --chown=tester . /home/tester/pg_agent_gate
+WORKDIR /home/tester/pg_agent_gate
+CMD ["make", "verify"]
