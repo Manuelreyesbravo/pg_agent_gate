@@ -27,6 +27,12 @@ set -uo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
 export PG_CONFIG=${PG_CONFIG:-pg_config}
+# pgrx-tests connects to its test instance as $USER and panics when it is unset, which is
+# what a container switched with `USER` and most CI runners give you. Found on the first
+# clean-machine run (2026-10-06): the first unit test panicked on it and the other nine
+# died on the mutex it left behind -- 0/10 on a machine where every suite passed.
+export USER=${USER:-$(id -un)}
+
 LOG=$ROOT/target/verify
 PGRX_VERSION=0.19.2
 
