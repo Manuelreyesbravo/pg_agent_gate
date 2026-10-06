@@ -78,9 +78,10 @@ make clean-machine                           # the same, in a fresh container th
 | `upgrade.sh` | an installation of the oldest schema, upgraded | 9 |
 | pgrx unit tests | the verbs, from inside the server | 10 |
 
-On a fresh Debian container with PostgreSQL 18.6, receiving only what git has
-committed: **`verified: 164 checks passed, 0 failed`** (the same 164 on
-PostgreSQL 19beta2). `VERIFY_DRIVERS=1` adds real pgjdbc and node-pg sessions.
+On a fresh Debian container receiving only what git has committed, with
+PostgreSQL 18.6 and with 19beta4 from PGDG: **`verified: 164 checks passed, 0
+failed`** on both (and on 19beta2, where it was developed). CI runs the same
+container for 18 and 19 on every push. `VERIFY_DRIVERS=1` adds real pgjdbc and node-pg sessions.
 
 Two of these suites were green while a hole was open: see
 [what found the 0.2.1 fixes](#what-found-the-021-fixes). A green suite is a
