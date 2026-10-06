@@ -22,4 +22,14 @@ trap 'rm -rf "$CONTEXT"' EXIT
 git -C "$ROOT" archive HEAD | tar -x -C "$CONTEXT"
 
 "$ENGINE" build -t pg_agent_gate-verify -f "$CONTEXT/tests/clean-machine/Containerfile" "$CONTEXT"
-"$ENGINE" run --rm pg_agent_gate-verify
+# Not --rm: the logs are copied out first, so a failure can be read after the fact.
+NAME=pg_agent_gate-verify-$$
+rc=0
+"$ENGINE" run --name "$NAME" pg_agent_gate-verify || rc=$?
+mkdir -p "$ROOT/target"
+rm -rf "$ROOT/target/clean-machine"
+"$ENGINE" cp "$NAME:/home/tester/pg_agent_gate/target/verify" "$ROOT/target/clean-machine" >/dev/null 2>&1 \
+    && echo "logs of the container: $ROOT/target/clean-machine"
+"$ENGINE" rm "$NAME" >/dev/null
+exit "$rc"
+

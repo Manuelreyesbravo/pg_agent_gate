@@ -74,10 +74,17 @@ record() {  # name status checks_ok checks_failed summary
     ROWS+=("$(printf '  %-14s %-7s %5s %6s   %s' "$1" "$2" "$3" "$4" "$5")")
 }
 
+# Each step says it started and how it ended. The first version printed nothing between
+# "building the release artifact ... ok" and the summary, and on a fresh container --
+# where the unit tests compile the crate from scratch -- that read as hung (2026-10-06).
 for s in "${SUITES[@]}"; do
     out="$LOG/$s.log"
+    printf '%-28s' "suite $s ..."
+    t0=$SECONDS
     bash "tests/$s.sh" >"$out" 2>&1
     rc=$?
+    [ "$rc" -eq 0 ] && echo "ok ($((SECONDS - t0)) s)" || echo "FAILED, exit $rc ($((SECONDS - t0)) s)"
+
     ok=$(grep -cE '^[[:space:]]+ok[[:space:]]' "$out")
     bad=$(grep -cE '^[[:space:]]+FAIL[[:space:]]' "$out")
     total_ok=$((total_ok + ok))
@@ -94,8 +101,13 @@ done
 # registers. Not registered is a failure with its fix, not a skip.
 unit="$LOG/unit.log"
 if cargo pgrx info pg-config "pg$MAJOR" >/dev/null 2>&1; then
+    printf '%-28s' "unit tests (pgrx) ..."
+    echo -n "compiling with pg_test the first time takes minutes ... "
+    t0=$SECONDS
     cargo pgrx test "pg$MAJOR" >"$unit" 2>&1
     rc=$?
+    [ "$rc" -eq 0 ] && echo "ok ($((SECONDS - t0)) s)" || echo "FAILED, exit $rc ($((SECONDS - t0)) s)"
+
     passed=$(sed -nE 's/.*test result: [a-zA-Z]+\. ([0-9]+) passed.*/\1/p' "$unit" | tail -1)
     nfail=$(sed -nE 's/.*test result: [a-zA-Z]+\. [0-9]+ passed; ([0-9]+) failed.*/\1/p' "$unit" | tail -1)
     total_ok=$((total_ok + ${passed:-0}))
@@ -123,5 +135,18 @@ if [ "$failed" -eq 0 ]; then
     echo "verified: $total_ok checks passed, 0 failed"
     exit 0
 fi
+# What failed is printed here and not only named: on a container run with --rm the log
+# file is gone with the container, and "see unit.log" pointed at nothing (2026-10-06).
+for f in "$LOG"/*.log; do
+    case "$(basename "$f" .log)" in package|cluster) continue ;; esac
+    if grep -qE '^[[:space:]]+FAIL[[:space:]]|test result: FAILED|^error|panicked' "$f"; then
+        echo
+        echo "---- last lines of $f"
+        grep -E 'FAIL|panicked|error|Error|denied|not found' "$f" | head -15
+        tail -15 "$f"
+    fi
+done
+echo
 echo "NOT verified: $failed suite(s) failed -- $total_ok checks passed, $total_fail failed"
 exit 1
+
