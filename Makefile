@@ -8,7 +8,7 @@
 
 PG_CONFIG ?= pg_config
 
-.PHONY: verify clean-machine demo contrast transfer bench mcp docker-demo
+.PHONY: verify clean-machine demo contrast transfer bench mcp docker-demo fuzz
 
 # Container engine for docker-demo: docker, or override with DOCKER=podman.
 DOCKER ?= docker
@@ -21,6 +21,12 @@ bench:
 
 demo:
 	PG_CONFIG=$(PG_CONFIG) bash tests/demo.sh
+
+
+# Fuzz the gate: generated and mutated adversarial SQL, checked from a superuser's side.
+# FUZZ_ITERS and FUZZ_SEED tune it. Needs uv (or psycopg on PATH).
+fuzz:
+	PG_CONFIG=$(PG_CONFIG) bash tests/fuzz.sh
 
 
 # What you remove, and what goes in its place: the same statement run by an ordinary

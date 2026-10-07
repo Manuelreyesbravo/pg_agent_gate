@@ -132,6 +132,15 @@ jobs:
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         run: make transfer PG_CONFIG=/usr/lib/postgresql/$PG_MAJOR/bin/pg_config
 
+      # Fuzzing is a campaign, not a per-push check: a fresh random seed each week, so it
+      # widens coverage over time. It prints the seed, so a finding is reproducible.
+      - name: fuzz the gate
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          export PATH="$HOME/.local/bin:$PATH"
+          FUZZ_ITERS=${FUZZ_ITERS:-5000} make fuzz PG_CONFIG=/usr/lib/postgresql/$PG_MAJOR/bin/pg_config
+
       - name: logs
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
