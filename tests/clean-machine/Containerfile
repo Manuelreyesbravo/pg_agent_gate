@@ -7,7 +7,7 @@
 #
 # PG_MAJOR picks the version. PGDG publishes each major in its own component, betas
 # included, so 19 resolves to the newest 19 beta without naming it here.
-FROM docker.io/library/debian:bookworm-slim
+FROM docker.io/library/debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
 
 ARG PG_MAJOR=18
 ARG PGRX_VERSION=0.19.2
@@ -34,7 +34,7 @@ ENV PATH=/home/tester/.cargo/bin:/usr/lib/postgresql/$PG_MAJOR/bin:$PATH \
     PG_CONFIG=/usr/lib/postgresql/$PG_MAJOR/bin/pg_config \
     USER=tester
 
-RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.98.0
 RUN cargo install cargo-pgrx --version "$PGRX_VERSION" --locked
 RUN cargo pgrx init --pg$PG_MAJOR "$PG_CONFIG"
 

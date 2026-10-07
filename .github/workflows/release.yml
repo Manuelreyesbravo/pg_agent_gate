@@ -62,10 +62,15 @@ jobs:
             -t "ghcr.io/$OWNER/pg_agent_gate-demo:${{ steps.tag.outputs.version }}" \
             -t "ghcr.io/$OWNER/pg_agent_gate-demo:latest" .
 
+      # Publish only if the gate actually did its job in the image: these markers are the
+      # refusals and limits in the demo output, not merely that it exited 0.
       - name: run the demo in the image before publishing it
         run: |
           docker run --rm "$IMAGE:${{ steps.tag.outputs.version }}" | tee demo-output.txt
-          grep -q 'ana@new.example' demo-output.txt   # the demo reached its end, not just exited 0
+          for m in "it proposes, it does not execute" "refused at propose" \
+                   "aborted" "TABLE GONE" "ana@new.example"; do
+            grep -qF "$m" demo-output.txt || { echo "smoke test: the demo is missing: $m"; exit 1; }
+          done
 
       - name: push to ghcr.io
         run: |

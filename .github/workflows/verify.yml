@@ -25,18 +25,20 @@ on:
     - cron: '0 7 * * 1'   # Mondays 07:00 UTC: catch a moving PostgreSQL 19 beta, run the measurements
 
 permissions:
-  contents: read
-  issues: write     # the weekly run opens an issue when the PostgreSQL 19 beta breaks
+  contents: read     # the verify job widens this to issues: write for the PG19 cron alert
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   verify:
     name: verify (PostgreSQL ${{ matrix.pg }})
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    permissions:
+      contents: read
+      issues: write     # open an issue when the PostgreSQL 19 beta breaks on the weekly run
     # PostgreSQL 19 is a beta that moves under us: let it run and report, without failing the run.
     continue-on-error: ${{ matrix.pg == 19 }}
     strategy:
@@ -137,7 +139,7 @@ jobs:
       - name: fuzz the gate
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         run: |
-          curl -LsSf https://astral.sh/uv/install.sh | sh
+          curl -LsSf https://astral.sh/uv/0.12.23/install.sh | sh    # pinned, like every other tool here
           export PATH="$HOME/.local/bin:$PATH"
           FUZZ_ITERS=${FUZZ_ITERS:-5000} make fuzz PG_CONFIG=/usr/lib/postgresql/$PG_MAJOR/bin/pg_config
 
@@ -146,5 +148,5 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: end-to-end-gated-mcp-log
-          path: .testcluster/gated-mcp.log
+          path: gated-mcp.log
           if-no-files-found: warn

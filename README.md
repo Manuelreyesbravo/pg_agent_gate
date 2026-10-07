@@ -124,6 +124,13 @@ PostgreSQL 18.6 and with 19beta4 from PGDG: **`verified: 164 checks passed, 0
 failed`** on both (and on 19beta2, where it was developed). CI runs the same
 container for 18 and 19 on every push. `VERIFY_DRIVERS=1` adds real pgjdbc and node-pg sessions.
 
+Beyond the hand-written suites, **`make fuzz`** throws generated and mutated adversarial SQL
+at the gate and, from a superuser's side, checks that nothing the agent runs directly changes
+the database (a fingerprint of the catalog, the role and every row) and that the server stays
+up. A teeth check runs first so a clean result is never vacuous, and `FUZZ_NO_GATE=1` is the
+negative control. The strong property is that fingerprint, not the word list the `propose`
+half uses; `tests/fuzz.py` says what it does and does not catch. CI fuzzes weekly, not on every push.
+
 Two of these suites were green while a hole was open: see
 [what found the 0.2.1 fixes](#what-found-the-021-fixes). A green suite is a
 claim about the cases it has, which is why the threat model below says what is

@@ -29,9 +29,13 @@ jobs:
       - name: build the image
         run: docker build -t pg_agent_gate-demo:ci .
 
-      # Fail if the demo runs but does not reach its end, not only if it exits non-zero:
-      # the last line commits a change and prints the new value.
+      # Fail unless the gate actually did its job, not just unless the demo exited 0: the
+      # markers below are the refusals and limits in the output. A broken gate would be missing
+      # "it proposes, it does not execute" or "refused at propose" or "aborted".
       - name: run the demo in it
         run: |
           docker run --rm pg_agent_gate-demo:ci | tee demo-output.txt
-          grep -q 'ana@new.example' demo-output.txt
+          for m in "it proposes, it does not execute" "refused at propose" \
+                   "aborted" "TABLE GONE" "ana@new.example"; do
+            grep -qF "$m" demo-output.txt || { echo "smoke test: the demo is missing: $m"; exit 1; }
+          done

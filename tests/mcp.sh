@@ -69,12 +69,12 @@ export GATED_MCP_URL="http://127.0.0.1:$MCP_PORT/mcp"
 export GATE_SUPERUSER_URL="postgres://$SUPERUSER@127.0.0.1:$GATE_PORT/$DB"
 AGENT_GATE_DATABASE_URL="postgres://$AGENT@127.0.0.1:$GATE_PORT/$DB" \
     PORT="$MCP_PORT" HOST=127.0.0.1 \
-    bun run gated-mcp/src/index.ts >"$ROOT/.testcluster/gated-mcp.log" 2>&1 &
+    bun run gated-mcp/src/index.ts >"$ROOT/gated-mcp.log" 2>&1 &
 MCP_PID=$!
 
 # Up when the endpoint answers at all (even a 400 means the server is listening).
 for _ in $(seq 1 60); do
-    kill -0 "$MCP_PID" 2>/dev/null || { echo "gated-mcp exited early:"; cat "$ROOT/.testcluster/gated-mcp.log"; exit 1; }
+    kill -0 "$MCP_PID" 2>/dev/null || { echo "gated-mcp exited early:"; cat "$ROOT/gated-mcp.log"; exit 1; }
     curl -s -o /dev/null "$GATED_MCP_URL" && break
     sleep 0.5
 done
@@ -90,5 +90,5 @@ run "Resources and prompts add no power"                  resources.mjs
 run "The Streamable HTTP transport MUSTs"                 transport.mjs
 
 echo
-[ "$rc" -eq 0 ] && echo "gated-mcp: every suite passed" || echo "gated-mcp: a suite failed (log: .testcluster/gated-mcp.log)"
+[ "$rc" -eq 0 ] && echo "gated-mcp: every suite passed" || echo "gated-mcp: a suite failed (log: gated-mcp.log)"
 exit "$rc"

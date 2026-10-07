@@ -5,24 +5,33 @@
 # Fuzz the gate the way an adversary would, with volume the 164 hand-written attacks do not
 # have. Two properties, checked from a superuser's side of the database after every input:
 #
-#   1. DIRECT EXECUTION CHANGES NOTHING. In an agent session SQL does not execute -- only the
-#      verbs. So a fingerprint of the catalog (tables, columns, constraints, triggers,
-#      policies), the agent role's attributes, and the data (row counts and another tenant's
-#      rows) must be IDENTICAL after any statement the agent runs directly. Any change is a
-#      bypass of the one guarantee the extension exists for.
-#   2. propose() REFUSES THE DANGEROUS. A statement that drops, truncates, grants, alters,
-#      creates, copies, calls, does, prepares, chains two statements, writes in a CTE, or
-#      moves a setting its policies read must come back ok:false. ok:true on one of those is a
-#      bypass.
+#   1. DIRECT EXECUTION CHANGES NOTHING -- the strong oracle. In an agent session SQL does not
+#      execute, only the verbs. So a fingerprint of the catalog (tables, columns, constraints,
+#      triggers, policies), the agent role's attributes, and EVERY ROW of both tables (so an
+#      update of the agent's own tenant is caught too) must be IDENTICAL after any statement the
+#      agent runs directly. Any change is a bypass of the one guarantee the extension exists for.
+#   2. propose() REFUSES THE DANGEROUS -- a heuristic. A statement that drops, truncates, grants,
+#      alters, creates, copies, calls, does, prepares, chains two statements, writes in a CTE, or
+#      moves a setting its policies read should come back ok:false.
 #
-# And after every input: the server is still alive (a crash is the loudest bug of all).
+# And after every input: the server is still alive, and if the agent's own backend went away
+# the run reconnects and counts it, so a killed session cannot turn into a silent "clean".
+#
+# WHAT THIS DOES NOT CATCH, said plainly. Property 2 is a word list, not a parser: it does not
+# flag dangerous FUNCTIONS (pg_terminate_backend, pg_sleep, lo_import, dblink, pg_read_*). That
+# is on purpose -- those resolve as reads, so propose() accepts them BY DESIGN; the damage, if
+# any, is bounded by the agent's own privileges at commit (not a superuser, no pg_signal_backend,
+# no server-file read) and by property 1. They are in the corpus, exercised, not expected to be
+# refused. The real guarantee is property 1; property 2 is a convenience. A teeth check runs
+# first every time (a known change must move the fingerprint) so a clean run is never vacuous.
 #
 #   make fuzz PG_CONFIG=/path/to/pg_config            # default 3000 inputs
 #   FUZZ_ITERS=20000 FUZZ_SEED=1 make fuzz            # longer, reproducible
+#   FUZZ_NO_GATE=1 make fuzz                          # negative control: no gate, escapes expected
 #
-# The inputs are generated from dangerous templates, mutations of them, and random bytes, so
-# a run is reproducible only with its seed (printed at the top). Facts are measured by the
-# database, never asserted in prose.
+# The inputs are generated from dangerous templates, mutations of them, and random bytes, so a
+# run is reproducible only with its seed (printed at the top), and it refuses any database not
+# named gate_fuzz unless FUZZ_FORCE=1. Facts are measured by the database, never asserted.
 import os
 import random
 import re
@@ -83,6 +92,19 @@ DANGEROUS = [
     "lock shop.orders in access exclusive mode",
     "notify x",
     "listen x",
+    # Dangerous FUNCTIONS. These resolve as reads, so propose() may accept them -- that is by
+    # design: the damage, if any, is bounded by the agent's own privileges at commit (it is not
+    # a superuser, has no pg_signal_backend, cannot read server files) and by the fingerprint
+    # oracle below. They are here to be EXERCISED end to end, not to be refused at propose.
+    "select pg_terminate_backend(pid) from pg_stat_activity",
+    "select pg_cancel_backend(pid) from pg_stat_activity",
+    "select pg_sleep(10)",
+    "select lo_import('/etc/passwd')",
+    "select lo_export(1, '/tmp/x')",
+    "select pg_read_server_files from pg_roles",
+    "select dblink('host=x', 'select 1')",
+    "select pg_stat_file('/etc/passwd')",
+    "select pg_ls_dir('/')",
 ]
 
 # A few legitimate statements: the agent still cannot run these DIRECTLY (the gate blocks all
@@ -176,9 +198,14 @@ select md5(string_agg(x, '|' order by x)) from (
   union all select 'p:'||polname from pg_policy
   union all select 'r:'||rolname||':'||rolsuper::text||':'||rolcreaterole::text||':'||rolcreatedb::text from pg_roles where rolname='fuzz_agent'
   union all select 'm:'||r.rolname from pg_auth_members am join pg_roles m on m.oid=am.member join pg_roles r on r.oid=am.roleid where m.rolname='fuzz_agent'
-  union all select 'n:customers:'||(select count(*) from shop.customers)
-  union all select 'n:orders:'||(select count(*) from shop.orders)
-  union all select 't2:'||coalesce(string_agg(email, ',' order by id), '') from shop.customers where tenant=2
+  -- Every row of both tables, every column, so ANY change a bypass could make -- including an
+  -- update of the agent's own tenant -- moves the fingerprint. A superuser sees past RLS.
+  union all select 'd:customers:'||coalesce(string_agg(
+      c.id||':'||c.tenant||':'||coalesce(c.name,'')||':'||coalesce(c.email,''), '|' order by c.id), '')
+    from shop.customers c
+  union all select 'd:orders:'||coalesce(string_agg(
+      o.id||':'||o.tenant||':'||coalesce(o.customer::text,'')||':'||coalesce(o.total::text,''), '|' order by o.id), '')
+    from shop.orders o
 ) s(x)
 """
 
@@ -188,6 +215,13 @@ def main():
         sys.exit("need a superuser DSN as argv[1] or FUZZ_DSN")
     print(f"fuzzing pg_agent_gate: {ITERS} inputs, seed {SEED}")
     su = psycopg.connect(DSN, autocommit=True)
+
+    # This is destructive -- it drops schema shop and the role fuzz_agent. Refuse any database
+    # not named gate_fuzz unless forced, so a stray DSN cannot wipe a real schema.
+    db = su.execute("select current_database()").fetchone()[0]
+    if db != "gate_fuzz" and not os.environ.get("FUZZ_FORCE"):
+        sys.exit(f"refusing to fuzz database {db!r}: this drops schema shop and the role {AGENT}. "
+                 "Use a throwaway named 'gate_fuzz', or set FUZZ_FORCE=1 if you are sure.")
 
     def run_schema():
         for stmt in SCHEMA.split(";"):
@@ -218,38 +252,66 @@ def main():
             return False
 
     baseline = fingerprint()
-    agent = psycopg.connect(DSN, user=AGENT, autocommit=True)
+
+    # Prove the oracle has TEETH every run, not only when FUZZ_NO_GATE is set by hand: as a
+    # superuser, make a change the fingerprint must see (an update, then a new table) and undo
+    # it. If the fingerprint does not move, it is blind and a clean run would mean nothing.
+    if not os.environ.get("FUZZ_NO_GATE"):
+        su.execute("update shop.customers set email = email || '.teeth' where id = 1")
+        saw_update = fingerprint() != baseline
+        su.execute("update shop.customers set email = replace(email, '.teeth', '') where id = 1")
+        restored = fingerprint() == baseline
+        su.execute("create table shop.teeth_check (x int)")
+        saw_ddl = fingerprint() != baseline
+        su.execute("drop table shop.teeth_check")
+        if not (saw_update and restored and saw_ddl and fingerprint() == baseline):
+            sys.exit("the fingerprint is BLIND: a known change did not move it -- the oracle has no teeth")
+
+    agent = [psycopg.connect(DSN, user=AGENT, autocommit=True)]
+
+    def reconnect():
+        try:
+            agent[0].close()
+        except Exception:
+            pass
+        agent[0] = psycopg.connect(DSN, user=AGENT, autocommit=True)
 
     direct_bypass, propose_bypass, crashes = [], [], []
+    reached = client_rejected = reconnects = 0
     for i in range(ITERS):
         payload = gen()
 
-        # 1. direct execution must change nothing.
+        # 1. direct execution must change nothing. Count whether it reached the server, and if
+        #    the agent's own backend went away, reconnect so later iterations still test.
         try:
-            with agent.cursor() as c:
+            with agent[0].cursor() as c:
                 c.execute(payload)
+                reached += 1
                 try:
                     c.fetchall()
                 except psycopg.Error:
                     pass
+        except psycopg.OperationalError:
+            reconnects += 1; reconnect()        # the backend went away (e.g. terminated)
         except psycopg.Error:
-            pass
-        except Exception:  # a client-side encoding error never reached the server
-            pass
+            reached += 1                         # the server rejected it -- it still saw it
+        except Exception:
+            client_rejected += 1                 # psycopg refused to send it (e.g. a NUL byte)
         if not alive():
             crashes.append(payload); break
         if fingerprint() != baseline:
             direct_bypass.append(payload)
             run_schema(); baseline = fingerprint()  # restore and keep going
 
-        # 2. propose() must refuse the dangerous.
+        # 2. propose() must refuse the dangerous. This half is a heuristic (see the docstring);
+        #    the fingerprint above is the part that holds whatever the word list misses.
         try:
-            with agent.cursor() as c:
+            with agent[0].cursor() as c:
                 row = c.execute("select agent_gate.propose(%s, %s)", (payload, "fuzz")).fetchone()
             ok = isinstance(row[0], dict) and row[0].get("ok") is True
-        except psycopg.Error:
-            ok = False
-        except Exception:
+        except psycopg.OperationalError:
+            ok = False; reconnects += 1; reconnect()
+        except (psycopg.Error, Exception):
             ok = False
         if ok and looks_dangerous(payload):
             propose_bypass.append(payload)
@@ -263,7 +325,9 @@ def main():
             print(f"  {i + 1}/{ITERS}  direct_bypass={len(direct_bypass)} propose_bypass={len(propose_bypass)} crashes={len(crashes)}")
 
     print("\n--- result ---")
-    print(f"inputs:                 {ITERS}")
+    print(f"inputs generated:       {ITERS}")
+    print(f"reached the server:     {reached}  (rejected by the client, e.g. a NUL byte: {client_rejected})")
+    print(f"agent reconnections:    {reconnects}  (the agent's backend went away this many times)")
     print(f"server crashes:         {len(crashes)}")
     print(f"direct-execution escapes: {len(direct_bypass)}")
     print(f"propose() accepted a dangerous statement: {len(propose_bypass)}")
@@ -272,7 +336,22 @@ def main():
             print(f"  {label}: {s!r}")
 
     bad = len(crashes) + len(direct_bypass) + len(propose_bypass)
-    print(f"\n{'CLEAN: nothing escaped' if bad == 0 else f'FOUND {bad} escape(s) -- see above'} (seed {SEED})")
+    verdict = "CLEAN: nothing escaped" if bad == 0 else f"FOUND {bad} escape(s) -- see the job log, not this summary"
+    print(f"\n{verdict} (seed {SEED})")
+
+    # A public summary carries the numbers and the seed, but NEVER the escaping inputs: one
+    # could disclose a bypass, so those stay only in the login-gated job log.
+    gh_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if gh_summary:
+        with open(gh_summary, "a") as f:
+            f.write(
+                f"### fuzz (seed {SEED})\n\n"
+                f"- inputs: {ITERS} — reached the server: {reached}, client-rejected: {client_rejected}\n"
+                f"- agent reconnections: {reconnects}\n"
+                f"- crashes: {len(crashes)} · direct-execution escapes: {len(direct_bypass)} · "
+                f"propose escapes: {len(propose_bypass)}\n"
+                f"- **{verdict}**\n"
+            )
     sys.exit(1 if bad else 0)
 
 
