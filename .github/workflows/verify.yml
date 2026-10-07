@@ -41,3 +41,53 @@ jobs:
           name: verify-logs-pg${{ matrix.pg }}
           path: target/clean-machine-pg${{ matrix.pg }}
           if-no-files-found: warn
+
+  # The MCP replacement, re-proved on every commit: a real MCP client, through gated-mcp,
+  # can only operate the gate. gated-mcp connects AS THE AGENT ROLE, so it holds no power;
+  # this runs `make mcp` -- the same command anyone can run after a fork -- against a fresh
+  # cluster, with the official @modelcontextprotocol client (both protocol eras), and every
+  # change is checked from outside the gate by a superuser. The MCP layer is the same for
+  # every PostgreSQL major, so one is enough to prove it.
+  mcp:
+    name: mcp (a real MCP client, gated)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PG_MAJOR: "18"
+      PGRX_VERSION: "0.19.2"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: PostgreSQL ${{ env.PG_MAJOR }} and a build toolchain, from PGDG
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSo /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main $PG_MAJOR" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            postgresql-$PG_MAJOR postgresql-server-dev-$PG_MAJOR \
+            build-essential clang libclang-dev pkg-config
+          echo "/usr/lib/postgresql/$PG_MAJOR/bin" >> "$GITHUB_PATH"
+
+      - name: cargo-pgrx ${{ env.PGRX_VERSION }}
+        run: |
+          cargo install cargo-pgrx --version "$PGRX_VERSION" --locked
+          cargo pgrx init --pg$PG_MAJOR "/usr/lib/postgresql/$PG_MAJOR/bin/pg_config"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: oven-sh/setup-bun@v2
+
+      - name: a real MCP client operates the gate
+        run: make mcp PG_CONFIG=/usr/lib/postgresql/$PG_MAJOR/bin/pg_config
+
+      - name: logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcp-gated-mcp-log
+          path: .testcluster/gated-mcp.log
+          if-no-files-found: warn
