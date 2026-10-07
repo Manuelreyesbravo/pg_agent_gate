@@ -103,7 +103,7 @@ jobs:
       - name: the gate vs an ordinary connection, side by side
         run: make contrast PG_CONFIG=/usr/lib/postgresql/$PG_MAJOR/bin/pg_config
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "20"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
