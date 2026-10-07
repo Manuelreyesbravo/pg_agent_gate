@@ -38,6 +38,24 @@ jobs:
       # extension is identical to the tagged one.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # Do not publish anything the attack suite did not pass on this exact commit. On a tag
+      # push verify runs in parallel, so wait for it; on workflow_dispatch it has already run.
+      - name: require the verify workflow to pass for this commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SHA="${{ github.sha }}"
+          for i in $(seq 1 40); do
+            CONC=$(gh run list -R "${{ github.repository }}" --workflow verify.yml --commit "$SHA" \
+                   --json status,conclusion --jq '[.[] | select(.status=="completed")][0].conclusion // ""')
+            case "$CONC" in
+              success) echo "verify passed for $SHA"; exit 0 ;;
+              "")      echo "waiting for verify on $SHA ($i/40)"; sleep 30 ;;
+              *)       echo "verify did not pass for $SHA: $CONC"; exit 1 ;;
+            esac
+          done
+          echo "timed out waiting for verify on $SHA"; exit 1
+
       - name: the tag matches the extension version
         run: |
           WANT="${{ steps.tag.outputs.version }}"

@@ -125,11 +125,13 @@ failed`** on both (and on 19beta2, where it was developed). CI runs the same
 container for 18 and 19 on every push. `VERIFY_DRIVERS=1` adds real pgjdbc and node-pg sessions.
 
 Beyond the hand-written suites, **`make fuzz`** throws generated and mutated adversarial SQL
-at the gate and, from a superuser's side, checks that nothing the agent runs directly changes
-the database (a fingerprint of the catalog, the role and every row) and that the server stays
-up. A teeth check runs first so a clean result is never vacuous, and `FUZZ_NO_GATE=1` is the
-negative control. The strong property is that fingerprint, not the word list the `propose`
-half uses; `tests/fuzz.py` says what it does and does not catch. CI fuzzes weekly, not on every push.
+at the gate and checks, from a superuser's side: nothing the agent runs directly changes the
+database, and every proposal the gate *accepts*, once **committed**, leaves the catalog, the
+role and another tenant untouched and stays within `max_rows` -- the surface the two 0.2.1 bugs
+lived on. Two teeth checks run first so neither half can pass vacuously (a known change must
+move the fingerprint; `propose` must refuse a known `DROP` and `GRANT`), and run against the
+`v0.2.0` tag the fuzzer reports the historical `set_config` hole. `tests/fuzz.py` says plainly
+what it does and does not catch. CI fuzzes weekly, not on every push.
 
 Two of these suites were green while a hole was open: see
 [what found the 0.2.1 fixes](#what-found-the-021-fixes). A green suite is a
