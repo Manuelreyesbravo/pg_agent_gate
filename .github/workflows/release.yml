@@ -42,13 +42,14 @@ jobs:
         run: |
           WANT="${{ steps.tag.outputs.version }}"
           CARGO=$(sed -nE 's/^version = "([^"]+)".*/\1/p' Cargo.toml | head -1)
-          META=$(sed -nE 's/.*"version": *"([^"]+)".*/\1/p' META.json | head -1)
-          for pair in "Cargo.toml:$CARGO" "META.json:$META"; do
-            if [ "${pair#*:}" != "$WANT" ]; then
-              echo "tag ${{ steps.tag.outputs.tag }} does not match ${pair%%:*} version ${pair#*:}"; exit 1
-            fi
+          META_TOP=$(jq -r '.version' META.json)
+          META_PROV=$(jq -r '.provides.pg_agent_gate.version' META.json)
+          PROV_FILE=$(jq -r '.provides.pg_agent_gate.file' META.json)
+          for pair in "Cargo.toml:$CARGO" "META.json:$META_TOP" "META.json/provides:$META_PROV"; do
+            [ "${pair#*:}" = "$WANT" ] || { echo "tag ${{ steps.tag.outputs.tag }} does not match ${pair%%:*} version ${pair#*:}"; exit 1; }
           done
-          echo "version $WANT matches Cargo.toml and META.json"
+          [ -f "$PROV_FILE" ] || { echo "META.json provides.file '$PROV_FILE' does not exist"; exit 1; }
+          echo "version $WANT matches Cargo.toml and both META.json versions; provides.file ($PROV_FILE) present"
 
       - name: build the demo image
         run: |

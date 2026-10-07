@@ -97,6 +97,8 @@ or pull the prebuilt image instead of building it:
 docker run --rm ghcr.io/manuelreyesbravo/pg_agent_gate-demo
 ```
 
+The image is `linux/amd64`; on an Apple-silicon Mac it runs under emulation.
+
 ## Verify it yourself
 
 Every claim in this README has a test that attacks it on purpose and checks the

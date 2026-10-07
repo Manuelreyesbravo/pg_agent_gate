@@ -11,7 +11,7 @@ ARG PG_MAJOR=18
 ARG PGRX_VERSION=0.19.2
 
 # ---------------------------------------------------------------- builder (has the toolchain)
-FROM docker.io/library/debian:bookworm-slim AS builder
+FROM docker.io/library/debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS builder
 ARG PG_MAJOR
 ARG PGRX_VERSION
 RUN apt-get update \
@@ -27,7 +27,7 @@ RUN apt-get update \
       build-essential clang libclang-dev pkg-config git make \
  && rm -rf /var/lib/apt/lists/*
 ENV PATH=/root/.cargo/bin:/usr/lib/postgresql/$PG_MAJOR/bin:$PATH
-RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.98.0
 RUN cargo install cargo-pgrx --version "$PGRX_VERSION" --locked
 RUN cargo pgrx init --pg$PG_MAJOR /usr/lib/postgresql/$PG_MAJOR/bin/pg_config
 COPY . /src
@@ -35,7 +35,7 @@ WORKDIR /src
 RUN cargo pgrx package --pg-config /usr/lib/postgresql/$PG_MAJOR/bin/pg_config
 
 # ---------------------------------------------------------------- runtime (no toolchain)
-FROM docker.io/library/debian:bookworm-slim AS runtime
+FROM docker.io/library/debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS runtime
 ARG PG_MAJOR
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl make bash \
