@@ -25,10 +25,11 @@ A small, free model operating it live, verified end to end:
 
 **Contents:** [See it in one minute](#see-it-in-one-minute) ·
 [Verify it yourself](#verify-it-yourself) · [How it works](#how-it-works) ·
-[The six verbs](#the-six-verbs) · [Run the two side by side](#run-the-two-side-by-side) ·
+[The six verbs](#the-six-verbs) · [Setup](#setup) ·
+[Run the two side by side](#run-the-two-side-by-side) ·
 [The pipe: what JSON costs](#the-pipe-what-json-costs) ·
 [A client that only speaks MCP](#for-a-client-that-only-speaks-mcp-a-shim-with-no-power) ·
-[Measured](#measured) · [Threat model](#threat-model) ·
+[Measured](#measured) · [What it costs](#what-it-costs) · [Threat model](#threat-model) ·
 [What it does not cover](#what-it-does-not-cover)
 
 ## See it in one minute

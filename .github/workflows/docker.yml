@@ -1,0 +1,33 @@
+# The demo image is the front door for anyone without Rust, and nothing else in CI builds it.
+# Build it and run the demo in it whenever the Dockerfile or its ignore list changes. amd64
+# only (the GitHub runner); on an ARM Mac it would run emulated.
+name: docker
+
+on:
+  pull_request:
+    paths: ['Dockerfile', '.dockerignore']
+  push:
+    branches: [main]
+    paths: ['Dockerfile', '.dockerignore']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    name: build and run the demo image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: build the image
+        run: docker build -t pg_agent_gate-demo:ci .
+
+      - name: run the demo in it
+        run: docker run --rm pg_agent_gate-demo:ci

@@ -38,12 +38,31 @@ jobs:
       # extension is identical to the tagged one.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - name: build and push the demo image to ghcr.io
+      - name: the tag matches the extension version
+        run: |
+          CARGO=$(sed -nE 's/^version = "([^"]+)".*/\1/p' Cargo.toml | head -1)
+          if [ "$CARGO" != "${{ steps.tag.outputs.version }}" ]; then
+            echo "tag ${{ steps.tag.outputs.tag }} does not match Cargo.toml version $CARGO"; exit 1
+          fi
+          echo "version $CARGO matches the tag"
+
+      - name: build the demo image
         run: |
           OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
-          IMAGE="ghcr.io/$OWNER/pg_agent_gate-demo"
+          echo "IMAGE=ghcr.io/$OWNER/pg_agent_gate-demo" >> "$GITHUB_ENV"
+          docker build \
+            --label org.opencontainers.image.source=https://github.com/${{ github.repository }} \
+            --label org.opencontainers.image.version=${{ steps.tag.outputs.version }} \
+            --label org.opencontainers.image.revision=${{ github.sha }} \
+            -t "ghcr.io/$OWNER/pg_agent_gate-demo:${{ steps.tag.outputs.version }}" \
+            -t "ghcr.io/$OWNER/pg_agent_gate-demo:latest" .
+
+      - name: run the demo in the image before publishing it
+        run: docker run --rm "$IMAGE:${{ steps.tag.outputs.version }}"
+
+      - name: push to ghcr.io
+        run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-          docker build -t "$IMAGE:${{ steps.tag.outputs.version }}" -t "$IMAGE:latest" .
           docker push "$IMAGE:${{ steps.tag.outputs.version }}"
           docker push "$IMAGE:latest"
 
@@ -55,6 +74,9 @@ jobs:
             f { print }
           ' CHANGELOG.md > notes.md
           [ -s notes.md ] || echo "See CHANGELOG.md." > notes.md
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          printf '\n---\nDemo image: `docker run --rm ghcr.io/%s/pg_agent_gate-demo:%s` (built from commit %s).\n' \
+            "$OWNER" "${{ steps.tag.outputs.version }}" "${{ github.sha }}" >> notes.md
 
       - name: create or update the GitHub release
         env:

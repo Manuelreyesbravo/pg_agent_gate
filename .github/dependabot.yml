@@ -16,3 +16,10 @@ updates:
       interval: weekly
     commit-message:
       prefix: deps
+    # pgrx must match cargo-pgrx EXACTLY, and cargo-pgrx is a pinned toolchain version
+    # (=0.19.2) in the CI, the Dockerfile and the README -- not a Cargo dependency Dependabot
+    # can bump. A pgrx bump on its own therefore always breaks the build (a PR did), so pgrx is
+    # upgraded by hand, in lockstep with cargo-pgrx, and left out of Dependabot here.
+    ignore:
+      - dependency-name: pgrx
+      - dependency-name: pgrx-tests
