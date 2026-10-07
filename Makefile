@@ -8,7 +8,7 @@
 
 PG_CONFIG ?= pg_config
 
-.PHONY: verify clean-machine demo contrast bench mcp
+.PHONY: verify clean-machine demo contrast transfer bench mcp
 # psycopg 3 is the only dependency; uv fetches it without touching your environment.
 # Python pinned to 3.13: a default free-threaded 3.14 has no psycopg-binary wheel yet.
 bench:
@@ -24,6 +24,12 @@ demo:
 # connection (gone) and refused by the gate, and the rich verification the gate returns.
 contrast:
 	PG_CONFIG=$(PG_CONFIG) bash tests/contrast.sh
+
+
+# What the pipe costs: the same data native (typed, binary) and forced through JSON, on a
+# replica of a real workload. Needs node for the fidelity proof.
+transfer:
+	PG_CONFIG=$(PG_CONFIG) bash tests/transfer.sh
 
 
 # A real MCP client, through gated-mcp, can only operate the gate. Needs node and bun.

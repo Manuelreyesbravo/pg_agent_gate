@@ -346,9 +346,32 @@ the gate, gated-mcp started as that role, and every suite against it:
 make mcp PG_CONFIG=/path/to/pg_config     # needs node and bun on PATH
 ```
 
-CI (`.github/workflows/verify.yml`, the `mcp` job) runs that same command on
-every commit, so "a real MCP client can only operate the gate" is re-proved,
+CI (`.github/workflows/verify.yml`, the `end-to-end` job) runs that same command
+on every commit, so "a real MCP client can only operate the gate" is re-proved,
 not just asserted.
+
+## The pipe: what JSON costs
+
+MCP is JSON-RPC, and JSON has no 64-bit integer, no exact decimal and no binary.
+An agent that reaches the database through it moves its data over that pipe; one
+that reaches the gate over a native connection does not. The gate's guarantee is
+identical either way -- the same six verbs, the same verification -- so what you
+weigh is the pipe. `make transfer` measures it on a replica of a real workload
+(a 64-bit id, exact money, binary, arrays, nested documents, at volume):
+
+```
+make transfer PG_CONFIG=/path/to/pg_config
+```
+
+| the same data | native, PostgreSQL's own protocol | forced through JSON |
+|---|---|---|
+| the id `9007199254740993` | exact | `9007199254740992` -- a JSON number is an IEEE double |
+| `numeric(40,12)` | exact | lost, unless it travels as a string |
+| 256 bytes of binary | 256 bytes, raw | 348 bytes of base64 text (+35%) |
+| the whole set | its typed, binary self | larger, every number and key as text |
+
+None of it is real data; it is there so you can run it. The fidelity loss is
+shown live, by parsing the value with the same JSON a client would use.
 
 ## Measured
 

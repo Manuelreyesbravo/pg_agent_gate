@@ -90,6 +90,9 @@ jobs:
       - name: a real MCP client operates the gate
         run: make mcp PG_CONFIG=/usr/lib/postgresql/$PG_MAJOR/bin/pg_config
 
+      - name: what the JSON pipe costs, measured
+        run: make transfer PG_CONFIG=/usr/lib/postgresql/$PG_MAJOR/bin/pg_config
+
       - name: logs
         if: always()
         uses: actions/upload-artifact@v4
