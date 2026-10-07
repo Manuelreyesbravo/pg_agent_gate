@@ -321,6 +321,17 @@ superuser connection that only the committed change happened;
 `test/transport.mjs` checks the transport MUSTs with plain `fetch`; and the
 official `@modelcontextprotocol/conformance` suite runs against it.
 
+One command runs all of it -- a throwaway cluster, an agent registered behind
+the gate, gated-mcp started as that role, and every suite against it:
+
+```sh
+make mcp PG_CONFIG=/path/to/pg_config     # needs node and bun on PATH
+```
+
+CI (`.github/workflows/verify.yml`, the `mcp` job) runs that same command on
+every commit, so "a real MCP client can only operate the gate" is re-proved,
+not just asserted.
+
 ## Measured
 
 With real sessions of an agent role, both wire protocols, against PostgreSQL
