@@ -1,6 +1,8 @@
 # pg_agent_gate
 
 [![verify](https://github.com/Manuelreyesbravo/pg_agent_gate/actions/workflows/verify.yml/badge.svg)](https://github.com/Manuelreyesbravo/pg_agent_gate/actions/workflows/verify.yml)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+![PostgreSQL 18 and 19](https://img.shields.io/badge/PostgreSQL-18%20%7C%2019-336791.svg)
 
 **Agents propose, PostgreSQL decides.**
 
@@ -14,6 +16,20 @@ In a session that belongs to an agent, **SQL does not execute**. The agent may
 only *propose* one statement; PostgreSQL verifies it against itself, shows its
 exact effect, and keeps it only if every guard agrees. It is enforced by hooks
 inside the server, so there is no client, driver or protocol path around it.
+
+**No MCP server required.** The gate lives in the database, so an agent reaches it over
+`psql`, a driver or direct SQL — there is nothing to put in front of it (see
+[a client that only speaks MCP](#for-a-client-that-only-speaks-mcp-a-shim-with-no-power)).
+A small, free model operating it live, verified end to end:
+**[see the demo ▶](https://manuelreyesbravo.github.io/agent-gate-demo/)**.
+
+**Contents:** [See it in one minute](#see-it-in-one-minute) ·
+[Verify it yourself](#verify-it-yourself) · [How it works](#how-it-works) ·
+[The six verbs](#the-six-verbs) · [Run the two side by side](#run-the-two-side-by-side) ·
+[The pipe: what JSON costs](#the-pipe-what-json-costs) ·
+[A client that only speaks MCP](#for-a-client-that-only-speaks-mcp-a-shim-with-no-power) ·
+[Measured](#measured) · [Threat model](#threat-model) ·
+[What it does not cover](#what-it-does-not-cover)
 
 ## See it in one minute
 
