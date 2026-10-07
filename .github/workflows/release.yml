@@ -1,0 +1,66 @@
+# On a v* tag (or on demand), publish the "try it with no Rust" demo image to ghcr.io and
+# cut the GitHub Release with notes taken from the CHANGELOG. The image is the Dockerfile at
+# the repo root -- the same thing `make docker-demo` builds locally.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: the tag to release (e.g. v0.2.1)
+        required: true
+
+permissions:
+  contents: write     # create the GitHub Release
+  packages: write     # push the image to ghcr.io
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: resolve the tag
+        id: tag
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+
+      - name: build and push the demo image to ghcr.io
+        run: |
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/$OWNER/pg_agent_gate-demo"
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker build -t "$IMAGE:${{ steps.tag.outputs.version }}" -t "$IMAGE:latest" .
+          docker push "$IMAGE:${{ steps.tag.outputs.version }}"
+          docker push "$IMAGE:latest"
+
+      - name: release notes from the changelog
+        run: |
+          awk -v v="${{ steps.tag.outputs.version }}" '
+            $0 ~ "^## " v " " { f = 1; next }
+            f && /^## / { exit }
+            f { print }
+          ' CHANGELOG.md > notes.md
+          [ -s notes.md ] || echo "See CHANGELOG.md." > notes.md
+
+      - name: create or update the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" --title "$TAG" --notes-file notes.md
+          fi

@@ -80,6 +80,22 @@ A small, free model doing this live — fork-and-run, with the scored report:
 **[agent-gate-demo](https://github.com/Manuelreyesbravo/agent-gate-demo)** ·
 **[see a live run](https://manuelreyesbravo.github.io/agent-gate-demo/)**.
 
+### Try it with no Rust or PostgreSQL installed
+
+`make demo` needs PostgreSQL 18+, Rust and cargo-pgrx. To see the same with/without-gate
+demo with none of that, run it in a throwaway container — the extension is built into the
+image, and it needs only Docker or Podman:
+
+```
+make docker-demo        # builds the image from this repo and runs the demo
+```
+
+or pull the prebuilt image instead of building it:
+
+```
+docker run --rm ghcr.io/manuelreyesbravo/pg_agent_gate-demo
+```
+
 ## Verify it yourself
 
 Every claim in this README has a test that attacks it on purpose and checks the

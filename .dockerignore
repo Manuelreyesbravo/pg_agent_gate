@@ -1,0 +1,9 @@
+# The builder compiles the extension fresh; nothing local should enter the image.
+.git
+target
+.testcluster
+_site
+gated-mcp/node_modules
+gated-mcp/.bun-cache
+gated-mcp/.bun-tmp
+**/*.log

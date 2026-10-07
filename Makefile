@@ -8,7 +8,10 @@
 
 PG_CONFIG ?= pg_config
 
-.PHONY: verify clean-machine demo contrast transfer bench mcp
+.PHONY: verify clean-machine demo contrast transfer bench mcp docker-demo
+
+# Container engine for docker-demo: docker, or override with DOCKER=podman.
+DOCKER ?= docker
 # psycopg 3 is the only dependency; uv fetches it without touching your environment.
 # Python pinned to 3.13: a default free-threaded 3.14 has no psycopg-binary wheel yet.
 bench:
@@ -35,6 +38,13 @@ transfer:
 # A real MCP client, through gated-mcp, can only operate the gate. Needs node and bun.
 mcp:
 	PG_CONFIG=$(PG_CONFIG) bash tests/mcp.sh
+
+
+# Run the demo with no Rust, cargo-pgrx or PostgreSQL installed locally: build a throwaway
+# image that carries the extension and PostgreSQL, and run the with/without-gate demo in it.
+docker-demo:
+	$(DOCKER) build -t pg_agent_gate-demo .
+	$(DOCKER) run --rm pg_agent_gate-demo
 
 
 verify:
