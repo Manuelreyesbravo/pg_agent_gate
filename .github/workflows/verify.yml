@@ -42,14 +42,17 @@ jobs:
           path: target/clean-machine-pg${{ matrix.pg }}
           if-no-files-found: warn
 
-  # The MCP replacement, re-proved on every commit: a real MCP client, through gated-mcp,
-  # can only operate the gate. gated-mcp connects AS THE AGENT ROLE, so it holds no power;
-  # this runs `make mcp` -- the same command anyone can run after a fork -- against a fresh
-  # cluster, with the official @modelcontextprotocol client (both protocol eras), and every
-  # change is checked from outside the gate by a superuser. The MCP layer is the same for
-  # every PostgreSQL major, so one is enough to prove it.
-  mcp:
-    name: mcp (a real MCP client, gated)
+  # The two things the README shows, re-proved on every commit on a fresh cluster -- the
+  # same commands anyone runs after a fork:
+  #   * `make contrast`: the same statement an ordinary connection runs (gone) and the gate
+  #     refuses, and the rich verification the gate returns instead of a bare result.
+  #   * `make mcp`: a real MCP client, through gated-mcp (which connects AS THE AGENT ROLE
+  #     and holds no power), can only operate the gate -- the official @modelcontextprotocol
+  #     client, both protocol eras.
+  # Every change is checked from outside the gate by a superuser. Neither depends on the
+  # PostgreSQL major, so one is enough to prove them.
+  end-to-end:
+    name: end-to-end (contrast + a real MCP client)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -76,6 +79,9 @@ jobs:
           cargo install cargo-pgrx --version "$PGRX_VERSION" --locked
           cargo pgrx init --pg$PG_MAJOR "/usr/lib/postgresql/$PG_MAJOR/bin/pg_config"
 
+      - name: the gate vs an ordinary connection, side by side
+        run: make contrast PG_CONFIG=/usr/lib/postgresql/$PG_MAJOR/bin/pg_config
+
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -88,6 +94,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mcp-gated-mcp-log
+          name: end-to-end-gated-mcp-log
           path: .testcluster/gated-mcp.log
           if-no-files-found: warn

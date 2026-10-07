@@ -145,6 +145,19 @@ DETAIL:  DELETE does not reach the database from an agent session
 HINT:  Call agent_gate.propose(sql, intent), then agent_gate.dry_run(proposal) or agent_gate.commit(proposal).
 ```
 
+## Run the two side by side
+
+```
+make contrast PG_CONFIG=/path/to/pg_config
+```
+
+The same `DROP TABLE` that an ordinary connection runs -- and the table is gone,
+irreversibly -- the gate refuses, with the reason. And where an ordinary server
+hands back a row count *after* it ran, the gate returns the catalog the agent
+may touch, every check with its verdict, and the exact before/after of the
+change, *before* anything is kept. The piece you take out returned a result; the
+piece in its place returns a decision you can see.
+
 ## The six verbs
 
 | verb | does |
@@ -276,14 +289,19 @@ superuser roles: a superuser can unset a superuser-only setting, and an agent
 that can leave the gate is not behind it. It takes effect on the role's
 **next** connection.
 
-## gated-mcp: an MCP server that cannot execute anything
+## For a client that only speaks MCP: a shim with no power
 
-For clients that only speak MCP. `gated-mcp/` is a small Bun + Hono server
-exposing the six verbs as six MCP tools over Streamable HTTP. Unlike an
-ordinary MCP server for PostgreSQL, it holds no power of its own: it connects
-**as the agent role**, so it is not where the gate lives -- replace it with
-anything and it still can only call the verbs. Six tools, never one per table:
-what the agent may touch comes from `discover`.
+The gate is in the database, so there is nothing to put in front of it -- an
+agent reaches it through `psql`, a driver, or direct SQL, and it is governed all
+the same. You do not need an MCP server, and that is the point: the piece that
+used to hold the connection and run what the model asked is gone.
+
+For a client that only speaks MCP, `gated-mcp/` fills the gap without bringing
+that power back. It is a small Bun + Hono server exposing the six verbs as six
+MCP tools over Streamable HTTP, and it connects **as the agent role**, so it is
+not where the gate lives -- replace it with anything and it still can only call
+the verbs. It is a compatibility layer, not the product. Six tools, never one
+per table: what the agent may touch comes from `discover`.
 
 ```sh
 cd gated-mcp && bun install
