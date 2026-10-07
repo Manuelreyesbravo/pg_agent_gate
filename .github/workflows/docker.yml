@@ -29,5 +29,9 @@ jobs:
       - name: build the image
         run: docker build -t pg_agent_gate-demo:ci .
 
+      # Fail if the demo runs but does not reach its end, not only if it exits non-zero:
+      # the last line commits a change and prints the new value.
       - name: run the demo in it
-        run: docker run --rm pg_agent_gate-demo:ci
+        run: |
+          docker run --rm pg_agent_gate-demo:ci | tee demo-output.txt
+          grep -q 'ana@new.example' demo-output.txt

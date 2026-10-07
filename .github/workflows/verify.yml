@@ -26,6 +26,7 @@ on:
 
 permissions:
   contents: read
+  issues: write     # the weekly run opens an issue when the PostgreSQL 19 beta breaks
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -47,6 +48,22 @@ jobs:
 
       - name: clean machine, PostgreSQL ${{ matrix.pg }}
         run: PG_MAJOR=${{ matrix.pg }} ENGINE=docker bash tests/clean-machine/run.sh
+
+      # continue-on-error keeps the run green when the PostgreSQL 19 beta breaks, so the
+      # weekly schedule would otherwise say nothing. Open an issue instead -- that is the
+      # heads-up the cron exists for. One at a time: skip if one is already open.
+      - name: open an issue if the PostgreSQL 19 beta broke on the weekly run
+        if: failure() && matrix.pg == 19 && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          OPEN=$(gh issue list --state open --json title \
+            --jq '[.[] | select(.title | startswith("PostgreSQL 19 beta broke"))] | length')
+          if [ "$OPEN" = "0" ]; then
+            gh issue create \
+              --title "PostgreSQL 19 beta broke \`make verify\`" \
+              --body "The weekly scheduled run of \`verify (PostgreSQL 19)\` failed. The 19 beta moves under us; this is the heads-up to look. Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID ($(date -u +%F))."
+          fi
 
       - name: logs
         if: always()

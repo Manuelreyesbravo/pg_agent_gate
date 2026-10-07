@@ -40,11 +40,15 @@ jobs:
 
       - name: the tag matches the extension version
         run: |
+          WANT="${{ steps.tag.outputs.version }}"
           CARGO=$(sed -nE 's/^version = "([^"]+)".*/\1/p' Cargo.toml | head -1)
-          if [ "$CARGO" != "${{ steps.tag.outputs.version }}" ]; then
-            echo "tag ${{ steps.tag.outputs.tag }} does not match Cargo.toml version $CARGO"; exit 1
-          fi
-          echo "version $CARGO matches the tag"
+          META=$(sed -nE 's/.*"version": *"([^"]+)".*/\1/p' META.json | head -1)
+          for pair in "Cargo.toml:$CARGO" "META.json:$META"; do
+            if [ "${pair#*:}" != "$WANT" ]; then
+              echo "tag ${{ steps.tag.outputs.tag }} does not match ${pair%%:*} version ${pair#*:}"; exit 1
+            fi
+          done
+          echo "version $WANT matches Cargo.toml and META.json"
 
       - name: build the demo image
         run: |
@@ -58,7 +62,9 @@ jobs:
             -t "ghcr.io/$OWNER/pg_agent_gate-demo:latest" .
 
       - name: run the demo in the image before publishing it
-        run: docker run --rm "$IMAGE:${{ steps.tag.outputs.version }}"
+        run: |
+          docker run --rm "$IMAGE:${{ steps.tag.outputs.version }}" | tee demo-output.txt
+          grep -q 'ana@new.example' demo-output.txt   # the demo reached its end, not just exited 0
 
       - name: push to ghcr.io
         run: |
