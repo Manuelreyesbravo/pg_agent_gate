@@ -43,7 +43,7 @@ jobs:
       matrix:
         pg: [18, 19]
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: clean machine, PostgreSQL ${{ matrix.pg }}
         run: PG_MAJOR=${{ matrix.pg }} ENGINE=docker bash tests/clean-machine/run.sh
@@ -75,7 +75,7 @@ jobs:
       PG_MAJOR: "18"
       PGRX_VERSION: "0.19.2"
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: PostgreSQL ${{ env.PG_MAJOR }} and a build toolchain, from PGDG
         run: |
