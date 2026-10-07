@@ -32,9 +32,11 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
 
+      # On a tag push, checkout defaults to the tag. On workflow_dispatch it checks out the
+      # branch it was run from (the default branch) -- which is what we want when releasing a
+      # tag made before this Dockerfile existed: the image is built from current code, whose
+      # extension is identical to the tagged one.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          ref: ${{ steps.tag.outputs.tag }}
 
       - name: build and push the demo image to ghcr.io
         run: |
