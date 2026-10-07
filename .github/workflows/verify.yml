@@ -1,55 +1,71 @@
-# Every push and pull request runs the attacks. For a security extension, CI is not
-# "the build passes": it is the claim that no guarantee broke, re-proved on every commit.
+# Every push to main, every pull request, and a weekly run re-prove the attacks. For a
+# security extension, CI is not "the build passes": it is the claim that no guarantee broke,
+# re-proved continuously.
 #
-# Each job is `make clean-machine` -- the exact command anyone can run locally -- for one
-# PostgreSQL major: a fresh Debian container, PostgreSQL from PGDG (19 resolves to the
-# newest 19 beta), cargo-pgrx 0.19.2, pg_living_assertions from its public repository,
-# the repository as committed, `make verify` as a user that is not root. One definition
-# of "verified", not a second one in YAML that can drift from it.
+# The `verify` job is `make clean-machine` -- the exact command anyone can run locally -- for
+# one PostgreSQL major: a fresh Debian container, PostgreSQL from PGDG, cargo-pgrx 0.19.2,
+# pg_living_assertions pinned, the repository as committed, `make verify` as a non-root user.
+# One definition of "verified", not a second one in YAML that can drift from it.
 #
-# To block merges on it: Settings -> Branches -> require the status checks
-# "verify (PostgreSQL 18)" and "verify (PostgreSQL 19)".
+# PostgreSQL 19 is a MOVING beta: its job runs but is `continue-on-error`, so a break in the
+# beta does not turn the whole run red. Require only "verify (PostgreSQL 18)" to block merges
+# (Settings -> Branches); the weekly schedule is there to catch 19 drifting early.
+#
+# Third-party actions are pinned to a full commit SHA (the version is in the comment) so a
+# moved tag cannot change what runs. Bump them through Dependabot (.github/dependabot.yml).
 name: verify
 
 on:
   push:
+    branches: [main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
+  schedule:
+    - cron: '0 7 * * 1'   # Mondays 07:00 UTC: catch a moving PostgreSQL 19 beta, run the measurements
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   verify:
     name: verify (PostgreSQL ${{ matrix.pg }})
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    # PostgreSQL 19 is a beta that moves under us: let it run and report, without failing the run.
+    continue-on-error: ${{ matrix.pg == 19 }}
     strategy:
       fail-fast: false
       matrix:
         pg: [18, 19]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: clean machine, PostgreSQL ${{ matrix.pg }}
         run: PG_MAJOR=${{ matrix.pg }} ENGINE=docker bash tests/clean-machine/run.sh
 
       - name: logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: verify-logs-pg${{ matrix.pg }}
           path: target/clean-machine-pg${{ matrix.pg }}
           if-no-files-found: warn
 
-  # The two things the README shows, re-proved on every commit on a fresh cluster -- the
-  # same commands anyone runs after a fork:
+  # The things the README shows, re-proved on a fresh cluster -- the same commands anyone
+  # runs after a fork:
   #   * `make contrast`: the same statement an ordinary connection runs (gone) and the gate
   #     refuses, and the rich verification the gate returns instead of a bare result.
-  #   * `make mcp`: a real MCP client, through gated-mcp (which connects AS THE AGENT ROLE
-  #     and holds no power), can only operate the gate -- the official @modelcontextprotocol
+  #   * `make mcp`: a real MCP client, through gated-mcp (which connects AS THE AGENT ROLE and
+  #     holds no power), can only operate the gate -- the official @modelcontextprotocol
   #     client, both protocol eras.
-  # Every change is checked from outside the gate by a superuser. Neither depends on the
+  #   * `make transfer`: a MEASUREMENT, not a pass/fail check, so it runs only on the schedule
+  #     and on demand -- what the JSON pipe costs vs a native connection.
+  # Every change is checked from outside the gate by a superuser. None depends on the
   # PostgreSQL major, so one is enough to prove them.
   end-to-end:
     name: end-to-end (contrast + a real MCP client)
@@ -59,7 +75,7 @@ jobs:
       PG_MAJOR: "18"
       PGRX_VERSION: "0.19.2"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: PostgreSQL ${{ env.PG_MAJOR }} and a build toolchain, from PGDG
         run: |
@@ -74,28 +90,34 @@ jobs:
             build-essential clang libclang-dev pkg-config
           echo "/usr/lib/postgresql/$PG_MAJOR/bin" >> "$GITHUB_PATH"
 
+      # Caches ~/.cargo (registry, git and the cargo-pgrx binary) and target/, keyed on
+      # Cargo.lock -- so cargo-pgrx is not reinstalled and the extension is not rebuilt from
+      # scratch on every run.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
       - name: cargo-pgrx ${{ env.PGRX_VERSION }}
         run: |
-          cargo install cargo-pgrx --version "$PGRX_VERSION" --locked
+          command -v cargo-pgrx || cargo install cargo-pgrx --version "$PGRX_VERSION" --locked
           cargo pgrx init --pg$PG_MAJOR "/usr/lib/postgresql/$PG_MAJOR/bin/pg_config"
 
       - name: the gate vs an ordinary connection, side by side
         run: make contrast PG_CONFIG=/usr/lib/postgresql/$PG_MAJOR/bin/pg_config
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "20"
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
 
       - name: a real MCP client operates the gate
         run: make mcp PG_CONFIG=/usr/lib/postgresql/$PG_MAJOR/bin/pg_config
 
       - name: what the JSON pipe costs, measured
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         run: make transfer PG_CONFIG=/usr/lib/postgresql/$PG_MAJOR/bin/pg_config
 
       - name: logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: end-to-end-gated-mcp-log
           path: .testcluster/gated-mcp.log

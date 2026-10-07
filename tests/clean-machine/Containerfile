@@ -39,7 +39,7 @@ RUN cargo install cargo-pgrx --version "$PGRX_VERSION" --locked
 RUN cargo pgrx init --pg$PG_MAJOR "$PG_CONFIG"
 
 # The one dependency outside this repository, from its public repository.
-RUN git clone --depth 1 https://github.com/Manuelreyesbravo/pg_living_assertions /home/tester/pg_living_assertions \
+RUN git clone --depth 1 --branch v0.5.4 https://github.com/Manuelreyesbravo/pg_living_assertions /home/tester/pg_living_assertions \
  && make -C /home/tester/pg_living_assertions install PG_CONFIG="$PG_CONFIG"
 
 COPY --chown=tester . /home/tester/pg_agent_gate
