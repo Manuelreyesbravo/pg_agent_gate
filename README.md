@@ -60,6 +60,10 @@ WITH the gate: the same role, registered as an agent (max_rows 5, no DDL)
      kept, Ana's email is now ana@new.example
 ```
 
+A small, free model doing this live — fork-and-run, with the scored report:
+**[agent-gate-demo](https://github.com/Manuelreyesbravo/agent-gate-demo)** ·
+**[see a live run](https://manuelreyesbravo.github.io/agent-gate-demo/)**.
+
 ## Verify it yourself
 
 Every claim in this README has a test that attacks it on purpose and checks the
