@@ -489,14 +489,24 @@ def main():
         su.execute("create table shop.par (id int primary key, t int not null)")
         su.execute("create table shop.kid (primary key (id)) inherits (shop.par)")
         su.execute("create function shop.kt() returns trigger language plpgsql as $$ begin return new; end $$")
-        su.execute("create trigger kt before insert on shop.kid for each row execute function shop.kt()")
+        su.execute("create trigger kt before insert or update or delete on shop.kid for each row execute function shop.kt()")
         su.execute("create table shop.rlog (x int)")
         su.execute("create table shop.ruled (id int primary key, t int not null)")
         su.execute("create rule r as on update to shop.ruled do also insert into shop.rlog values (1)")
         su.execute("create table shop.plainz (id int primary key, t int not null)")
         for tbl in ("par", "kid", "rlog", "ruled", "plainz"):
             su.execute(f"alter table shop.{tbl} owner to {AGENT}")
-        want = {"insert into shop.par values (1,1)": False,     # child kid has a trigger
+        want = {# update/delete on an inheritance parent DOES reach kid's rows, so kid's
+                # trigger genuinely fires -- the gate refuses, and the amplification is real.
+                "update shop.par set t = t": False,
+                "delete from shop.par": False,
+                # conservative over-refusal: in CLASSIC inheritance an INSERT to the parent is
+                # not routed down to kid, so kid's trigger would not fire -- the gate refuses
+                # anyway, because kid (an inheritance child) carries a trigger and the walker
+                # does not match the trigger's event to the statement. With a PARTITIONED parent
+                # an INSERT WOULD route to a partition and fire it, so there it is not merely
+                # conservative.
+                "insert into shop.par values (1,1)": False,
                 "update shop.ruled set t = t": False,           # has a DO ALSO rule
                 "insert into shop.plainz values (1,1)": True}   # nothing on it
         for sql, want_ok in want.items():
