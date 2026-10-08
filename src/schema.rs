@@ -79,6 +79,19 @@ CREATE TABLE agent_gate_internal.bindings (
     bound_by  name NOT NULL DEFAULT session_user,
     PRIMARY KEY (agent, assertion)
 );
+
+-- Tables an agent may write even though an amplifying object (a cascading foreign key, a user
+-- trigger, a rule) sits on them. A deliberate act by whoever registers the agent -- an updated_at
+-- or an audit trigger is fine. It relaxes the propose check, NOT the limit: the commit-time
+-- backstop still counts every amplified row against max_rows.
+CREATE TABLE agent_gate_internal.allowlist (
+    agent      text NOT NULL REFERENCES agent_gate_internal.agents (name) ON DELETE CASCADE,
+    relid      oid  NOT NULL,
+    note       text,
+    allowed_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    allowed_by name NOT NULL DEFAULT session_user,
+    PRIMARY KEY (agent, relid)
+);
 "#,
     name = "record",
     bootstrap
@@ -192,7 +205,10 @@ BEGIN
                    'name', a.name, 'max_rows', a.max_rows, 'allow_ddl', a.allow_ddl,
                    'bindings', coalesce((SELECT jsonb_agg(b.assertion ORDER BY b.assertion)
                                            FROM agent_gate_internal.bindings b
-                                          WHERE b.agent = a.name), '[]'))
+                                          WHERE b.agent = a.name), '[]'),
+                   'allowed_writes', coalesce((SELECT jsonb_agg(w.relid::bigint ORDER BY w.relid)
+                                           FROM agent_gate_internal.allowlist w
+                                          WHERE w.agent = a.name), '[]'))
           FROM agent_gate_internal.agents a
          WHERE a.name = p_name);
 END $$;
@@ -319,8 +335,33 @@ LANGUAGE sql SET search_path = pg_catalog, agent_gate_internal AS $$
     SELECT EXISTS (SELECT 1 FROM gone);
 $$;
 
+-- Let an agent write a table that carries an amplifying object (a cascading foreign key, a user
+-- trigger, a rule). Relaxes the `no_amplification` propose check for that one table; the commit
+-- backstop still counts every amplified row against max_rows, so the limit is not relaxed.
+CREATE FUNCTION agent_gate.allow_write(p_agent text, p_relation regclass, p_note text DEFAULT NULL)
+RETURNS jsonb LANGUAGE plpgsql SET search_path = pg_catalog, agent_gate_internal AS $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM agent_gate_internal.agents WHERE name = p_agent) THEN
+        RAISE EXCEPTION 'pg_agent_gate: no agent named %', p_agent;
+    END IF;
+    INSERT INTO agent_gate_internal.allowlist (agent, relid, note)
+    VALUES (p_agent, p_relation::oid, p_note)
+    ON CONFLICT (agent, relid) DO UPDATE SET note = EXCLUDED.note;
+    RETURN jsonb_build_object('agent', p_agent, 'relation', p_relation::text, 'note', p_note,
+        'effect', 'this agent may now propose writes to this table despite a trigger, cascade or rule on it; the commit-time backstop still counts every amplified row against max_rows');
+END $$;
+
+CREATE FUNCTION agent_gate.disallow_write(p_agent text, p_relation regclass) RETURNS boolean
+LANGUAGE sql SET search_path = pg_catalog, agent_gate_internal AS $$
+    WITH gone AS (DELETE FROM agent_gate_internal.allowlist
+                   WHERE agent = p_agent AND relid = p_relation::oid RETURNING 1)
+    SELECT EXISTS (SELECT 1 FROM gone);
+$$;
+
 REVOKE EXECUTE ON FUNCTION agent_gate.register_agent(text, regrole, text, integer, boolean) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION agent_gate.unregister_agent(text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION agent_gate.allow_write(text, regclass, text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION agent_gate.disallow_write(text, regclass) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION agent_gate.bind_assertion(text, text) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION agent_gate.unbind_assertion(text, text) FROM PUBLIC;
 
@@ -370,6 +411,24 @@ rel_json as (
             case when has_table_privilege(r.oid, 'INSERT') then 'insert' end,
             case when has_table_privilege(r.oid, 'UPDATE') then 'update' end,
             case when has_table_privilege(r.oid, 'DELETE') then 'delete' end], null)),
+        'write_refused', (
+            with recursive descendants(oid) as (
+                select r.oid
+                union
+                select i.inhrelid from pg_inherits i join descendants d on i.inhparent = d.oid
+            )
+            select case when r.oid::bigint = any($3::bigint[])
+                        then null
+                   else (select label from (
+                           select 'cascading foreign key '||conname as label from pg_constraint
+                             where contype='f' and confrelid in (select oid from descendants)
+                               and (confdeltype in ('c','n','d') or confupdtype in ('c','n','d'))
+                           union all select 'trigger '||tgname from pg_trigger
+                             where tgrelid in (select oid from descendants) and not tgisinternal
+                           union all select 'rule '||rulename from pg_rewrite
+                             where ev_class in (select oid from descendants) and rulename <> '_RETURN'
+                         ) s limit 1)
+                   end),
         'comment', obj_description(r.oid, 'pg_class'),
         'columns', (select jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
                         'name', a.attname,

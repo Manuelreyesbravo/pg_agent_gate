@@ -648,11 +648,16 @@ Said here so nobody learns it the hard way:
 * **`dry_run` is a rollback, not a sandbox.** Sequence values, session advisory
   locks, and anything outside the transaction (`dblink`, untrusted languages)
   are not undone.
-* **Functions a proposal calls run with their own rules.** A `SECURITY DEFINER`
-  function the agent may execute does what it does; the gate verifies the
-  proposal, not every function body. Measured (`tests/hostile.sh`): called from
-  a READ it leaves nothing, because a read's subtransaction is always rolled
-  back -- but inside a WRITE that is kept, whatever it wrote is kept with it.
+* **An opaque user function is refused (0.2.3).** A statement that calls a user
+  function which is volatile or `SECURITY DEFINER` is refused at `propose`
+  (`no_opaque_function`): its body is not in the analyzed tree, so it could write
+  rows no one counts or run as its owner outside the agent's tenant. Built-ins and
+  non-volatile, non-`SECURITY DEFINER` user functions pass. Measured
+  (`tests/hostile.sh`): such a function inside a WRITE is refused and writes
+  nothing. A table whose trigger or function is legitimate (an `updated_at`, an
+  audit row) can be re-allowed per agent with `agent_gate.allow_write`; that
+  relaxes the refusal, not the limit -- the commit backstop still counts every
+  amplified row against `max_rows`, and does not see `TRUNCATE`.
 * **A view is checked with its owner's privileges unless it was created with
   `security_invoker`.** An agent granted `SELECT` on such a view reads the
   tables behind it, including ones it has no privilege on at all: measured, a

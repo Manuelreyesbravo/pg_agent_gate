@@ -65,6 +65,9 @@ struct Config {
     max_rows: i64,
     allow_ddl: bool,
     bindings: Vec<String>,
+    /// Relation OIDs this agent may write even though an amplifying object sits on them
+    /// (agent_gate.allow_write). The propose check skips them; the backstop still counts them.
+    allowed: Vec<u32>,
 }
 
 /// The gate's own SQL that WRITES the record. Read-write SPI: assigns a
@@ -100,7 +103,7 @@ fn config(who: &Identity) -> Config {
     if !who.is_agent {
         // A human or a service using the gate on purpose: the same checks, the
         // conservative limits, and no DDL.
-        return Config { max_rows: 1000, allow_ddl: false, bindings: Vec::new() };
+        return Config { max_rows: 1000, allow_ddl: false, bindings: Vec::new(), allowed: Vec::new() };
     }
     let found: Option<JsonB> =
         read_internal("select agent_gate_internal._agent($1)", &[who.agent.clone().into()]);
@@ -116,6 +119,10 @@ fn config(who: &Identity) -> Config {
         bindings: agent["bindings"]
             .as_array()
             .map(|a| a.iter().filter_map(|b| b.as_str().map(str::to_string)).collect())
+            .unwrap_or_default(),
+        allowed: agent["allowed_writes"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u32)).collect())
             .unwrap_or_default(),
     }
 }
@@ -185,9 +192,12 @@ impl Mode {
 pub fn discover(filter: default!(Option<&str>, "NULL"), max_objects: default!(i32, 50)) -> JsonB {
     not_from_inside();
     let who = identity();
+    // The agent cannot read the allow-list table, so the gate passes the relations it allowed as a
+    // parameter; discover marks every other amplifying table as write_refused, with the reason.
+    let allowed: Vec<i64> = config(&who).allowed.iter().map(|o| *o as i64).collect();
     let found: Option<JsonB> = read_internal(
         crate::schema::DISCOVER_SQL,
-        &[filter.map(str::to_string).into(), max_objects.into()],
+        &[filter.map(str::to_string).into(), max_objects.into(), allowed.into()],
     );
     let mut out = found.map(|j| j.0).unwrap_or_else(|| json!({}));
     out["agent"] = json!(who.agent);
@@ -203,7 +213,7 @@ pub fn propose(sql: &str, intent: &str, params: default!(Option<Vec<Option<Strin
     }
     let who = identity();
     let cfg = config(&who);
-    let verdict = verify::verify(sql, &params, cfg.allow_ddl);
+    let verdict = verify::verify(sql, &params, cfg.allow_ddl, &cfg.allowed);
     let kind = verdict.kind.map(|k| k.as_str()).unwrap_or("unknown");
 
     relax_for_an_attempt();
@@ -351,6 +361,24 @@ fn refuse_execution(who: &Identity, proposal: i64, mode: Mode, started: Instant,
     })
 }
 
+/// Tuple operations (insert + update + delete) this transaction has made to user tables outside
+/// the gate's own schemas. Read before and after the statement inside the same subtransaction, the
+/// difference is what the statement AND everything it fired -- triggers, cascades, rules, functions
+/// -- changed, which `rows.processed` (the top-level count) misses. It counts tuples, so it
+/// over-counts (the safe side), and does not see TRUNCATE (blocked as DDL). The gate's own
+/// bookkeeping is excluded so its record does not inflate an agent's budget.
+fn xact_tuples() -> i64 {
+    let _running = state::proposal();
+    Spi::get_one::<i64>(
+        "select coalesce(sum(n_tup_ins + n_tup_upd + n_tup_del), 0)::bigint \
+         from pg_catalog.pg_stat_xact_user_tables \
+         where schemaname not in ('agent_gate', 'agent_gate_internal')",
+    )
+    .ok()
+    .flatten()
+    .unwrap_or(0)
+}
+
 fn execute(proposal: i64, mode: Mode) -> Value {
     let started = Instant::now();
     let who = identity();
@@ -402,7 +430,7 @@ fn execute(proposal: i64, mode: Mode) -> Value {
 
     // The world may have changed since the proposal. Verify again, now.
     let cfg = config(&who);
-    let verdict = verify::verify(&sql, &params, cfg.allow_ddl);
+    let verdict = verify::verify(&sql, &params, cfg.allow_ddl, &cfg.allowed);
     if !verdict.ok {
         let why = verdict.first_failure().map(|c| c.detail.clone()).unwrap_or_default();
         return refuse_execution(
@@ -428,6 +456,7 @@ fn execute(proposal: i64, mode: Mode) -> Value {
 
     let result = in_subxact(
         || {
+            let tup_before = xact_tuples();   // the backstop's starting point, inside this subxact
             let rows = {
                 let _running = state::proposal();
                 Spi::connect_mut(|client| {
@@ -463,6 +492,19 @@ fn execute(proposal: i64, mode: Mode) -> Value {
                         "it touched {} rows and this agent may touch at most {}",
                         rows.processed, max_rows
                     ));
+                } else if kind == Kind::Write {
+                    // Backstop: the top-level count is not the whole story. Measure the tuples this
+                    // transaction changed over the statement (triggers, cascades, rules, functions
+                    // included) and abort if they exceed the limit -- the count check that catches
+                    // an amplifier the propose checks did not, and what makes an allow-list safe.
+                    let moved = xact_tuples().saturating_sub(tup_before);
+                    if moved > max_rows {
+                        abort = Some(format!(
+                            "it changed {moved} rows in all -- {} named plus more from a trigger, \
+                             cascade, rule or function -- and this agent may touch at most {max_rows}",
+                            rows.processed
+                        ));
+                    }
                 }
             }
 

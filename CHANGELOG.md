@@ -1,20 +1,32 @@
 # Changelog
 
-## Unreleased (towards 0.2.3)
+## 0.2.3 -- 2026-10-08
 
-* **An opaque user function amplifies a write the same way a cascade did.** A SELECT
-  may call a user function whose body the gate cannot see: a volatile one may write rows
-  no one counts, a SECURITY DEFINER one runs as its owner, outside the agent's tenant.
-  New propose check `no_opaque_function`: a statement that calls a user function which is
-  volatile or SECURITY DEFINER is refused, naming it. Built-ins (pg_catalog) and
-  non-volatile, non-SECURITY DEFINER user functions pass. Measured: `select wf()` and
-  `select * from wf()` for a writing volatile function, and a SECURITY DEFINER function,
-  refused; `random()`, `now()`, a pure user function and plain DML pass. Regression in
-  `tests/fuzz.py`, run on every push.
-* Still to come in this version: a commit-time row-count backstop
-  (`pg_stat_xact_user_tables` delta vs `max_rows`, both snapshots in one subtransaction)
-  and a per-agent allow-list for legitimate triggers and functions, with `discover`
-  flagging which tables are refused and why. Not tagged until those land.
+Closes the rest of the amplification class 0.2.2 opened, and makes the result usable.
+
+* **An opaque user function amplifies a write the same way a cascade did.** A SELECT may
+  call a user function whose body the gate cannot see: a volatile one may write rows no one
+  counts, a SECURITY DEFINER one runs as its owner, outside the agent's tenant. New propose
+  check `no_opaque_function`: a statement calling a user function that is volatile or
+  SECURITY DEFINER is refused, naming it. Built-ins (pg_catalog) and non-volatile,
+  non-SECURITY DEFINER user functions pass.
+* **A commit-time backstop, so the limit counts the real effect.** Even a propose that
+  passes is measured: the transaction's tuple operations on user tables over the statement
+  (`pg_stat_xact_user_tables`, both snapshots in the one subtransaction) must not exceed
+  `max_rows`, so a trigger, cascade, rule or function that moves more rows than the
+  statement names aborts the kept set. It counts tuple operations, so it over-counts (the
+  safe side -- rows a trigger writes then rolls back in its own EXCEPTION still count), and
+  it does not see TRUNCATE (blocked as DDL). The gate's own bookkeeping is excluded.
+* **A per-agent allow-list, so a legitimate trigger is not a wall.** `agent_gate.allow_write
+  (agent, relation)` lets an agent write a table that carries an updated_at or audit trigger
+  (or a cascade): it relaxes `no_amplification` for that table only, never the limit -- the
+  backstop still counts every amplified row. `discover` now reports `write_refused` on each
+  table the agent may not write and why (the cascade, trigger or rule), so the agent does not
+  propose a doomed write; an allow-listed table drops the flag.
+* Regression in `tests/fuzz.py` (the amplification teeth also build a volatile writer and a
+  SECURITY DEFINER function and assert both refused) runs on every push. Schema change: the
+  `allowlist` table and the two functions; the upgrade script creates them and redefines
+  `_agent`.
 
 ## 0.2.2 -- 2026-10-07
 

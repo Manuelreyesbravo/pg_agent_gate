@@ -89,7 +89,12 @@ struct Parsed {
     select_locks: bool,
 }
 
-pub(crate) fn verify(sql: &str, params: &Option<Vec<Option<String>>>, allow_ddl: bool) -> Verdict {
+pub(crate) fn verify(
+    sql: &str,
+    params: &Option<Vec<Option<String>>>,
+    allow_ddl: bool,
+    allowed: &[u32],
+) -> Verdict {
     let mut v = Verdict {
         ok: false,
         kind: None,
@@ -246,7 +251,13 @@ pub(crate) fn verify(sql: &str, params: &Option<Vec<Option<String>>>, allow_ddl:
                     return v;
                 }
                 v.check("keeps_its_context", true, "nothing in the statement calls set_config()");
-                match amplifying_object(&tree.targets) {
+                // Tables the agent was explicitly allowed to write (amplifier and all) are not
+                // checked here -- the commit backstop still counts every row they move. The
+                // fail-closed "no target" test below uses the ORIGINAL targets, so an all-allowed
+                // write is not mistaken for one whose target could not be resolved.
+                let checked: Vec<pg_sys::Oid> =
+                    tree.targets.iter().copied().filter(|t| !allowed.contains(&t.to_u32())).collect();
+                match amplifying_object(&checked) {
                     Err(why) => {
                         // Fail CLOSED: a lookup we could not complete is not "nothing to find".
                         v.kind = Some(kind);

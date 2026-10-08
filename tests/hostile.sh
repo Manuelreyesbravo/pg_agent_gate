@@ -254,24 +254,26 @@ expect indirect "and the write it was attached to did not happen either" "uno" \
 # else -- this file learned that about itself on its first run.
 su -c 'drop trigger libro_anota on libro' >/dev/null
 
-# A SECURITY DEFINER function called from a READ proposal: a read's
-# subtransaction is ALWAYS rolled back, so whatever it wrote goes with it. That
-# is a protection nobody designed on purpose -- it falls out of how reads are
-# executed -- which is exactly why it is worth a case: it could disappear in a
-# refactor without anybody noticing.
+# A SECURITY DEFINER function called from a READ. Since 0.2.3 the gate refuses it at propose
+# (no_opaque_function, because the body is opaque); even if it had not, a read's subtransaction is
+# always rolled back, so it would leave nothing either way. Two layers -- the case checks the
+# outcome, which is the same: nothing written.
 propose_and_commit "select elevar()" "call an elevated function from a read" >/dev/null
 expect indirect "a SECURITY DEFINER function called from a READ leaves nothing" "0" "$(bitacora)"
 
-# The same function inside a WRITE, which IS kept. Here the row really appears
-# in a table the agent has no privilege on.
-propose_and_commit "update libro set texto = 'elevado' || elevar()::text where id = 2" \
-    "call an elevated function from a write" >/dev/null
-wrote=$(bitacora)
-if [ "$wrote" = "1" ] && [ "$(grep -c -F 'SECURITY DEFINER' "$ROOT/README.md")" -ge 1 ]; then
-    report indirect "a SECURITY DEFINER function inside a WRITE does write, and the README says so" yes ""
+# The same function inside a WRITE. Until 0.2.3 this was a documented LIMIT: elevar(), being
+# SECURITY DEFINER, ran as its owner and wrote to a table the agent cannot touch. 0.2.3 closes it:
+# no_opaque_function refuses at propose any statement that calls a volatile or SECURITY DEFINER
+# user function, because its body is opaque to the gate. So the write never runs and bitacora stays
+# empty -- and the README now says it is refused, not that it writes.
+before=$(bitacora)
+refused=$(agent -c "select agent_gate.propose(\$s\$update libro set texto = 'elevado' || elevar()::text where id = 2\$s\$, \$i\$call an elevated function from a write\$i\$)")
+if echo "$refused" | grep -q 'no_opaque_function' && [ "$(bitacora)" = "$before" ] \
+   && [ "$(grep -c -F 'SECURITY DEFINER' "$ROOT/README.md")" -ge 1 ]; then
+    report indirect "a SECURITY DEFINER function inside a WRITE is refused at propose, writing nothing" yes ""
 else
-    report indirect "a SECURITY DEFINER function inside a WRITE does write, and the README says so" no \
-        "rows in bitacora: $wrote (expected 1); README mentions SECURITY DEFINER: $(grep -c -F 'SECURITY DEFINER' "$ROOT/README.md")"
+    report indirect "a SECURITY DEFINER function inside a WRITE is refused at propose, writing nothing" no \
+        "bitacora: $(bitacora) (expected $before); refused by no_opaque_function: $(echo "$refused" | grep -c no_opaque_function); README mentions SECURITY DEFINER: $(grep -c -F 'SECURITY DEFINER' "$ROOT/README.md")"
 fi
 
 # A view without security_invoker is checked with the OWNER's privileges, so it

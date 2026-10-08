@@ -440,6 +440,27 @@ def main():
             pr = probe.execute("select agent_gate.propose(%s, %s)", (danger, "amplification check")).fetchone()[0]
             if isinstance(pr, dict) and pr.get("ok") is True:
                 max_rows_oracle_fails.append(f"amplification ({why}): propose ACCEPTED {danger!r} -- it must be refused")
+        # (f) allow_write relaxes propose for a table with a legitimate (updated_at-style) trigger,
+        # but the commit backstop still bounds the TOTAL rows the trigger moves: with MAX_ROWS=5,
+        # k=2 is 2 updates + 2 trigger inserts = 4 (kept), k=3 is 6 (aborted by the backstop).
+        su.execute("create table shop.log (id serial primary key, m text)")
+        su.execute("create table shop.items (id int primary key, t int not null, n int)")
+        su.execute("insert into shop.items select g, 1, g from generate_series(1,8) g")
+        su.execute("create function shop.au() returns trigger language plpgsql as $$ begin insert into shop.log(m) values ('u'); return new; end $$")
+        su.execute("create trigger au after update on shop.items for each row execute function shop.au()")
+        su.execute(f"alter table shop.log owner to {AGENT}")
+        su.execute(f"alter table shop.items owner to {AGENT}")
+        su.execute("select agent_gate.allow_write('fuzzer', 'shop.items', 'audit trigger is fine')")
+        for k, want in ((2, "kept"), (3, "aborted")):
+            pr = probe.execute("select agent_gate.propose(%s, %s)",
+                               (f"update shop.items set n = n + 1 where id <= {k}", "backstop check")).fetchone()[0]
+            got = "refused-at-propose"
+            if isinstance(pr, dict) and pr.get("ok") is True and pr.get("proposal") is not None:
+                cr = probe.execute("select agent_gate.commit(%s)", (pr["proposal"],)).fetchone()[0]
+                got = cr.get("outcome") if isinstance(cr, dict) else "?"
+            if got != want:
+                max_rows_oracle_fails.append(f"backstop/allow-list k={k}: expected {want}, got {got}")
+        su.execute("select agent_gate.disallow_write('fuzzer', 'shop.items')")
         run_schema(); baseline = full_fp()
         probe.close()
 

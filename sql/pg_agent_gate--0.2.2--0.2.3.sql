@@ -1,0 +1,66 @@
+-- 0.2.2 -> 0.2.3
+--
+-- A real schema change this time. The library (verify.rs, verbs.rs) adds two things that need no
+-- catalog change -- the no_opaque_function propose check, and a commit-time row-count backstop
+-- (pg_stat_xact_user_tables delta vs max_rows) -- and one that does: a per-agent allow-list, so a
+-- table with a legitimate trigger (updated_at, audit) can be written without the amplification
+-- refusal, while the backstop still counts every amplified row against max_rows.
+--
+-- What 0.2.3 refuses or bounds, over 0.2.2:
+--  * no_opaque_function: a statement calling a USER function that is volatile or SECURITY DEFINER
+--    is refused -- its body is not in the analyzed tree, so it may write uncounted rows or run as
+--    its owner outside the agent's tenant. Built-ins and pure user functions pass.
+--  * the backstop: triggers, cascades, rules and functions can move more rows than the top-level
+--    count names; the transaction's tuple operations on user tables are measured and the kept set
+--    aborts if they exceed max_rows. It over-counts (the safe side) and does not see TRUNCATE.
+--  * allow_write(agent, relation): relaxes no_amplification for one table, not the limit.
+
+CREATE TABLE agent_gate_internal.allowlist (
+    agent      text NOT NULL REFERENCES agent_gate_internal.agents (name) ON DELETE CASCADE,
+    relid      oid  NOT NULL,
+    note       text,
+    allowed_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    allowed_by name NOT NULL DEFAULT session_user,
+    PRIMARY KEY (agent, relid)
+);
+
+CREATE FUNCTION agent_gate.allow_write(p_agent text, p_relation regclass, p_note text DEFAULT NULL)
+RETURNS jsonb LANGUAGE plpgsql SET search_path = pg_catalog, agent_gate_internal AS $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM agent_gate_internal.agents WHERE name = p_agent) THEN
+        RAISE EXCEPTION 'pg_agent_gate: no agent named %', p_agent;
+    END IF;
+    INSERT INTO agent_gate_internal.allowlist (agent, relid, note)
+    VALUES (p_agent, p_relation::oid, p_note)
+    ON CONFLICT (agent, relid) DO UPDATE SET note = EXCLUDED.note;
+    RETURN jsonb_build_object('agent', p_agent, 'relation', p_relation::text, 'note', p_note,
+        'effect', 'this agent may now propose writes to this table despite a trigger, cascade or rule on it; the commit-time backstop still counts every amplified row against max_rows');
+END $$;
+
+CREATE FUNCTION agent_gate.disallow_write(p_agent text, p_relation regclass) RETURNS boolean
+LANGUAGE sql SET search_path = pg_catalog, agent_gate_internal AS $$
+    WITH gone AS (DELETE FROM agent_gate_internal.allowlist
+                   WHERE agent = p_agent AND relid = p_relation::oid RETURNING 1)
+    SELECT EXISTS (SELECT 1 FROM gone);
+$$;
+
+REVOKE EXECUTE ON FUNCTION agent_gate.allow_write(text, regclass, text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION agent_gate.disallow_write(text, regclass) FROM PUBLIC;
+
+-- _agent now also reports the allow-list (DISCOVER_SQL's third parameter and config() read it).
+CREATE OR REPLACE FUNCTION agent_gate_internal._agent(p_name text) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, agent_gate_internal AS $$
+BEGIN
+    PERFORM agent_gate_internal._only_the_gate();
+    RETURN (
+        SELECT jsonb_build_object(
+                   'name', a.name, 'max_rows', a.max_rows, 'allow_ddl', a.allow_ddl,
+                   'bindings', coalesce((SELECT jsonb_agg(b.assertion ORDER BY b.assertion)
+                                           FROM agent_gate_internal.bindings b
+                                          WHERE b.agent = a.name), '[]'),
+                   'allowed_writes', coalesce((SELECT jsonb_agg(w.relid::bigint ORDER BY w.relid)
+                                           FROM agent_gate_internal.allowlist w
+                                          WHERE w.agent = a.name), '[]'))
+          FROM agent_gate_internal.agents a
+         WHERE a.name = p_name);
+END $$;
