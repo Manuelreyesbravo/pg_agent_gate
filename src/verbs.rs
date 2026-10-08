@@ -253,7 +253,7 @@ fn propose_one(sql: &str, intent: &str, params: Option<Vec<Option<String>>>) -> 
     }
     let who = identity();
     let cfg = config(&who);
-    let verdict = verify::verify(sql, &params, cfg.allow_ddl, &cfg.allowed);
+    let verdict = verify::verify(sql, &params, cfg.allow_ddl, &cfg.allowed, true);
     let kind = verdict.kind.map(|k| k.as_str()).unwrap_or("unknown");
 
     relax_for_an_attempt();
@@ -429,10 +429,23 @@ fn xact_tuples() -> Option<i64> {
     let _running = state::proposal();
     // None only on a real SPI failure: the coalesce guarantees a non-null value otherwise, so the
     // caller can tell "nothing changed" (Some(0)) from "could not measure" (None) and fail closed.
-    Spi::get_one::<i64>(
-        "select coalesce(sum(n_tup_ins + n_tup_upd + n_tup_del), 0)::bigint \
-         from pg_catalog.pg_stat_xact_user_tables \
-         where schemaname not in ('agent_gate', 'agent_gate_internal')",
+    //
+    // The same sum pg_stat_xact_user_tables gives, without the view: it computes a dozen
+    // statistics per relation and joins pg_namespace, which on the mind (695 relations) cost ~2 ms
+    // to plan and ~2 ms to run, twice per commit (2026-10-08). Same relations -- tables and
+    // materialized views outside pg_catalog, information_schema and the TOAST schemas (TOAST
+    // tables are relkind 't', so they are left out by kind) -- and the gate's own schemas excluded.
+    crate::exec::get_one_prepared::<i64>(
+        "select coalesce(sum(pg_catalog.pg_stat_get_xact_tuples_inserted(c.oid) \
+                           + pg_catalog.pg_stat_get_xact_tuples_updated(c.oid) \
+                           + pg_catalog.pg_stat_get_xact_tuples_deleted(c.oid)), 0)::bigint \
+           from pg_catalog.pg_class c \
+          where c.relkind in ('r', 'm', 'p') \
+            and c.relnamespace not in (select n.oid from pg_catalog.pg_namespace n \
+                                        where n.nspname in ('pg_catalog', 'information_schema', \
+                                                            'agent_gate', 'agent_gate_internal'))",
+        &[],
+        &[],
     )
     .ok()
     .flatten()
@@ -489,7 +502,7 @@ fn execute(proposal: i64, mode: Mode) -> Value {
 
     // The world may have changed since the proposal. Verify again, now.
     let cfg = config(&who);
-    let verdict = verify::verify(&sql, &params, cfg.allow_ddl, &cfg.allowed);
+    let verdict = verify::verify(&sql, &params, cfg.allow_ddl, &cfg.allowed, false);
     if !verdict.ok {
         let why = verdict.first_failure().map(|c| c.detail.clone()).unwrap_or_default();
         return refuse_execution(

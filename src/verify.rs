@@ -95,11 +95,15 @@ struct Parsed {
     select_locks: bool,
 }
 
+/// `estimate`: whether to work out `estimated_rows`. Only `propose` reports it; `commit` verifies
+/// again but returns no estimate, so it skips the VERBOSE plan and the privilege lookup that only
+/// the estimate needs (measured: they were most of what 0.2.6-0.2.10 added to a commit).
 pub(crate) fn verify(
     sql: &str,
     params: &Option<Vec<Option<String>>>,
     allow_ddl: bool,
     allowed: &[u32],
+    estimate: bool,
 ) -> Verdict {
     let mut v = Verdict {
         ok: false,
@@ -339,7 +343,11 @@ pub(crate) fn verify(
     if kind != Kind::Ddl {
         // VERBOSE so that every scan names its schema: the estimate is judged on the relations the
         // PLAN reads, which can be more than the tree's (a SQL function the planner inlines).
-        let explain = format!("EXPLAIN (VERBOSE, FORMAT JSON) {}", v.statement);
+        let explain = if estimate {
+            format!("EXPLAIN (VERBOSE, FORMAT JSON) {}", v.statement)
+        } else {
+            format!("EXPLAIN (FORMAT JSON) {}", v.statement)
+        };
         let args = text_args(params);
         match in_subxact(|| explain_plan(&explain, &args), |_| false) {
             Ok(plan) => {
@@ -354,8 +362,10 @@ pub(crate) fn verify(
                 // tree AND the plan touch -- the plan too, because the planner inlines a SQL
                 // function after the tree was built (0.2.8: 34 through such a helper, 1156 through
                 // two of them joined). Fail closed: a lookup that failed withholds it.
-                let hidden = rows_hidden_from_agent(&tree_relations, &plan_relations).unwrap_or(true);
-                v.estimated_rows = if hidden { None } else { rows };
+                if estimate {
+                    let hidden = rows_hidden_from_agent(&tree_relations, &plan_relations).unwrap_or(true);
+                    v.estimated_rows = if hidden { None } else { rows };
+                }
                 v.check(
                     "resolves",
                     true,
@@ -444,21 +454,18 @@ fn amplifying_object(targets: &[pg_sys::Oid], allowed: &[u32]) -> Result<Option<
     if targets.is_empty() {
         return Ok(None);
     }
-    let ids = targets.iter().map(|o| o.to_u32().to_string()).collect::<Vec<_>>().join(",");
-    let allow = if allowed.is_empty() {
-        "array[]::bigint[]".to_string()
-    } else {
-        format!("array[{}]::bigint[]", allowed.iter().map(|o| o.to_string()).collect::<Vec<_>>().join(","))
-    };
+    let ids: Vec<i64> = targets.iter().map(|o| o.to_u32() as i64).collect();
+    let allow: Vec<i64> = allowed.iter().map(|o| *o as i64).collect();
     // A scalar subquery, so the result is exactly one row: the first unsafe amplifier's name, or
-    // NULL. get_one then gives Ok(Some)/Ok(None); only a real failure gives Err.
-    let sql = format!(
+    // NULL. Ok(Some)/Ok(None); only a real failure gives Err.
+    crate::exec::get_one_prepared::<String>(
         "select (select x.label
-                   from unnest(array[{ids}]::oid[]) t,
-                        lateral (select agent_gate_internal._unsafe_amplifier(t, {allow}) as label) x
-                  where x.label is not null limit 1)"
-    );
-    Spi::get_one::<String>(&sql).map_err(|e| e.to_string())
+                   from unnest($1::int8[]) t,
+                        lateral (select agent_gate_internal._unsafe_amplifier(t::oid, $2::bigint[]) as label) x
+                  where x.label is not null limit 1)",
+        &[PgOid::BuiltIn(PgBuiltInOids::INT8ARRAYOID), PgOid::BuiltIn(PgBuiltInOids::INT8ARRAYOID)],
+        &[ids.into(), allow.into()],
+    )
 }
 
 /// A USER function the statement calls that the gate cannot vouch for: volatile (its body may
@@ -470,19 +477,20 @@ fn risky_function(funcs: &[pg_sys::Oid]) -> Result<Option<String>, String> {
     if funcs.is_empty() {
         return Ok(None);
     }
-    let ids = funcs.iter().map(|o| o.to_u32().to_string()).collect::<Vec<_>>().join(",");
-    let sql = format!(
+    let ids: Vec<i64> = funcs.iter().map(|o| o.to_u32() as i64).collect();
+    crate::exec::get_one_prepared::<String>(
         "select (
            select 'function '||n.nspname||'.'||p.proname||
                   case when p.prosecdef then ' (security definer)' else ' (volatile)' end
              from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid = p.pronamespace
-             where p.oid in ({ids})
+             where p.oid = any($1::int8[]::oid[])
                and n.nspname not in ('pg_catalog', 'information_schema', 'pg_toast')
                and (p.prosecdef or p.provolatile = 'v')
              limit 1
-         )"
-    );
-    Spi::get_one::<String>(&sql).map_err(|e| e.to_string())
+         )",
+        &[PgOid::BuiltIn(PgBuiltInOids::INT8ARRAYOID)],
+        &[ids.into()],
+    )
 }
 
 /// Whether the current role could NOT read in full some relation the statement touches -- in the
@@ -498,7 +506,7 @@ fn rows_hidden_from_agent(relations: &[pg_sys::Oid], plan_relations: &[(String, 
     let ids: Vec<i64> = relations.iter().map(|o| o.to_u32() as i64).collect();
     let schemas: Vec<String> = plan_relations.iter().map(|(s, _)| s.clone()).collect();
     let names: Vec<String> = plan_relations.iter().map(|(_, n)| n.clone()).collect();
-    Spi::get_one_with_args::<bool>(
+    crate::exec::get_one_prepared::<bool>(
         "select exists (select 1 from (
              select r::oid as r from unnest($1::int8[]) r
              union all
@@ -508,6 +516,11 @@ fn rows_hidden_from_agent(relations: &[pg_sys::Oid], plan_relations: &[(String, 
            where x.r is null
               or not pg_catalog.has_table_privilege(x.r, 'SELECT')
               or pg_catalog.row_security_active(x.r))",
+        &[
+            PgOid::BuiltIn(PgBuiltInOids::INT8ARRAYOID),
+            PgOid::BuiltIn(PgBuiltInOids::TEXTARRAYOID),
+            PgOid::BuiltIn(PgBuiltInOids::TEXTARRAYOID),
+        ],
         &[ids.into(), schemas.into(), names.into()],
     )
     .map(|b| b.unwrap_or(true))

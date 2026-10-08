@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.2.11 -- 2026-10-08
+
+Measured on a real agent: the tree of the author's own system, which runs every one of its
+acts through the gate. Upgrading it from 0.2.1 to 0.2.10 made each of its executions take a
+median 5.7 ms inside the gate instead of 1.2 ms.
+
+* **The max_rows counter no longer reads `pg_stat_xact_user_tables`.** It read that view before
+  and after every executed statement; the view computes a dozen statistics per relation and
+  joins `pg_namespace`, and on a database of 695 relations it cost ~2 ms to plan and ~2 ms to
+  run -- twice per commit. The counter now sums the three statistics it needs from `pg_class`,
+  over the same relations (TOAST excluded by kind, the gate's own schemas excluded): ~0.5 ms
+  there. `make fuzz`'s max_rows differential oracle: PASS, 1500 generated cases, no commit over
+  max_rows.
+* **The gate's fixed lookups keep a prepared plan per backend** (the max_rows counter, the
+  amplifier check, the opaque-function check, the estimate's privilege check), parameterized
+  instead of built as text on every call. The plan cache revalidates them when the catalog
+  changes.
+* **`commit` skips what only the estimate needs** -- the `VERBOSE` plan and the privilege
+  lookup -- since it reports no estimate. Every check still runs.
+* Measured in a throwaway cluster with the real schema and the last 500 proposals of that agent,
+  propose then commit as it does, three alternated rounds in a quiet lane: a propose+commit pair
+  0.2.10 3.22 ms -> 0.2.11 2.30 ms (0.2.1: 1.64 ms, with far fewer checks). Every case kept.
+
 ## 0.2.10 -- 2026-10-08
 
 From an external audit of 0.2.8 (c87b343), re-measured here before it was changed.

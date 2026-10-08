@@ -6,6 +6,7 @@
 //! more.
 
 use pgrx::pg_sys::panic::CaughtError;
+use pgrx::datum::DatumWithOid;
 use pgrx::prelude::*;
 use serde_json::{json, Map, Value};
 use std::ffi::CStr;
@@ -166,4 +167,35 @@ fn typed(type_oid: pg_sys::Oid, text: &str) -> Value {
     } else {
         Value::String(text.into())
     }
+}
+
+thread_local! {
+    /// Plans of the gate's own fixed queries, prepared once per backend (SPI_keepplan). The plan
+    /// cache revalidates them when the catalog changes, as it does for any prepared statement.
+    static PLANS: std::cell::RefCell<std::collections::HashMap<&'static str, pgrx::spi::OwnedPreparedStatement>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// One row, one column, from one of the gate's own FIXED queries -- never the agent's SQL --
+/// with its plan prepared once per backend instead of on every call. Measured on the mind
+/// (2026-10-08): planning the max_rows counter alone took ~2 ms, twice per commit. The plan is
+/// taken out of the cache while it runs, so an error unwinding through here only costs a
+/// re-prepare next time.
+pub(crate) fn get_one_prepared<T: FromDatum + IntoDatum>(
+    sql: &'static str,
+    types: &[PgOid],
+    args: &[DatumWithOid],
+) -> Result<Option<T>, String> {
+    Spi::connect(|client| {
+        let plan = match PLANS.with(|p| p.borrow_mut().remove(sql)) {
+            Some(plan) => plan,
+            None => client.prepare(sql, types).map_err(|e| e.to_string())?.keep(),
+        };
+        let result = client
+            .select(&plan, Some(1), args)
+            .and_then(|t| t.first().get_one::<T>())
+            .map_err(|e| e.to_string());
+        PLANS.with(|p| p.borrow_mut().insert(sql, plan));
+        result
+    })
 }

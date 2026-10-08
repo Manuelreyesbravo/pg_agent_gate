@@ -1,0 +1,8 @@
+-- 0.2.10 -> 0.2.11
+--
+-- No catalog change. 0.2.11 makes the verification of 0.2.6-0.2.10 cheaper, inside the library:
+-- the max_rows counter sums three per-relation statistics from pg_class instead of reading
+-- pg_stat_xact_user_tables (which computes a dozen per relation), the gate's fixed lookups keep a
+-- prepared plan per backend, and commit -- which reports no estimate -- skips the work only the
+-- estimate needs. Same checks, same answers (make fuzz's max_rows differential oracle: PASS).
+-- The SQL surface of an upgraded database and a fresh one stay identical (tests/upgrade.sh).
