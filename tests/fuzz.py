@@ -127,10 +127,11 @@ DANGEROUS = [
     "lock shop.orders in access exclusive mode",
     "notify x",
     "listen x",
-    # Dangerous FUNCTIONS. These resolve as reads, so propose() may accept them -- that is by
-    # design: the damage, if any, is bounded by the agent's own privileges at commit (it is not
-    # a superuser, has no pg_signal_backend, cannot read server files) and by the fingerprint
-    # oracle below. They are here to be EXERCISED end to end, not to be refused at propose.
+    # Dangerous FUNCTIONS, two kinds. The agent CANNOT execute the file/large-object ones below
+    # (lo_import, lo_export, pg_read_file, pg_stat_file, pg_ls_dir), so the gate refuses them at
+    # propose -- DANGER_WORDS asserts that. The ones it CAN call (pg_sleep, pg_terminate_backend,
+    # pg_cancel_backend) are accepted and exercised at commit, where they abort (permission or
+    # timeout), bounded by the agent's own privileges -- never refused at propose.
     "select pg_terminate_backend(pid) from pg_stat_activity",
     "select pg_cancel_backend(pid) from pg_stat_activity",
     "select pg_sleep(10)",
@@ -282,7 +283,7 @@ def main():
     # The seed is withheld from the START line in CI: whether this run found a real escape is not
     # known yet, and in CI the log is public. A clean run's seed is added to the summary at the end.
     print(f"fuzzing pg_agent_gate: {ITERS} inputs" + ("" if IN_CI else f", seed {SEED}"))
-    if IN_CI and SEED_SOURCE == "random":
+    if IN_CI and SEED_SOURCE == "random" and ITERS > 0:
         # Without the key the seed is random, and an escape's seed would be withheld with nothing
         # to recompute it from. Warn loudly rather than fail -- a fork lacks the secret by design.
         print("WARNING: FUZZ_SEED_KEY is not set; the seed is random. If this run finds an escape "
@@ -560,7 +561,7 @@ def main():
                          ("PROTECTED-STATE", protected), ("OVER-MAX-ROWS", over_rows), ("DANGER-FN KEPT", danger_kept)):
         for idx, s in enumerate(items[:10], 1):
             print(f"  {label} {idx} of {len(items)}" + ("" if IN_CI else f": {s!r}"))
-    for fail in max_rows_oracle_fails[:24]:
+    for fail in max_rows_oracle_fails[:48]:   # 6 shapes x k=1..8
         print(f"  MAX-ROWS ORACLE: {fail}")
 
     escapes = len(crashes) + len(direct_bypass) + propose_commit + len(max_rows_oracle_fails)
@@ -613,7 +614,7 @@ def main():
         oracle_line = ("- max_rows differential oracle (k=1..8): PASS\n" if not max_rows_oracle_fails
                        else f"- max_rows differential oracle (k=1..8): {len(max_rows_oracle_fails)} FAILED\n")
         keywarn_line = ("- ⚠️ FUZZ_SEED_KEY unset: seed random, an escape would be unreproducible\n"
-                        if IN_CI and SEED_SOURCE == "random" else "")
+                        if IN_CI and SEED_SOURCE == "random" and ITERS > 0 else "")
         with open(gh_summary, "a") as f:
             f.write(
                 f"### fuzz{f' (seed {SEED})' if reveal_seed else ''}\n\n"
