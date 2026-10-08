@@ -163,12 +163,14 @@ DANGER_WORDS = ("drop", "truncate", "alter", "create", "grant", "revoke", "copy"
 
 
 def looks_dangerous(s):
-    # Classify on the statement with its SQL comments removed: a dangerous word that lives
-    # only inside a `-- ...` or `/* ... */` comment is inert, and the gate -- which judges the
-    # parsed tree, not the text -- correctly allows it. Matching the raw text would be a false
-    # positive, the naive mistake the gate does not make.
+    # Classify on the statement with its SQL comments AND string literals removed: a dangerous
+    # word inside a comment or a string (an email 'zsuperuser@x', the text 'drop it') is inert,
+    # and the gate -- which judges the parsed tree, not the text -- correctly allows it. Matching
+    # the raw text would be a false positive, the naive mistake the gate does not make.
     stripped = re.sub(r"--[^\n]*", " ", s)
     stripped = re.sub(r"/\*.*?\*/", " ", stripped, flags=re.S)
+    stripped = re.sub(r"\$\$.*?\$\$", " ", stripped, flags=re.S)   # dollar-quoted strings
+    stripped = re.sub(r"'(?:[^']|'')*'", " ", stripped)            # single-quoted strings
     low = stripped.lower()
     if ";" in stripped.strip().rstrip(";"):   # more than one statement
         return True
@@ -187,8 +189,8 @@ insert into shop.customers values (1,1,'Ana','ana@one.example'),(2,1,'Bruno','br
 insert into shop.orders select g,1,1+g%2,g*10 from generate_series(1,8) g;
 alter table shop.customers enable row level security; alter table shop.customers force row level security;
 alter table shop.orders enable row level security;    alter table shop.orders force row level security;
-create policy t on shop.customers using (tenant = current_setting('app.tenant_id')::int);
-create policy t on shop.orders    using (tenant = current_setting('app.tenant_id')::int);
+create policy t on shop.customers using (tenant = current_setting('app.tenant_id')::int) with check (tenant = current_setting('app.tenant_id')::int);
+create policy t on shop.orders    using (tenant = current_setting('app.tenant_id')::int) with check (tenant = current_setting('app.tenant_id')::int);
 alter table shop.customers owner to fuzz_agent; alter table shop.orders owner to fuzz_agent;
 """
 
