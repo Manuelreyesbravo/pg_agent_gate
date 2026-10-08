@@ -47,6 +47,8 @@ jobs:
         pg: [18, 19]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false   # keep the token (issues: write) out of .git/config, where later steps could read it
 
       - name: clean machine, PostgreSQL ${{ matrix.pg }}
         run: PG_MAJOR=${{ matrix.pg }} ENGINE=docker bash tests/clean-machine/run.sh
@@ -98,6 +100,8 @@ jobs:
       PGRX_VERSION: "0.19.2"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false   # keep the token (issues: write) out of .git/config, where make mcp (npm/bun), cargo and curl | sh could read it
 
       - name: PostgreSQL ${{ env.PG_MAJOR }} and a build toolchain, from PGDG
         run: |
@@ -140,17 +144,21 @@ jobs:
       # Fuzzing is a campaign, not a per-push check: a seed derived from the run id each week, so
       # coverage widens over time. On a real escape the seed is withheld from the public log; the
       # maintainer recomputes it from the run id with the repo secret (see tests/fuzz.py).
+      - name: install uv (pinned) for the fuzzer
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: |
+          curl -LsSf https://astral.sh/uv/0.12.23/install.sh | sh    # pinned, like every other tool here
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
       - name: fuzz the gate
         id: fuzz
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         env:
-          # The seed is HMAC(this secret, run id). Unset -> the seed is random; set the secret in
-          # the repo so a withheld escape seed stays recomputable by the maintainer from the run id.
+          # The seed is HMAC(this secret, run id); unset -> random. Scoped to THIS step, which runs
+          # only Python -- not the `curl | sh` above, nor the npm/bun/cargo steps -- so the secret
+          # is never in the environment of third-party tooling.
           FUZZ_SEED_KEY: ${{ secrets.FUZZ_SEED_KEY }}
-        run: |
-          curl -LsSf https://astral.sh/uv/0.12.23/install.sh | sh    # pinned, like every other tool here
-          export PATH="$HOME/.local/bin:$PATH"
-          FUZZ_ITERS=${FUZZ_ITERS:-5000} make fuzz PG_CONFIG=/usr/lib/postgresql/$PG_MAJOR/bin/pg_config
+        run: FUZZ_ITERS=${FUZZ_ITERS:-5000} make fuzz PG_CONFIG=/usr/lib/postgresql/$PG_MAJOR/bin/pg_config
 
       # A weekly fuzz break must not be silent (the job is not merge-gating). Open ONE issue --
       # public, so no seed and no input, just the run link; the maintainer recomputes the seed

@@ -131,8 +131,7 @@ DANGEROUS = [
     "select pg_sleep(10)",
     "select lo_import('/etc/passwd')",
     "select lo_export(1, '/tmp/x')",
-    "select pg_read_server_files from pg_roles",
-    "select dblink('host=x', 'select 1')",
+    "select pg_read_file('/etc/passwd')",
     "select pg_stat_file('/etc/passwd')",
     "select pg_ls_dir('/')",
 ]
@@ -269,7 +268,7 @@ ROW_STATE = """
 # is to watch what they do at COMMIT: they must abort (timeout, permission) or run as a harmless
 # read, never apply a change. This matches a committed statement to that family for the breakdown.
 DANGER_FN_RE = re.compile(r"pg_sleep|pg_terminate_backend|pg_cancel_backend|lo_import|lo_export|"
-                          r"dblink|pg_read_server_files|pg_read_file|pg_stat_file|pg_ls", re.I)
+                          r"pg_read_file|pg_stat_file|pg_ls", re.I)
 
 
 def main():
@@ -346,6 +345,7 @@ def main():
         return n
 
     baseline = full_fp()
+    max_rows_oracle_fails = []   # exact k-sweep differential oracle (filled in the teeth phase)
 
     # Prove BOTH oracles have teeth every run. (a) The fingerprint must move for a known data
     # change and a known DDL, and come back. (b) propose() must actually REFUSE a known-dangerous
@@ -378,6 +378,34 @@ def main():
         if moved != 1:
             sys.exit(f"a committed one-row UPDATE was measured as {moved} rows, not 1 -- the commit "
                      "oracle is blind (tenant context on the role? RLS?)")
+        # (d) an EXACT differential oracle for the two 0.2.1 surfaces, for a known count k and the
+        # agent's own tenant (orders are all tenant 1), every k from 1 to 8 -- nothing random, so
+        # the boundary is proved each run instead of waiting for the generator to stumble onto it.
+        # A plain write (update, insert) must be KEPT and move exactly k at k <= MAX_ROWS, and ABORT
+        # and move 0 above it. A data-modifying CTE must be REFUSED outright and never apply at any
+        # k -- that is the other 0.2.1 fix, and a CTE that got kept would be its regression.
+        for k in range(1, 9):
+            for name, tmpl, is_cte in (
+                    ("update", "update shop.orders set total = total + 1 where id <= {k}", False),
+                    ("insert", "insert into shop.orders select 100+g, 1, 1, g from generate_series(1,{k}) g", False),
+                    ("cte-delete", "with d as (delete from shop.orders where id <= {k} returning 1) select count(*) from d", True)):
+                run_schema()
+                before = row_state()
+                pr = probe.execute("select agent_gate.propose(%s, %s)", (tmpl.format(k=k), "k-sweep")).fetchone()[0]
+                outcome = "not-committed"
+                if isinstance(pr, dict) and pr.get("ok") is True and pr.get("proposal") is not None:
+                    cr = probe.execute("select agent_gate.commit(%s)", (pr["proposal"],)).fetchone()[0]
+                    outcome = cr.get("outcome") if isinstance(cr, dict) else "?"
+                moved = rows_changed(before, row_state())
+                if is_cte:
+                    if outcome == "kept" or moved != 0:
+                        max_rows_oracle_fails.append(f"k={k} {name}: a writing CTE applied (outcome={outcome} moved={moved}) -- it must be refused")
+                elif k <= MAX_ROWS:
+                    if not (outcome == "kept" and moved == k):
+                        max_rows_oracle_fails.append(f"k={k} {name}: expected kept & {k} rows, got outcome={outcome} moved={moved}")
+                else:
+                    if outcome == "kept" or moved != 0:
+                        max_rows_oracle_fails.append(f"k={k} {name}: expected abort & 0 rows, got outcome={outcome} moved={moved}")
         run_schema(); baseline = full_fp()
         probe.close()
 
@@ -403,6 +431,9 @@ def main():
     # run shows they abort or read -- never "kept" -- instead of hiding behind one total.
     outcomes = Counter()
     danger_outcomes = Counter()
+    danger_sqlstate = Counter()   # SQLSTATE of aborted dangerous-function commits: 42501
+                                  # (insufficient_privilege) is the win, 57014 a timeout
+    danger_kept = []              # a dangerous FUNCTION that APPLIED a change -- a real escape
     for i in range(ITERS):
         payload = gen()
 
@@ -463,6 +494,13 @@ def main():
                 outcomes[oc] += 1
                 if DANGER_FN_RE.search(payload):
                     danger_outcomes[oc] += 1
+                    if oc == "kept":                 # a dangerous function applied a change: ESCAPE
+                        danger_kept.append("dangerous function applied a change: " + payload)
+                    elif oc == "aborted":
+                        err = cres.get("error")
+                        ss = err.get("sqlstate") if isinstance(err, dict) else None
+                        if ss:
+                            danger_sqlstate[ss] += 1
             if safe_fp() != safe_before:   # a committed proposal must never touch catalog/role/tenant 2
                 protected.append("commit changed protected state: " + payload)
             # MEASURE how many rows actually changed, from the superuser's snapshot -- never trust
@@ -480,10 +518,10 @@ def main():
             run_schema(); baseline = full_fp()
 
         if (i + 1) % 500 == 0:
-            pc = len(word_miss) + len(protected) + len(over_rows)
+            pc = len(word_miss) + len(protected) + len(over_rows) + len(danger_kept)
             print(f"  {i + 1}/{ITERS}  direct={len(direct_bypass)} propose/commit={pc} crashes={len(crashes)}")
 
-    propose_commit = len(word_miss) + len(protected) + len(over_rows)
+    propose_commit = len(word_miss) + len(protected) + len(over_rows) + len(danger_kept)
     print("\n--- result ---")
     print(f"inputs generated:       {ITERS}")
     print(f"reached the server:     {reached}  (rejected by the client, e.g. a NUL byte: {client_rejected})")
@@ -492,26 +530,32 @@ def main():
           f"aborted {outcomes['aborted']} · refused {outcomes['refused']}")
     if danger_outcomes:
         df = " · ".join(f"{k} {v}" for k, v in sorted(danger_outcomes.items()))
-        print(f"    dangerous-function commits: {df}   (must never be 'kept')")
+        print(f"    dangerous-function commits: {df}   (a 'kept' is an escape, enforced below)")
+        if danger_sqlstate:
+            ss = " · ".join(f"{k} {v}" for k, v in sorted(danger_sqlstate.items()))
+            print(f"        aborted by SQLSTATE: {ss}   (42501 = permission denied, 57014 = timeout)")
     print(f"agent reconnections:    {reconnects}")
     print(f"server crashes:         {len(crashes)}")
+    print(f"max_rows differential oracle (k=1..8): {'PASS' if not max_rows_oracle_fails else str(len(max_rows_oracle_fails)) + ' FAILED'}")
     print(f"direct-execution escapes: {len(direct_bypass)}")
     print(f"propose/commit escapes:   {propose_commit}")
     # Per category, so the CI summary shows WHICH oracle fired even though the inputs are hidden.
     print(f"    word list should have refused:   {len(word_miss)}")
     print(f"    commit moved protected state:    {len(protected)}")
     print(f"    commit over max_rows (measured): {len(over_rows)}")
+    print(f"    dangerous function applied (kept): {len(danger_kept)}")
 
     # A public CI log is readable by anyone with a GitHub account, so in CI print only WHICH escape
-    # (its position within its category, never the iteration) and never the input -- the counts
-    # above already carry the category; reproduce an input locally from the seed.
-    categories = (("CRASH", crashes), ("DIRECT ESCAPE", direct_bypass),
-                  ("WORD-LIST MISS", word_miss), ("PROTECTED-STATE", protected), ("OVER-MAX-ROWS", over_rows))
-    for label, items in categories:
+    # (its position within its category, never the iteration) and never the fuzz input. The k-sweep
+    # oracle carries no fuzz input (a fixed k and shape), so it is printed in full even in CI.
+    for label, items in (("CRASH", crashes), ("DIRECT ESCAPE", direct_bypass), ("WORD-LIST MISS", word_miss),
+                         ("PROTECTED-STATE", protected), ("OVER-MAX-ROWS", over_rows), ("DANGER-FN KEPT", danger_kept)):
         for idx, s in enumerate(items[:10], 1):
             print(f"  {label} {idx} of {len(items)}" + ("" if IN_CI else f": {s!r}"))
+    for fail in max_rows_oracle_fails[:24]:
+        print(f"  MAX-ROWS ORACLE: {fail}")
 
-    escapes = len(crashes) + len(direct_bypass) + propose_commit
+    escapes = len(crashes) + len(direct_bypass) + propose_commit + len(max_rows_oracle_fails)
     # Health: did the run actually exercise the gate? The one failure signal is reaching the server
     # too little -- then it proved nothing. Reconnections are NOT a failure: an agent is no
     # superuser and has no pg_signal_backend, so the only backend it can terminate is its own,
@@ -552,8 +596,14 @@ def main():
     # The public summary carries the numbers and the seed, never an escaping input.
     gh_summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if gh_summary:
-        danger_line = (f"- dangerous-function commits: {dict(danger_outcomes)} (never 'kept')\n"
-                       if danger_outcomes else "")
+        danger_line = ""
+        if danger_outcomes:
+            danger_line = f"- dangerous-function commits: {dict(danger_outcomes)} (a 'kept' is an escape)"
+            if danger_sqlstate:
+                danger_line += f"; aborted SQLSTATE {dict(danger_sqlstate)}"
+            danger_line += "\n"
+        oracle_line = ("- max_rows differential oracle (k=1..8): PASS\n" if not max_rows_oracle_fails
+                       else f"- max_rows differential oracle (k=1..8): {len(max_rows_oracle_fails)} FAILED\n")
         keywarn_line = ("- ⚠️ FUZZ_SEED_KEY unset: seed random, an escape would be unreproducible\n"
                         if IN_CI and SEED_SOURCE == "random" else "")
         with open(gh_summary, "a") as f:
@@ -564,8 +614,9 @@ def main():
                 f"(kept {outcomes['kept']}, read {outcomes['read']}, aborted {outcomes['aborted']}, "
                 f"refused {outcomes['refused']}) · reconnections: {reconnects}\n"
                 f"{danger_line}"
+                f"{oracle_line}"
                 f"- crashes: {len(crashes)} · direct escapes: {len(direct_bypass)} · propose/commit escapes: {propose_commit}\n"
-                f"- by category — word-list miss: {len(word_miss)} · moved protected state: {len(protected)} · over max_rows: {len(over_rows)}\n"
+                f"- by category — word-list miss: {len(word_miss)} · moved protected state: {len(protected)} · over max_rows: {len(over_rows)} · danger-fn kept: {len(danger_kept)}\n"
                 f"{keywarn_line}"
                 f"- **{verdict}**\n"
             )

@@ -38,6 +38,8 @@ jobs:
       # tag made before this Dockerfile existed: the image is built from current code, whose
       # extension is identical to the tagged one.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false   # keep the release token (contents/packages: write) out of .git/config, where docker build and the demo run could read it
 
       # Do not publish anything the attack suite did not pass on this exact commit. On a tag
       # push verify runs in parallel, so wait for it; on workflow_dispatch it has already run.
