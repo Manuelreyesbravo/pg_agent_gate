@@ -11,7 +11,7 @@
 # did not see its rows) and set_config() inside a proposal (it moved the context a
 # row-level policy reads). Same version, different behaviour, is the same lie.
 name = "pg_agent_gate"
-version = "0.2.3"
+version = "0.2.4"
 
 edition = "2021"
 description = "Agents propose, PostgreSQL decides: a native gate between LLM agents and the database"

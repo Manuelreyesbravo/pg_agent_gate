@@ -1,0 +1,31 @@
+-- 0.2.3 -> 0.2.4
+--
+-- Nothing to change in the schema: the fix lives in the library (hooks.rs, verbs.rs, state.rs)
+-- and reaches a database the moment the new .so is loaded. The script exists so the catalog says
+-- which version is running -- an extension whose behaviour changed under the same version number
+-- is the failure this family of extensions exists to close.
+--
+-- What 0.2.4 refuses, surfaced during the adversarial review of 0.2.3 and measured on PG 18.6:
+--
+-- NESTED UTILITY FROM AN UNSEEN FUNCTION -- an uncounted, permanent write the backstop could not
+-- bound. `no_opaque_function` walks the proposal's query tree, not a function the CATALOG attaches
+-- (a CHECK, DEFAULT, generated column, expression index, domain constraint, view body). A CHECK
+-- whose SECURITY DEFINER function TRUNCATEs a table ran on a plain INSERT an agent proposed: the
+-- walker did not see it, and pg_stat_xact_user_tables does not count TRUNCATE, so the commit was
+-- kept and the table emptied.
+--
+-- Fix: while the gate runs the ONE verified statement -- and fires its deferred constraints in
+-- its own SET CONSTRAINTS -- any utility a trigger, constraint or function reaches from there is
+-- refused (TRUNCATE, GRANT, ALTER, DROP, and also benign ones: NOTIFY, SET LOCAL, LOCK TABLE,
+-- CALL, CREATE TEMP TABLE). The decision is on the gate's own execution flag, NOT current_user,
+-- because inside a SECURITY DEFINER function the agent is already the table owner. The one utility
+-- the gate runs on purpose -- the verified DDL itself for an allow_ddl agent, and the gate's own
+-- SET CONSTRAINTS -- is exempted with a one-shot allowance, and utility sub-commands pass.
+--
+-- Not closed here: the DISCLOSURE half of the same class -- a SECURITY DEFINER function a DBA put
+-- in one of those positions, reached by a SELECT, returning rows the agent cannot see. That is a
+-- read, not a utility; it waits on the walker resolving those positions at propose.
+--
+-- Regression in tests/fuzz.py (the nested-utility teeth: a CHECK-TRUNCATE, a CHECK-GRANT and a
+-- deferred constraint trigger each abort by "nested utility"; a benign CHECK and an allow_ddl
+-- agent's own CREATE INDEX stay kept; the session recovers after the abort).

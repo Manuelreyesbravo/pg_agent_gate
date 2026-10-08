@@ -700,7 +700,12 @@ Said here so nobody learns it the hard way:
   gate runs the verified statement** (on the gate's own execution flag, not `current_user` --
   inside a `SECURITY DEFINER` function the agent is already the owner). Measured: a `CHECK` whose
   function `TRUNCATE`d a table ran on a plain `INSERT` the agent proposed -- before 0.2.4 the table
-  was emptied and kept; now the same statement aborts and the table is intact. What stays open is
+  was emptied and kept; now the same statement aborts and the table is intact. The window spans the
+  gate's own `SET CONSTRAINTS`, so a utility fired by a DEFERRED constraint trigger is caught too;
+  the one utility the gate runs on purpose (an `allow_ddl` agent's own DDL, and the `SET
+  CONSTRAINTS`) is exempted, so it still goes through. This refuses ALL nested utility, benign
+  included -- a trigger that does `NOTIFY`, `SET LOCAL`, `LOCK TABLE`, `CALL` or `CREATE TEMP TABLE`
+  makes the statement abort (`pg_notify()` called as a function is fine). What stays open is
   the READ half: a `SECURITY DEFINER` function a DBA placed in one of these positions, reached by a
   `SELECT`, could return rows the agent cannot see -- a disclosure, not a utility, so the
   nested-utility refusal does not touch it, and a rolled-back subtransaction does not undo it.
@@ -716,8 +721,10 @@ Said here so nobody learns it the hard way:
   `SECURITY DEFINER`. A cascade and a rule are NOT allow-listable in 0.2.3 (making some
   cascades safe needs a recursive closure over the cascade edges, and lands in 0.2.4),
   and a SECURITY DEFINER trigger never is. The commit backstop still counts every
-  amplified row against `max_rows` (it over-counts, the safe side, and does not see
-  `TRUNCATE`). "What the gate can check" is the honest bound: a non-SECURITY DEFINER
+  amplified row against `max_rows` (it over-counts, the safe side). It reads
+  `pg_stat_xact_user_tables`, which counts USER TABLES only -- not foreign tables, large
+  objects, sequences, or effects outside the transaction; a `TRUNCATE` it does not count is
+  instead refused as a nested utility (0.2.4). "What the gate can check" is the honest bound: a non-SECURITY DEFINER
   trigger can still call a SECURITY DEFINER function, or fire a cascade of its own that
   runs as a table owner outside RLS -- the gate does not see the body. Its rows are
   counted (so the limit holds) but not tenant-filtered. Allow-listing a trigger is a

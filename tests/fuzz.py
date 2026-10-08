@@ -499,28 +499,65 @@ def main():
             max_rows_oracle_fails.append("allow-list accepted a SECURITY DEFINER trigger table -- it must stay "
                                          f"refused by no_amplification, got failed_check={failed_check(pr)!r}")
         su.execute("select agent_gate.disallow_write('fuzzer', 'shop.sditems')")
-        # (h) a nested utility (TRUNCATE/GRANT/DDL) reached from a function the walker does NOT see
-        # -- here a CHECK constraint -- is refused at commit. propose accepts the plain insert (the
-        # walker does not reach the CHECK's function), but when the insert runs, the CHECK fires the
-        # function, it tries to TRUNCATE, and the gate refuses the nested utility and aborts. Without
-        # this the TRUNCATE would run uncounted (pg_stat_xact does not count it) and be kept.
+        # (h) nested utility: a utility a trigger, constraint or function reaches while the gate
+        # runs the verified statement -- which the walker does not see and pg_stat_xact does not
+        # count -- is refused, checked by the REASON, not just the outcome (so it cannot pass on an
+        # unrelated error). Three shapes (a TRUNCATE and a GRANT from a CHECK function; a TRUNCATE
+        # from a DEFERRED constraint trigger, which fires during the gate's SET CONSTRAINTS), plus
+        # positive controls that MUST go through: a benign CHECK, the session after an abort, and an
+        # allow_ddl agent's own DDL (which the executing window must not refuse as nested).
         run_schema()
         su.execute("create table shop.victim (id int)")
         su.execute("insert into shop.victim select generate_series(1, 50)")
+        su.execute("create role fuzz_grantee")
         su.execute("create function shop.nuke() returns boolean language plpgsql security definer as $$ begin truncate shop.victim; return true; end $$")
-        su.execute("create table shop.bait (id int, check (shop.nuke()))")
-        su.execute(f"grant select, insert on shop.bait to {AGENT}")
-        pr = probe.execute("select agent_gate.propose(%s, %s)",
-                           ("insert into shop.bait values (1)", "nested utility check")).fetchone()[0]
-        if not (isinstance(pr, dict) and pr.get("ok") is True and pr.get("proposal") is not None):
-            max_rows_oracle_fails.append(f"nested-utility: propose should accept the plain insert, got {pr}")
-        else:
-            cr = probe.execute("select agent_gate.commit(%s)", (pr["proposal"],)).fetchone()[0]
-            victim = su.execute("select count(*) from shop.victim").fetchone()[0]
-            outcome = cr.get("outcome") if isinstance(cr, dict) else cr
-            if outcome != "aborted" or victim != 50:
-                max_rows_oracle_fails.append(f"nested-utility: a CHECK that TRUNCATEs ran through the gate -- "
-                                             f"outcome={outcome!r}, victim rows={victim} (expected aborted, 50)")
+        su.execute("create function shop.grab() returns boolean language plpgsql security definer as $$ begin grant select on shop.victim to fuzz_grantee; return true; end $$")
+        su.execute("create function shop.dtrunc() returns trigger language plpgsql security definer as $$ begin truncate shop.victim; return null; end $$")
+        su.execute("create table shop.deferred_tbl (id int)")
+        su.execute("create constraint trigger dt after insert on shop.deferred_tbl deferrable initially deferred for each row execute function shop.dtrunc()")
+        su.execute("create function shop.ins_deferred() returns boolean language plpgsql security definer as $$ begin insert into shop.deferred_tbl values (1); return true; end $$")
+        su.execute("create table shop.bait_trunc (id int, check (shop.nuke()))")
+        su.execute("create table shop.bait_grant (id int, check (shop.grab()))")
+        su.execute("create table shop.bait_defer (id int, check (shop.ins_deferred()))")
+        su.execute("create table shop.bait_ok (id int check (id >= 0))")
+        for t in ("victim", "deferred_tbl", "bait_trunc", "bait_grant", "bait_defer", "bait_ok"):
+            su.execute(f"grant select, insert on shop.{t} to {AGENT}")
+
+        def commit_outcome(conn, sql, why):
+            pr = conn.execute("select agent_gate.propose(%s, %s)", (sql, why)).fetchone()[0]
+            if not (isinstance(pr, dict) and pr.get("ok") is True and pr.get("proposal") is not None):
+                return "propose-refused", {}
+            cr = conn.execute("select agent_gate.commit(%s)", (pr["proposal"],)).fetchone()[0]
+            cr = cr if isinstance(cr, dict) else {}
+            return cr.get("outcome"), cr
+
+        for why, sql in (("TRUNCATE", "insert into shop.bait_trunc values (1)"),
+                         ("GRANT", "insert into shop.bait_grant values (1)"),
+                         ("deferred-trigger", "insert into shop.bait_defer values (1)")):
+            outcome, cr = commit_outcome(probe, sql, f"nested {why}")
+            if outcome != "aborted" or "nested utility" not in (cr.get("reason") or ""):
+                max_rows_oracle_fails.append(f"nested-utility ({why}): expected abort by 'nested utility', "
+                                             f"got outcome={outcome!r} reason={cr.get('reason')!r}")
+        if su.execute("select count(*) from shop.victim").fetchone()[0] != 50:
+            max_rows_oracle_fails.append("nested-utility: a nested TRUNCATE actually emptied the table")
+        # positive controls: a benign CHECK is kept, and the session still works right after an abort
+        if commit_outcome(probe, "insert into shop.bait_ok values (1)", "benign check")[0] != "kept":
+            max_rows_oracle_fails.append("nested-utility positive control: a benign CHECK must be kept")
+        if commit_outcome(probe, "insert into shop.bait_ok values (2)", "after abort")[0] != "kept":
+            max_rows_oracle_fails.append("nested-utility: the session did not recover after an abort")
+        # positive control: an allow_ddl agent's OWN DDL (CREATE INDEX) must be KEPT, not refused as
+        # nested -- the regression the executing window would cause without the one-shot allowance.
+        su.execute("create role fuzz_ddl login")
+        su.execute("create table shop.idxtbl (id int, n int)")
+        su.execute("alter table shop.idxtbl owner to fuzz_ddl")
+        su.execute("grant usage, create on schema shop to fuzz_ddl")
+        su.execute("select agent_gate.register_agent('fuzz_ddl', 'fuzz_ddl', 'ddl positive control', p_max_rows => 50, p_allow_ddl => true)")
+        with psycopg.connect(DSN, user="fuzz_ddl", autocommit=True) as ddl:
+            outcome, cr = commit_outcome(ddl, "create index idxtbl_n on shop.idxtbl (n)", "own index")
+            if outcome != "kept":
+                max_rows_oracle_fails.append(f"allow_ddl positive control: an allow_ddl agent's own CREATE "
+                                             f"INDEX must be KEPT, got outcome={outcome!r} ({cr})")
+        su.execute("select agent_gate.unregister_agent('fuzz_ddl')")
         # (g) an amplifier on an INHERITANCE CHILD or a RULE refuses a write to the table, and
         # discover agrees with propose (both go through _unsafe_amplifier).
         run_schema()

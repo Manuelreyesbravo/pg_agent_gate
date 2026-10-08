@@ -166,13 +166,21 @@ unsafe extern "C-unwind" fn process_utility(
     // DROP from there is uncounted and permanent). Refuse it, on the gate's own `executing` flag and
     // NOT on current_user (inside a SECURITY DEFINER function the agent is already the owner).
     if !pstmt.is_null() && state::executing() {
-        let agent = crate::current_agent().unwrap_or_default();
-        refuse(
-            &agent,
-            "a trigger, constraint or function reached by this statement tried to run a utility \
-             command (TRUNCATE, GRANT, a DDL, ...); the gate refuses nested utility"
-                .into(),
-        );
+        // A SUBCOMMAND is part of a utility the gate is already running (e.g. the index an ALTER
+        // TABLE builds), so it passes. The one utility the gate runs on purpose -- the verified
+        // DDL for an allow_ddl agent, or its own SET CONSTRAINTS -- carries a one-shot allowance.
+        // Anything else a trigger, constraint or function fires from here is nested and refused.
+        if context != pg_sys::ProcessUtilityContext::PROCESS_UTILITY_SUBCOMMAND
+            && !state::take_gate_utility()
+        {
+            let agent = crate::current_agent().unwrap_or_default();
+            refuse(
+                &agent,
+                "a trigger, constraint or function reached by this statement tried to run a utility \
+                 command (TRUNCATE, GRANT, a DDL, ...); the gate refuses nested utility"
+                    .into(),
+            );
+        }
     }
     match PREV_PROCESS_UTILITY {
         Some(prev) => prev(pstmt, query_string, read_only_tree, context, params, query_env, dest, qc),

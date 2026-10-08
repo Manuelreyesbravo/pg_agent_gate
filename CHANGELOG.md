@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.4 -- unreleased
+## 0.2.4 -- 2026-10-08
 
 A runtime fix for an uncounted write reached through an unseen function, plus test and docs
 hardening from the adversarial review of 0.2.3.
@@ -13,11 +13,18 @@ hardening from the adversarial review of 0.2.3.
   `TRUNCATE`, so the backstop let it through and the table was emptied, kept. Fix: while the gate
   runs the one verified statement, any utility a trigger, constraint or function reaches from there
   -- `TRUNCATE`, `GRANT`, `ALTER`, `DROP` -- is refused, on the gate's own execution flag, NOT on
-  `current_user` (inside a `SECURITY DEFINER` function the agent is already the owner). Measured
-  again: the same `CHECK` now aborts and the table is intact. Regression in `tests/fuzz.py`. The
-  DISCLOSURE half of the class -- a `SECURITY DEFINER` function in a READ returning rows the agent
-  cannot see -- is a read, not a utility, so this does not close it; it still waits on the walker
-  resolving those positions at `propose`.
+  `current_user` (inside a `SECURITY DEFINER` function the agent is already the owner). The window
+  spans the gate's own `SET CONSTRAINTS` too, so a utility fired by a DEFERRED constraint trigger
+  is caught; the gate exempts the one utility it runs on purpose (the verified DDL for an
+  `allow_ddl` agent, and the `SET CONSTRAINTS` itself) with a one-shot allowance, and lets
+  sub-commands through. Measured: the `CHECK`-`TRUNCATE` and a deferred-trigger `TRUNCATE` now
+  abort and the table is intact, a benign `CHECK` and an `allow_ddl` agent's own `CREATE INDEX`
+  stay kept, and the session recovers after the abort. **Behaviour change:** ANY nested utility is
+  now refused, benign ones included -- a trigger that does `NOTIFY`, `SET LOCAL`, `LOCK TABLE`,
+  `CALL` or `CREATE TEMP TABLE` makes the statement abort (`pg_notify()` as a function still
+  works). Regression in `tests/fuzz.py`. The DISCLOSURE half of the class -- a `SECURITY DEFINER`
+  function in a READ returning rows the agent cannot see -- is a read, not a utility, so this does
+  not close it; it still waits on the walker resolving those positions at `propose`.
 * **An amplification tooth in 0.2.2/0.2.3 passed for the wrong reason.** The fuzzer's trigger
   tooth asserted only that `insert into shop.child` was refused -- and it was, but at `resolves`
   (the agent held no INSERT on the table), never reaching `no_amplification`. The check it was

@@ -458,13 +458,21 @@ fn execute(proposal: i64, mode: Mode) -> Value {
     let result = in_subxact(
         || {
             let tup_before = xact_tuples();   // the backstop's starting point, inside this subxact
+            // Hold the executing window across BOTH the verified statement and the gate's own SET
+            // CONSTRAINTS below (where deferred constraint triggers fire): any utility a trigger,
+            // constraint or function reaches is nested and refused, except the one the gate runs
+            // on purpose, which it exempts with allow_gate_utility(). It is dropped before the
+            // bound-assertion phase, which runs the gate's own pg_living_assertions code (and may
+            // itself use utility) and is not the agent's statement.
+            let exec_guard = state::executing_verified();
             let rows = {
                 let _running = state::proposal();
                 Spi::connect_mut(|client| {
-                    // Mark that this is the ONE verified statement: any utility a trigger,
-                    // constraint or function reaches from here is nested and must be refused
-                    // (collect_rows below is a read, so it never trips the utility hook).
-                    let _exec = state::executing_verified();
+                    // The verified statement is itself a utility only when it is DDL (an allow_ddl
+                    // agent's CREATE INDEX, ...): exempt that one, so it is not refused as nested.
+                    if kind == Kind::Ddl {
+                        state::allow_gate_utility();
+                    }
                     match kind {
                         // NOT `select`: read-only SPI runs on the snapshot of the
                         // statement that called the verb, and would not see what
@@ -490,6 +498,7 @@ fn execute(proposal: i64, mode: Mode) -> Value {
                 // caller's commit where nothing would be watching.
                 {
                     let _running = state::proposal();
+                    state::allow_gate_utility();   // SET CONSTRAINTS is the gate's own utility
                     Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("constraints");
                 }
                 if kind == Kind::Write && rows.processed as i64 > max_rows {
@@ -524,6 +533,10 @@ fn execute(proposal: i64, mode: Mode) -> Value {
                     }
                 }
             }
+
+            // The verified statement and its deferred constraints are done; leave the executing
+            // window before the gate's own assertion checks run.
+            drop(exec_guard);
 
             let mut assertions = Vec::new();
             if abort.is_none() && kind != Kind::Read && !bindings.is_empty() {

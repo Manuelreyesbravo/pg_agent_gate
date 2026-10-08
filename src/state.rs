@@ -35,10 +35,13 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::SeqCst};
 static TRUSTED: AtomicU32 = AtomicU32::new(0);
 static PROPOSAL: AtomicU32 = AtomicU32::new(0);
 static CHECKING: AtomicU32 = AtomicU32::new(0);
-// Set ONLY while the gate runs the one verified statement. Any utility that fires then
-// (a TRUNCATE, GRANT, ALTER or DROP from a trigger, constraint or function the statement
-// reached -- which the propose-time walker does not see) is nested and is refused.
+// Set ONLY while the gate runs the one verified statement (and fires its deferred constraints).
+// Any utility that happens then -- a TRUNCATE, GRANT, ALTER or DROP from a trigger, constraint or
+// function the statement reached, which the propose-time walker does not see -- is nested and is
+// refused. GATE_UTILITY is how the gate exempts the one utility IT runs on purpose (the verified
+// DDL itself for an allow_ddl agent, or its own SET CONSTRAINTS): a one-shot allowance.
 static EXECUTING: AtomicU32 = AtomicU32::new(0);
+static GATE_UTILITY: AtomicU32 = AtomicU32::new(0);
 
 static TXN_SEEN: AtomicBool = AtomicBool::new(false);
 static TXN_FOREIGN_WRITES: AtomicBool = AtomicBool::new(false);
@@ -86,6 +89,19 @@ pub(crate) fn executing() -> bool {
 
 pub(crate) fn executing_verified() -> Guard {
     enter(&EXECUTING)
+}
+
+/// The gate signals that the NEXT utility it runs (the verified DDL, or SET CONSTRAINTS) is its
+/// own and must pass even inside the executing window.
+pub(crate) fn allow_gate_utility() {
+    GATE_UTILITY.fetch_add(1, SeqCst);
+}
+
+/// Consume one gate-utility allowance; true if there was one to consume.
+pub(crate) fn take_gate_utility() -> bool {
+    GATE_UTILITY
+        .fetch_update(SeqCst, SeqCst, |v| if v > 0 { Some(v - 1) } else { None })
+        .is_ok()
 }
 
 pub(crate) fn proposal() -> Guard {
