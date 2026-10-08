@@ -34,8 +34,10 @@ Closes the rest of the amplification class 0.2.2 opened, and makes the result us
 
 A cross-tenant breach, the same shape as the 0.2.1 bugs -- the gate counted the
 top-level statement and the real effect was larger -- but worse, because the
-extra effect also escaped row-level security. Found by the fuzzer's cascade
-probe against a two-tenant database with a superuser watching.
+extra effect also escaped row-level security. Reported during adversarial
+review of the gate and confirmed by measuring the real cross-tenant row count
+from a superuser against a two-tenant database; the case is now a regression in
+the fuzzer (`tests/fuzz.py`).
 
 * **A referential action amplified a write across tenants.** A referential
   action (ON DELETE/UPDATE CASCADE, SET NULL, SET DEFAULT) runs as the table

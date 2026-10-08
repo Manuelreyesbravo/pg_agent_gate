@@ -8,8 +8,9 @@
 # One definition of "verified", not a second one in YAML that can drift from it.
 #
 # PostgreSQL 19 is a MOVING beta: its job runs but is `continue-on-error`, so a break in the
-# beta does not turn the whole run red. Require only "verify (PostgreSQL 18)" to block merges
-# (Settings -> Branches); the weekly schedule is there to catch 19 drifting early.
+# beta does not turn the whole run red. Branch protection requires both "verify (PostgreSQL 18)"
+# and "end-to-end (contrast + a real MCP client)" to block merges (Settings -> Branches); 19 is
+# NOT required, and the weekly schedule is there to catch it drifting early.
 #
 # Third-party actions are pinned to a full commit SHA (the version is in the comment) so a
 # moved tag cannot change what runs. Bump them through Dependabot (.github/dependabot.yml).
@@ -141,19 +142,22 @@ jobs:
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         run: make transfer PG_CONFIG=/usr/lib/postgresql/$PG_MAJOR/bin/pg_config
 
-      # Fuzzing is a campaign, not a per-push check: a seed derived from the run id each week, so
-      # coverage widens over time. On a real escape the seed is withheld from the public log; the
-      # maintainer recomputes it from the run id with the repo secret (see tests/fuzz.py).
+      # The GENERATIVE fuzz is a weekly campaign: a seed derived from the run id each week, so
+      # coverage widens over time (the teeth and the oracle below run every push instead). On a
+      # real escape the seed is withheld from the public log; the maintainer recomputes it from the
+      # run id with the repo secret (see tests/fuzz.py).
       - name: install uv (pinned) for the fuzzer
         run: |
           curl -LsSf https://astral.sh/uv/0.12.23/install.sh | sh    # pinned, like every other tool here
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      # The max_rows / writing-CTE differential oracle (48 fixed cases, seconds) is the exact
-      # regression test for the two 0.2.1 bugs, so it runs on EVERY push and PR -- not just the
-      # weekly campaign. FUZZ_ITERS=0 runs the teeth checks and that oracle, no random inputs, so
-      # it is deterministic and needs no seed (hence no FUZZ_SEED_KEY here).
-      - name: the 0.2.1 regression oracle (every push)
+      # FUZZ_ITERS=0 runs the regression teeth and the differential oracle with no random inputs:
+      # the teeth assert each known hole is refused by the RIGHT check -- direct execution, DROP and
+      # GRANT, and the amplification class (cascade, trigger, rule, opaque function, the commit
+      # backstop and the allow-list) -- and the max_rows / writing-CTE oracle (48 fixed cases) is
+      # the exact regression for the 0.2.1-0.2.3 bugs. So it runs on EVERY push and PR, not just the
+      # weekly campaign; being deterministic it needs no seed (hence no FUZZ_SEED_KEY here).
+      - name: regression teeth + differential oracle (every push)
         if: github.event_name == 'push' || github.event_name == 'pull_request'
         run: FUZZ_ITERS=0 make fuzz PG_CONFIG=/usr/lib/postgresql/$PG_MAJOR/bin/pg_config
 

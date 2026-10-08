@@ -426,28 +426,43 @@ def main():
         # outside RLS and deleted a tenant-2 child), and a user function that is volatile or SECURITY
         # DEFINER (0.2.3 -- an opaque body may write uncounted or run as its owner). Build each and
         # assert refusal.
+        def failed_check(pr):
+            """Name of the first propose check that did not pass, or None if the proposal passed.
+            Lets a tooth assert WHICH check refused a statement, not merely that something did --
+            so a refusal for an unrelated reason (no privilege, a parse error) cannot pass it."""
+            if not isinstance(pr, dict):
+                return None
+            for c in (pr.get("checks") or []):
+                if c.get("passed") is False:
+                    return c.get("check")
+            return None
         run_schema()
         su.execute("create table shop.child (id int primary key, parent int references shop.customers(id) on delete cascade)")
         su.execute("create function shop.tf() returns trigger language plpgsql as $$ begin return new; end $$")
         su.execute("create trigger ct after insert on shop.child for each row execute function shop.tf()")
+        # the agent must HOLD insert on child, or the insert is refused at `resolves` (no privilege)
+        # and never reaches no_amplification -- the tooth would pass for the wrong reason.
+        su.execute(f"grant insert on shop.child to {AGENT}")
         su.execute("create function shop.wf() returns int language plpgsql volatile as $$ begin insert into shop.orders values (501,1,1,1); return 1; end $$")
         su.execute("create function shop.sd() returns int language sql security definer as $$ select 1 $$")
         su.execute(f"grant execute on function shop.wf(), shop.sd() to {AGENT}")
-        for why, danger in (("inbound cascade", "delete from shop.customers where id = 1"),
-                            ("user trigger", "insert into shop.child values (1, 1)"),
-                            ("opaque volatile function", "select shop.wf()"),
-                            ("security definer function", "select shop.sd()")):
+        for why, danger, expect in (("inbound cascade",            "delete from shop.customers where id = 1", "no_amplification"),
+                                    ("user trigger",               "insert into shop.child values (1, 1)",    "no_amplification"),
+                                    ("opaque volatile function",   "select shop.wf()",                        "no_opaque_function"),
+                                    ("security definer function",  "select shop.sd()",                        "no_opaque_function")):
             pr = probe.execute("select agent_gate.propose(%s, %s)", (danger, "amplification check")).fetchone()[0]
-            if isinstance(pr, dict) and pr.get("ok") is True:
-                max_rows_oracle_fails.append(f"amplification ({why}): propose ACCEPTED {danger!r} -- it must be refused")
+            if failed_check(pr) != expect:
+                max_rows_oracle_fails.append(f"amplification ({why}): {danger!r} must be refused by {expect}, "
+                                             f"got failed_check={failed_check(pr)!r} (ok={pr.get('ok') if isinstance(pr, dict) else pr!r})")
         # the allow-list must NOT reopen the 0.2.2 breach: a cascade into an RLS child runs as the
         # table owner outside RLS, so it is unsafe even when the parent is allow-listed. orders (the
         # cascade child of customers) has RLS, so delete-from-customers STAYS refused after allow_write.
         su.execute("select agent_gate.allow_write('fuzzer', 'shop.customers', 'must not make a cross-tenant cascade safe')")
         pr = probe.execute("select agent_gate.propose(%s, %s)",
                            ("delete from shop.customers where id = 1", "amplification check")).fetchone()[0]
-        if isinstance(pr, dict) and pr.get("ok") is True:
-            max_rows_oracle_fails.append("allow-list reopened the breach: a cascade into an RLS child was ACCEPTED after allow_write")
+        if failed_check(pr) != "no_amplification":
+            max_rows_oracle_fails.append("allow-list reopened the breach: delete-from-customers after allow_write must "
+                                         f"stay refused by no_amplification, got failed_check={failed_check(pr)!r}")
         su.execute("select agent_gate.disallow_write('fuzzer', 'shop.customers')")
         # (f) allow_write relaxes propose for a table with a legitimate (updated_at-style) trigger,
         # but the commit backstop still bounds the TOTAL rows the trigger moves: with MAX_ROWS=5,
@@ -480,45 +495,71 @@ def main():
         su.execute("select agent_gate.allow_write('fuzzer', 'shop.sditems', 'should NOT help: trigger is SECURITY DEFINER')")
         pr = probe.execute("select agent_gate.propose(%s, %s)",
                            ("update shop.sditems set n = n + 1 where id = 1", "backstop check")).fetchone()[0]
-        if isinstance(pr, dict) and pr.get("ok") is True:
-            max_rows_oracle_fails.append("allow-list accepted a SECURITY DEFINER trigger table -- it must stay refused")
+        if failed_check(pr) != "no_amplification":
+            max_rows_oracle_fails.append("allow-list accepted a SECURITY DEFINER trigger table -- it must stay "
+                                         f"refused by no_amplification, got failed_check={failed_check(pr)!r}")
         su.execute("select agent_gate.disallow_write('fuzzer', 'shop.sditems')")
         # (g) an amplifier on an INHERITANCE CHILD or a RULE refuses a write to the table, and
         # discover agrees with propose (both go through _unsafe_amplifier).
         run_schema()
         su.execute("create table shop.par (id int primary key, t int not null)")
         su.execute("create table shop.kid (primary key (id)) inherits (shop.par)")
-        su.execute("create function shop.kt() returns trigger language plpgsql as $$ begin return new; end $$")
+        # return coalesce(new, old): NEW is NULL in a BEFORE DELETE trigger, and returning NULL
+        # there would cancel the delete. It does not matter today (propose refuses before the
+        # trigger ever fires), but the fixture should not carry a latent cancel.
+        su.execute("create function shop.kt() returns trigger language plpgsql as $$ begin return coalesce(new, old); end $$")
         su.execute("create trigger kt before insert or update or delete on shop.kid for each row execute function shop.kt()")
         su.execute("create table shop.rlog (x int)")
         su.execute("create table shop.ruled (id int primary key, t int not null)")
         su.execute("create rule r as on update to shop.ruled do also insert into shop.rlog values (1)")
         su.execute("create table shop.plainz (id int primary key, t int not null)")
-        for tbl in ("par", "kid", "rlog", "ruled", "plainz"):
+        # allow-listed tables must stay consistent between discover and propose (the round-15 trap):
+        # a non-SECURITY DEFINER trigger table that is allow-listed is writable (discover does not
+        # refuse it, propose accepts); a SECURITY DEFINER trigger table is NOT allow-listable, so
+        # allow_write records the entry but both discover and propose still refuse it.
+        su.execute("create function shop.okt() returns trigger language plpgsql as $$ begin return coalesce(new, old); end $$")
+        su.execute("create function shop.sdt() returns trigger language plpgsql security definer as $$ begin return coalesce(new, old); end $$")
+        su.execute("create table shop.allw (id int primary key, t int not null)")
+        su.execute("create trigger okt before update on shop.allw for each row execute function shop.okt()")
+        su.execute("create table shop.allwsd (id int primary key, t int not null)")
+        su.execute("create trigger sdt before update on shop.allwsd for each row execute function shop.sdt()")
+        for tbl in ("par", "kid", "rlog", "ruled", "plainz", "allw", "allwsd"):
             su.execute(f"alter table shop.{tbl} owner to {AGENT}")
-        want = {# update/delete on an inheritance parent DOES reach kid's rows, so kid's
+        su.execute("select agent_gate.allow_write('fuzzer', 'shop.allw', 'non-SECDEF trigger: allow-listable')")
+        su.execute("select agent_gate.allow_write('fuzzer', 'shop.allwsd', 'SECDEF trigger: must stay refused')")
+        want = {# (expected ok, the check that must refuse it when ok is False)
+                # update/delete on an inheritance parent DOES reach kid's rows, so kid's
                 # trigger genuinely fires -- the gate refuses, and the amplification is real.
-                "update shop.par set t = t": False,
-                "delete from shop.par": False,
+                "update shop.par set t = t": (False, "no_amplification"),
+                "delete from shop.par": (False, "no_amplification"),
                 # conservative over-refusal: in CLASSIC inheritance an INSERT to the parent is
                 # not routed down to kid, so kid's trigger would not fire -- the gate refuses
                 # anyway, because kid (an inheritance child) carries a trigger and the walker
                 # does not match the trigger's event to the statement. With a PARTITIONED parent
                 # an INSERT WOULD route to a partition and fire it, so there it is not merely
                 # conservative.
-                "insert into shop.par values (1,1)": False,
-                "update shop.ruled set t = t": False,           # has a DO ALSO rule
-                "insert into shop.plainz values (1,1)": True}   # nothing on it
-        for sql, want_ok in want.items():
+                "insert into shop.par values (1,1)": (False, "no_amplification"),
+                "update shop.ruled set t = t": (False, "no_amplification"),    # DO ALSO rule
+                "insert into shop.plainz values (1,1)": (True, None),          # nothing on it
+                "update shop.allw set t = t": (True, None),                    # allow-listed, non-SECDEF trigger
+                "update shop.allwsd set t = t": (False, "no_amplification")}   # allow-listed, but SECDEF -> refused
+        for sql, (want_ok, want_check) in want.items():
             pr = probe.execute("select agent_gate.propose(%s, %s)", (sql, "parity check")).fetchone()[0]
-            if (isinstance(pr, dict) and pr.get("ok") is True) != want_ok:
-                max_rows_oracle_fails.append(f"parity propose {sql!r}: expected ok={want_ok}")
+            ok = isinstance(pr, dict) and pr.get("ok") is True
+            if ok != want_ok:
+                max_rows_oracle_fails.append(f"parity propose {sql!r}: expected ok={want_ok}, got ok={ok}")
+            elif not want_ok and failed_check(pr) != want_check:
+                max_rows_oracle_fails.append(f"parity propose {sql!r}: expected refusal by {want_check}, got {failed_check(pr)!r}")
         disc = probe.execute("select agent_gate.discover(%s)", ("shop",)).fetchone()[0]
         refused = {r["relation"].split(".")[-1].strip('"')
                    for r in (disc.get("relations") or []) if r.get("write_refused")}
-        for tbl, should in (("par", True), ("ruled", True), ("plainz", False)):
+        # allw is allow-listed and safe -> discover must NOT refuse it; allwsd is allow-listed but
+        # SECDEF -> discover must refuse it, exactly as propose does (the round-15 consistency).
+        for tbl, should in (("par", True), ("ruled", True), ("plainz", False), ("allw", False), ("allwsd", True)):
             if (tbl in refused) != should:
                 max_rows_oracle_fails.append(f"parity discover shop.{tbl}: write_refused={tbl in refused}, expected {should}")
+        su.execute("select agent_gate.disallow_write('fuzzer', 'shop.allw')")
+        su.execute("select agent_gate.disallow_write('fuzzer', 'shop.allwsd')")
         run_schema(); baseline = full_fp()
         probe.close()
 

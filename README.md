@@ -672,14 +672,19 @@ Said here so nobody learns it the hard way:
   user functions pass. There is no allow-list for functions in 0.2.3, so a volatile
   helper that does not write should be marked `STABLE` or `IMMUTABLE`. Measured
   (`tests/hostile.sh`): such a function inside a WRITE is refused and writes nothing.
-* **The function check does not yet reach every position in a read.** `no_opaque_function`
-  walks direct calls, operators, `= ANY`/`IN`, aggregates and window functions, but NOT a
-  function reached through a row comparison (`RowCompareExpr`), an aggregate's own transition
-  or final functions, or an I/O cast. A `SECURITY DEFINER` function a DBA put in one of those
-  positions, inside a READ, could return rows the agent cannot see -- a disclosure, which a
-  rolled-back subtransaction does not undo and the commit backstop (writes only) does not
-  bound. It needs a DBA-defined definer object in exactly that spot; closed next by resolving
-  `pg_aggregate` and the `RowCompareExpr` operators.
+* **`no_opaque_function` walks the proposal's query tree, not every place a function can hide --
+  this is a class, not a fixed list.** It follows direct calls, operators, `= ANY`/`IN`,
+  aggregates and window functions in the statement itself. It does NOT follow a function reached
+  any other way: through a row comparison (`RowCompareExpr`), an aggregate's own transition or
+  final functions, an I/O or user cast, or a function the *catalog* attaches rather than the
+  statement -- a column `DEFAULT`, a `CHECK` or domain constraint, a generated column, an
+  expression index, or the body of a view or another function the statement touches. For a WRITE
+  this is bounded anyway: the commit backstop counts every row the real execution touches against
+  `max_rows`, whatever fired it. For a READ it is not -- a `SECURITY DEFINER` function a DBA placed
+  in one of those positions could return rows the agent cannot see, a disclosure a rolled-back
+  subtransaction does not undo and the write-only backstop does not bound. It needs a DBA-defined
+  definer object in exactly such a spot; resolving these positions at `propose` closes the class
+  next.
 * **A cascade, trigger or rule that amplifies a write is refused (0.2.2/0.2.3).**
   Its extra rows run as the table owner, outside the agent's `max_rows` and -- for a
   referential action -- its tenant. `agent_gate.allow_write(agent, table)` re-permits
