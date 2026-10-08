@@ -552,11 +552,21 @@ def main():
         su.execute("alter table shop.idxtbl owner to fuzz_ddl")
         su.execute("grant usage, create on schema shop to fuzz_ddl")
         su.execute("select agent_gate.register_agent('fuzz_ddl', 'fuzz_ddl', 'ddl positive control', p_max_rows => 50, p_allow_ddl => true)")
+        su.execute(f"grant select, insert on shop.bait_trunc to fuzz_ddl")
+        su.execute(f"grant select on shop.victim to fuzz_ddl")
         with psycopg.connect(DSN, user="fuzz_ddl", autocommit=True) as ddl:
             outcome, cr = commit_outcome(ddl, "create index idxtbl_n on shop.idxtbl (n)", "own index")
             if outcome != "kept":
                 max_rows_oracle_fails.append(f"allow_ddl positive control: an allow_ddl agent's own CREATE "
                                              f"INDEX must be KEPT, got outcome={outcome!r} ({cr})")
+            # no leak: the DDL's one-shot allowance must NOT survive to the next statement. In the
+            # SAME session, a CHECK that TRUNCATEs must still abort by "nested utility".
+            outcome, cr = commit_outcome(ddl, "insert into shop.bait_trunc values (2)", "leak check")
+            if outcome != "aborted" or "nested utility" not in (cr.get("reason") or ""):
+                max_rows_oracle_fails.append(f"allow_ddl allowance leaked: a nested TRUNCATE after a DDL commit "
+                                             f"should abort by nested utility, got outcome={outcome!r} reason={cr.get('reason')!r}")
+        if su.execute("select count(*) from shop.victim").fetchone()[0] != 50:
+            max_rows_oracle_fails.append("allow_ddl leak: the nested TRUNCATE after a DDL actually emptied the table")
         su.execute("select agent_gate.unregister_agent('fuzz_ddl')")
         # (g) an amplifier on an INHERITANCE CHILD or a RULE refuses a write to the table, and
         # discover agrees with propose (both go through _unsafe_amplifier).

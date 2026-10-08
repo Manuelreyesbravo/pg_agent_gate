@@ -87,8 +87,22 @@ pub(crate) fn executing() -> bool {
     EXECUTING.load(SeqCst) > 0
 }
 
-pub(crate) fn executing_verified() -> Guard {
-    enter(&EXECUTING)
+/// Guard for the executing window. On both entry and exit it clears GATE_UTILITY, so an
+/// allowance that was granted but never consumed (the statement never reached the utility hook)
+/// cannot outlive the window and be taken by a later nested utility.
+pub(crate) struct ExecGuard;
+
+impl Drop for ExecGuard {
+    fn drop(&mut self) {
+        let _ = EXECUTING.fetch_update(SeqCst, SeqCst, |v| Some(v.saturating_sub(1)));
+        GATE_UTILITY.store(0, SeqCst);
+    }
+}
+
+pub(crate) fn executing_verified() -> ExecGuard {
+    GATE_UTILITY.store(0, SeqCst);
+    EXECUTING.fetch_add(1, SeqCst);
+    ExecGuard
 }
 
 /// The gate signals that the NEXT utility it runs (the verified DDL, or SET CONSTRAINTS) is its
