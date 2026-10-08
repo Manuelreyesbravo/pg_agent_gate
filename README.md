@@ -651,13 +651,19 @@ Said here so nobody learns it the hard way:
 * **An opaque user function is refused (0.2.3).** A statement that calls a user
   function which is volatile or `SECURITY DEFINER` is refused at `propose`
   (`no_opaque_function`): its body is not in the analyzed tree, so it could write
-  rows no one counts or run as its owner outside the agent's tenant. Built-ins and
-  non-volatile, non-`SECURITY DEFINER` user functions pass. Measured
-  (`tests/hostile.sh`): such a function inside a WRITE is refused and writes
-  nothing. A table whose trigger or function is legitimate (an `updated_at`, an
-  audit row) can be re-allowed per agent with `agent_gate.allow_write`; that
-  relaxes the refusal, not the limit -- the commit backstop still counts every
-  amplified row against `max_rows`, and does not see `TRUNCATE`.
+  rows no one counts or run as its owner outside the agent's tenant. Built-ins
+  (`pg_catalog`, e.g. `gen_random_uuid()`) and non-volatile, non-`SECURITY DEFINER`
+  user functions pass. There is no allow-list for functions in 0.2.3, so a volatile
+  helper that does not write should be marked `STABLE` or `IMMUTABLE`. Measured
+  (`tests/hostile.sh`): such a function inside a WRITE is refused and writes nothing.
+* **A cascade, trigger or rule that amplifies a write is refused (0.2.2/0.2.3).**
+  Its extra rows run as the table owner, outside the agent's `max_rows` and -- for a
+  referential action -- its tenant. `agent_gate.allow_write(agent, table)` re-permits
+  one table, but ONLY where it is provably safe: a cascade to a child the agent may
+  change that has no row-level security, or a trigger whose function is not `SECURITY
+  DEFINER`; a rule, a SECURITY DEFINER trigger, or a cascade into an RLS table stays
+  refused even when allow-listed. The commit backstop still counts every amplified row
+  against `max_rows` (it over-counts, the safe side, and does not see `TRUNCATE`).
 * **A view is checked with its owner's privileges unless it was created with
   `security_invoker`.** An agent granted `SELECT` on such a view reads the
   tables behind it, including ones it has no privilege on at all: measured, a

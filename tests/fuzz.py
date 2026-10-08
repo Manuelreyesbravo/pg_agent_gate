@@ -440,6 +440,15 @@ def main():
             pr = probe.execute("select agent_gate.propose(%s, %s)", (danger, "amplification check")).fetchone()[0]
             if isinstance(pr, dict) and pr.get("ok") is True:
                 max_rows_oracle_fails.append(f"amplification ({why}): propose ACCEPTED {danger!r} -- it must be refused")
+        # the allow-list must NOT reopen the 0.2.2 breach: a cascade into an RLS child runs as the
+        # table owner outside RLS, so it is unsafe even when the parent is allow-listed. orders (the
+        # cascade child of customers) has RLS, so delete-from-customers STAYS refused after allow_write.
+        su.execute("select agent_gate.allow_write('fuzzer', 'shop.customers', 'must not make a cross-tenant cascade safe')")
+        pr = probe.execute("select agent_gate.propose(%s, %s)",
+                           ("delete from shop.customers where id = 1", "amplification check")).fetchone()[0]
+        if isinstance(pr, dict) and pr.get("ok") is True:
+            max_rows_oracle_fails.append("allow-list reopened the breach: a cascade into an RLS child was ACCEPTED after allow_write")
+        su.execute("select agent_gate.disallow_write('fuzzer', 'shop.customers')")
         # (f) allow_write relaxes propose for a table with a legitimate (updated_at-style) trigger,
         # but the commit backstop still bounds the TOTAL rows the trigger moves: with MAX_ROWS=5,
         # k=2 is 2 updates + 2 trigger inserts = 4 (kept), k=3 is 6 (aborted by the backstop).

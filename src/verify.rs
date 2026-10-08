@@ -251,13 +251,10 @@ pub(crate) fn verify(
                     return v;
                 }
                 v.check("keeps_its_context", true, "nothing in the statement calls set_config()");
-                // Tables the agent was explicitly allowed to write (amplifier and all) are not
-                // checked here -- the commit backstop still counts every row they move. The
-                // fail-closed "no target" test below uses the ORIGINAL targets, so an all-allowed
-                // write is not mistaken for one whose target could not be resolved.
-                let checked: Vec<pg_sys::Oid> =
-                    tree.targets.iter().copied().filter(|t| !allowed.contains(&t.to_u32())).collect();
-                match amplifying_object(&checked) {
+                // The allow-list does NOT skip the check -- it is consulted inside it, so an allowed
+                // table still refuses an UNSAFE amplifier (a cascade the agent could not do directly,
+                // a SECURITY DEFINER trigger, a rule). A blanket skip reopened the 0.2.2 breach.
+                match amplifying_object(&tree.targets, allowed) {
                     Err(why) => {
                         // Fail CLOSED: a lookup we could not complete is not "nothing to find".
                         v.kind = Some(kind);
@@ -275,10 +272,11 @@ pub(crate) fn verify(
                             "no_amplification",
                             false,
                             format!(
-                                "writing this table fires {obj}, whose effect is not counted against \
-                                 max_rows (a cascading foreign key additionally runs as the table owner, \
-                                 outside row-level security, and was measured deleting another tenant's \
-                                 row): the write cannot be proven bounded, so it is refused"
+                                "writing this table fires {obj}, which can change rows outside the \
+                                 agent's reach and tenant and is not counted against max_rows. If it is \
+                                 legitimate -- an updated_at or audit trigger that is not SECURITY \
+                                 DEFINER, or a cascade to a table the agent may change that has no \
+                                 row-level security -- allow it with agent_gate.allow_write"
                             ),
                         );
                         return v;
@@ -298,8 +296,8 @@ pub(crate) fn verify(
                         v.check(
                             "no_amplification",
                             true,
-                            "no cascading foreign key, user trigger or rule on this write's target \
-                             (or an inheritance child of it) can amplify it beyond its own rows",
+                            "no unsafe cascade, trigger or rule on this write's target (or an \
+                             inheritance child of it) can amplify it beyond the agent's reach",
                         );
                     }
                 }
@@ -321,7 +319,8 @@ pub(crate) fn verify(
                             false,
                             format!("the statement calls {f}; a user function that is volatile or \
                                      SECURITY DEFINER has a body the gate cannot see -- it may write \
-                                     rows no one counts, or run as its owner outside the agent's tenant"),
+                                     rows no one counts, or run as its owner outside the agent's tenant. \
+                                     If it does not write, mark it STABLE or IMMUTABLE"),
                         );
                         return v;
                     }
@@ -391,31 +390,53 @@ unsafe fn collect_target(q: *mut pg_sys::Query, tree: &mut Tree) {
 /// catalog is asked about the whole hierarchy. `Ok(None)` means nothing amplifies this write;
 /// `Ok(Some(name))` names the object to refuse; `Err` is a lookup that failed -- which must refuse,
 /// never pass (the fail-closed the first version got wrong by swallowing the error into None).
-fn amplifying_object(targets: &[pg_sys::Oid]) -> Result<Option<String>, String> {
+fn amplifying_object(targets: &[pg_sys::Oid], allowed: &[u32]) -> Result<Option<String>, String> {
     if targets.is_empty() {
         return Ok(None);
     }
     let ids = targets.iter().map(|o| o.to_u32().to_string()).collect::<Vec<_>>().join(",");
-    // A scalar subquery so the result is always exactly ONE row: the name when something amplifies,
-    // SQL NULL when nothing does. get_one then gives Ok(Some(name)) / Ok(None), and only a real SPI
-    // failure gives Err -- so "no rows" can never be mistaken for "nothing to find" (the fail-open).
+    let allow = if allowed.is_empty() {
+        "array[]::oid[]".to_string()
+    } else {
+        format!("array[{}]::oid[]", allowed.iter().map(|o| o.to_string()).collect::<Vec<_>>().join(","))
+    };
+    // The first amplifier on a target -- or an inheritance/partition child of one -- that is UNSAFE.
+    // An amplifier is unsafe unless its target was allow-listed AND it is one the agent could already
+    // have caused directly, so the allow-list never buys an escalation (the 0.2.2 breach, which a
+    // blanket allow-list reopened):
+    //   cascade  -> safe only if the agent has the action's privilege on the CHILD and the child has
+    //               no row-level security (a referential action runs as the table owner and ignores
+    //               RLS, so with RLS it would cross tenants the agent cannot);
+    //   trigger  -> safe only if its function is not SECURITY DEFINER (else it runs as its owner);
+    //   rule     -> never safe (it rewrites to statements the gate never saw).
+    // A scalar subquery, so the result is one row: the name, or NULL when nothing is unsafe. get_one
+    // gives Ok(Some)/Ok(None); only a real failure gives Err -- "no rows" is never "nothing to find".
     let sql = format!(
         "select (
-           with recursive descendants(oid) as (
-             select oid from pg_catalog.pg_class where oid in ({ids})
+           with recursive d(root, oid) as (
+             select o, o from unnest(array[{ids}]::oid[]) o
              union
-             select i.inhrelid from pg_catalog.pg_inherits i join descendants d on i.inhparent = d.oid
-           )
+             select d.root, i.inhrelid from pg_catalog.pg_inherits i join d on i.inhparent = d.oid
+           ),
+           allowed(oid) as (select unnest({allow}))
            select label from (
-             select 'foreign key '||conname as label from pg_catalog.pg_constraint
-               where contype='f' and confrelid in (select oid from descendants)
-                 and (confdeltype in ('c','n','d') or confupdtype in ('c','n','d'))
+             select 'cascading foreign key '||co.conname as label
+               from pg_catalog.pg_constraint co join d on d.oid = co.confrelid
+              where co.contype='f' and (co.confdeltype in ('c','n','d') or co.confupdtype in ('c','n','d'))
+                and (d.root not in (select oid from allowed)
+                     or not (((co.confdeltype not in ('c','n','d')) or pg_catalog.has_table_privilege(co.conrelid, 'DELETE'))
+                         and ((co.confupdtype not in ('c','n','d')) or pg_catalog.has_table_privilege(co.conrelid, 'UPDATE'))
+                         and not coalesce((select relrowsecurity from pg_catalog.pg_class where oid = co.conrelid), true)))
              union all
-             select 'trigger '||tgname from pg_catalog.pg_trigger
-               where tgrelid in (select oid from descendants) and not tgisinternal
+             select 'trigger '||tg.tgname
+               from pg_catalog.pg_trigger tg join d on d.oid = tg.tgrelid
+               join pg_catalog.pg_proc p on p.oid = tg.tgfoid
+              where not tg.tgisinternal
+                and (d.root not in (select oid from allowed) or p.prosecdef)
              union all
-             select 'rule '||rulename from pg_catalog.pg_rewrite
-               where ev_class in (select oid from descendants) and rulename <> '_RETURN'
+             select 'rule '||rw.rulename
+               from pg_catalog.pg_rewrite rw join d on d.oid = rw.ev_class
+              where rw.rulename <> '_RETURN'
            ) s limit 1
          )"
     );
@@ -494,6 +515,11 @@ unsafe extern "C-unwind" fn walk(node: *mut pg_sys::Node, context: *mut c_void) 
         }
         pg_sys::NodeTag::T_OpExpr | pg_sys::NodeTag::T_DistinctExpr | pg_sys::NodeTag::T_NullIfExpr => {
             tree.funcs.push((*(node as *mut pg_sys::OpExpr)).opfuncid);
+            pg_sys::expression_tree_walker_impl(node, Some(walk), context)
+        }
+        pg_sys::NodeTag::T_ScalarArrayOpExpr => {
+            // `x = ANY(...)`, `x IN (...)`: the operator's function, same as an OpExpr.
+            tree.funcs.push((*(node as *mut pg_sys::ScalarArrayOpExpr)).opfuncid);
             pg_sys::expression_tree_walker_impl(node, Some(walk), context)
         }
         pg_sys::NodeTag::T_Aggref => {

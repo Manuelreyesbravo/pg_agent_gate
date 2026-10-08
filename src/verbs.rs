@@ -367,8 +367,10 @@ fn refuse_execution(who: &Identity, proposal: i64, mode: Mode, started: Instant,
 /// -- changed, which `rows.processed` (the top-level count) misses. It counts tuples, so it
 /// over-counts (the safe side), and does not see TRUNCATE (blocked as DDL). The gate's own
 /// bookkeeping is excluded so its record does not inflate an agent's budget.
-fn xact_tuples() -> i64 {
+fn xact_tuples() -> Option<i64> {
     let _running = state::proposal();
+    // None only on a real SPI failure: the coalesce guarantees a non-null value otherwise, so the
+    // caller can tell "nothing changed" (Some(0)) from "could not measure" (None) and fail closed.
     Spi::get_one::<i64>(
         "select coalesce(sum(n_tup_ins + n_tup_upd + n_tup_del), 0)::bigint \
          from pg_catalog.pg_stat_xact_user_tables \
@@ -376,7 +378,6 @@ fn xact_tuples() -> i64 {
     )
     .ok()
     .flatten()
-    .unwrap_or(0)
 }
 
 fn execute(proposal: i64, mode: Mode) -> Value {
@@ -495,15 +496,27 @@ fn execute(proposal: i64, mode: Mode) -> Value {
                 } else if kind == Kind::Write {
                     // Backstop: the top-level count is not the whole story. Measure the tuples this
                     // transaction changed over the statement (triggers, cascades, rules, functions
-                    // included) and abort if they exceed the limit -- the count check that catches
-                    // an amplifier the propose checks did not, and what makes an allow-list safe.
-                    let moved = xact_tuples().saturating_sub(tup_before);
-                    if moved > max_rows {
-                        abort = Some(format!(
-                            "it changed {moved} rows in all -- {} named plus more from a trigger, \
-                             cascade, rule or function -- and this agent may touch at most {max_rows}",
-                            rows.processed
-                        ));
+                    // included) and abort if they exceed the limit -- the count check that catches an
+                    // amplifier the propose checks did not, and what makes an allow-list safe. Fail
+                    // CLOSED: if a snapshot could not be read, abort rather than assume zero.
+                    match (tup_before, xact_tuples()) {
+                        (Some(before), Some(after)) => {
+                            let moved = after.saturating_sub(before);
+                            if moved > max_rows {
+                                abort = Some(format!(
+                                    "it changed {moved} rows in all -- {} named plus more from a trigger, \
+                                     cascade, rule or function -- and this agent may touch at most {max_rows}",
+                                    rows.processed
+                                ));
+                            }
+                        }
+                        _ => {
+                            abort = Some(
+                                "the row-count backstop could not read the transaction's tuple \
+                                 statistics, so this write cannot be proven bounded"
+                                    .into(),
+                            );
+                        }
                     }
                 }
             }
