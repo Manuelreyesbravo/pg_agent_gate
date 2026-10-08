@@ -90,6 +90,9 @@ jobs:
     name: end-to-end (contrast + a real MCP client)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    permissions:
+      contents: read
+      issues: write     # open an issue if the weekly fuzz run breaks (mirrors the PG19 alert)
     env:
       PG_MAJOR: "18"
       PGRX_VERSION: "0.19.2"
@@ -134,9 +137,11 @@ jobs:
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         run: make transfer PG_CONFIG=/usr/lib/postgresql/$PG_MAJOR/bin/pg_config
 
-      # Fuzzing is a campaign, not a per-push check: a fresh random seed each week, so it
-      # widens coverage over time. It prints the seed, so a finding is reproducible.
+      # Fuzzing is a campaign, not a per-push check: a seed derived from the run id each week, so
+      # coverage widens over time. On a real escape the seed is withheld from the public log; the
+      # maintainer recomputes it from the run id with the repo secret (see tests/fuzz.py).
       - name: fuzz the gate
+        id: fuzz
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         env:
           # The seed is HMAC(this secret, run id). Unset -> the seed is random; set the secret in
@@ -146,6 +151,22 @@ jobs:
           curl -LsSf https://astral.sh/uv/0.12.23/install.sh | sh    # pinned, like every other tool here
           export PATH="$HOME/.local/bin:$PATH"
           FUZZ_ITERS=${FUZZ_ITERS:-5000} make fuzz PG_CONFIG=/usr/lib/postgresql/$PG_MAJOR/bin/pg_config
+
+      # A weekly fuzz break must not be silent (the job is not merge-gating). Open ONE issue --
+      # public, so no seed and no input, just the run link; the maintainer recomputes the seed
+      # from the run id with the repo secret. Mirrors the PG19 beta alert above.
+      - name: open an issue if the weekly fuzz run broke
+        if: failure() && steps.fuzz.outcome == 'failure' && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          OPEN=$(gh issue list --state open --json title \
+            --jq '[.[] | select(.title | startswith("the weekly fuzz run"))] | length')
+          if [ "$OPEN" = "0" ]; then
+            gh issue create \
+              --title "the weekly fuzz run found something in \`make fuzz\`" \
+              --body "The weekly scheduled fuzz failed (an escape, a crash, or an unhealthy run). Details are withheld from this public issue; recompute the seed from the run id with the repo's FUZZ_SEED_KEY and re-run \`make fuzz\` locally. Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID ($(date -u +%F))."
+          fi
 
       - name: logs
         if: always()

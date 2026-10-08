@@ -49,6 +49,7 @@ import os
 import random
 import re
 import sys
+from collections import Counter
 
 import psycopg
 
@@ -66,7 +67,9 @@ _explicit, _key = os.environ.get("FUZZ_SEED"), os.environ.get("FUZZ_SEED_KEY")
 if _explicit:
     SEED, SEED_SOURCE = int(_explicit), "explicit"
 elif _key and RUN_ID:
-    SEED = int.from_bytes(hmac.new(_key.encode(), RUN_ID.encode(), hashlib.sha256).digest()[:4], "big") & ((1 << 30) - 1)
+    # The full 256-bit digest is the seed: public (run_id, seed) pairs from clean runs then reveal
+    # nothing usable about the key, and recovering a random 32-byte key offline is infeasible.
+    SEED = int.from_bytes(hmac.new(_key.encode(), RUN_ID.encode(), hashlib.sha256).digest(), "big")
     SEED_SOURCE = "hmac"
 else:
     SEED, SEED_SOURCE = random.randrange(1 << 30), "random"
@@ -262,6 +265,12 @@ ROW_STATE = """
   select 'o:'||id, md5(coalesce(tenant::text,'~')||'|'||coalesce(customer::text,'~')||'|'||coalesce(total::text,'~')) from shop.orders
 """
 
+# The dangerous FUNCTIONS -- accepted at propose by design (they resolve as reads), so the point
+# is to watch what they do at COMMIT: they must abort (timeout, permission) or run as a harmless
+# read, never apply a change. This matches a committed statement to that family for the breakdown.
+DANGER_FN_RE = re.compile(r"pg_sleep|pg_terminate_backend|pg_cancel_backend|lo_import|lo_export|"
+                          r"dblink|pg_read_server_files|pg_read_file|pg_stat_file|pg_ls", re.I)
+
 
 def main():
     if not DSN:
@@ -269,6 +278,11 @@ def main():
     # The seed is withheld from the START line in CI: whether this run found a real escape is not
     # known yet, and in CI the log is public. A clean run's seed is added to the summary at the end.
     print(f"fuzzing pg_agent_gate: {ITERS} inputs" + ("" if IN_CI else f", seed {SEED}"))
+    if IN_CI and SEED_SOURCE == "random":
+        # Without the key the seed is random, and an escape's seed would be withheld with nothing
+        # to recompute it from. Warn loudly rather than fail -- a fork lacks the secret by design.
+        print("WARNING: FUZZ_SEED_KEY is not set; the seed is random. If this run finds an escape "
+              "its seed is withheld and NOT reproducible. Set the repo secret to make it recoverable.")
     su = psycopg.connect(DSN, autocommit=True)
 
     # This is destructive -- it drops schema shop and the role fuzz_agent. Refuse any database
@@ -382,7 +396,13 @@ def main():
     # accepted/committed count how much the run actually exercised the two verbs.
     direct_bypass, crashes = [], []
     word_miss, protected, over_rows = [], [], []
-    reached = client_rejected = reconnects = accepted = committed = 0
+    reached = client_rejected = reconnects = accepted = 0
+    # commit() never raises on a bad statement -- it catches PostgreSQL's error and returns an
+    # outcome ("kept" applied a write, "read" ran a read, "aborted" ran and PostgreSQL raised,
+    # "refused" the gate stopped it). Count those, and separately the dangerous FUNCTIONS, so the
+    # run shows they abort or read -- never "kept" -- instead of hiding behind one total.
+    outcomes = Counter()
+    danger_outcomes = Counter()
     for i in range(ITERS):
         payload = gen()
 
@@ -434,11 +454,15 @@ def main():
             try:
                 with agent[0].cursor() as c:
                     cres = c.execute("select agent_gate.commit(%s)", (pid,)).fetchone()[0]
-                committed += 1
             except psycopg.OperationalError:
                 reconnects += 1; reconnect()
             except (psycopg.Error, Exception):
                 pass
+            if isinstance(cres, dict):   # commit() returned an outcome rather than raising
+                oc = cres.get("outcome", "?")
+                outcomes[oc] += 1
+                if DANGER_FN_RE.search(payload):
+                    danger_outcomes[oc] += 1
             if safe_fp() != safe_before:   # a committed proposal must never touch catalog/role/tenant 2
                 protected.append("commit changed protected state: " + payload)
             # MEASURE how many rows actually changed, from the superuser's snapshot -- never trust
@@ -463,7 +487,12 @@ def main():
     print("\n--- result ---")
     print(f"inputs generated:       {ITERS}")
     print(f"reached the server:     {reached}  (rejected by the client, e.g. a NUL byte: {client_rejected})")
-    print(f"proposals accepted:     {accepted}   committed: {committed}")
+    print(f"proposals accepted:     {accepted}   committed: {sum(outcomes.values())}")
+    print(f"    commit outcomes: kept {outcomes['kept']} · read {outcomes['read']} · "
+          f"aborted {outcomes['aborted']} · refused {outcomes['refused']}")
+    if danger_outcomes:
+        df = " · ".join(f"{k} {v}" for k, v in sorted(danger_outcomes.items()))
+        print(f"    dangerous-function commits: {df}   (must never be 'kept')")
     print(f"agent reconnections:    {reconnects}")
     print(f"server crashes:         {len(crashes)}")
     print(f"direct-execution escapes: {len(direct_bypass)}")
@@ -523,13 +552,21 @@ def main():
     # The public summary carries the numbers and the seed, never an escaping input.
     gh_summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if gh_summary:
+        danger_line = (f"- dangerous-function commits: {dict(danger_outcomes)} (never 'kept')\n"
+                       if danger_outcomes else "")
+        keywarn_line = ("- ⚠️ FUZZ_SEED_KEY unset: seed random, an escape would be unreproducible\n"
+                        if IN_CI and SEED_SOURCE == "random" else "")
         with open(gh_summary, "a") as f:
             f.write(
                 f"### fuzz{f' (seed {SEED})' if reveal_seed else ''}\n\n"
                 f"- inputs: {ITERS} — reached the server: {reached}, client-rejected: {client_rejected}\n"
-                f"- proposals accepted: {accepted} · committed: {committed} · agent reconnections: {reconnects}\n"
+                f"- proposals accepted: {accepted} · committed: {sum(outcomes.values())} "
+                f"(kept {outcomes['kept']}, read {outcomes['read']}, aborted {outcomes['aborted']}, "
+                f"refused {outcomes['refused']}) · reconnections: {reconnects}\n"
+                f"{danger_line}"
                 f"- crashes: {len(crashes)} · direct escapes: {len(direct_bypass)} · propose/commit escapes: {propose_commit}\n"
                 f"- by category — word-list miss: {len(word_miss)} · moved protected state: {len(protected)} · over max_rows: {len(over_rows)}\n"
+                f"{keywarn_line}"
                 f"- **{verdict}**\n"
             )
     sys.exit(0 if ok_exit else 1)
