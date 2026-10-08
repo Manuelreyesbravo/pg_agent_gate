@@ -274,6 +274,14 @@ fn propose_one(sql: &str, intent: &str, params: Option<Vec<Option<String>>>) -> 
     .expect("pg_agent_gate: the proposal was not recorded");
 
     log!("pg_agent_gate: agent={} proposal={} kind={} ok={}", who.agent, id, kind, verdict.ok);
+    state::written_to_record(format!(
+        "proposal {id} of agent {} (role {}): kind={kind} ok={} intent={} sql={}",
+        who.agent,
+        who.role,
+        verdict.ok,
+        serde_json::to_string(intent).unwrap_or_default(),
+        serde_json::to_string(sql).unwrap_or_default(),
+    ));
 
     json!({
         "proposal": id,
@@ -369,7 +377,13 @@ fn record_execution(
     } else {
         relax_for_an_attempt();
     }
-    call_internal(
+    let told = format!(
+        "of proposal {proposal}: mode={} outcome={outcome} rows_affected={} reason={}",
+        mode.as_str(),
+        rows_affected.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
+        serde_json::to_string(&reason).unwrap_or_default(),
+    );
+    let id: Option<i64> = call_internal(
         "select agent_gate_internal._record_execution($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
         &[
             proposal.into(),
@@ -383,7 +397,11 @@ fn record_execution(
             sample.map(JsonB).into(),
             duration_ms.into(),
         ],
-    )
+    );
+    if let Some(e) = id {
+        state::written_to_record(format!("execution {e} {told}"));
+    }
+    id
 }
 
 fn refuse_execution(who: &Identity, proposal: i64, mode: Mode, started: Instant, reason: String, checks: Value) -> Value {

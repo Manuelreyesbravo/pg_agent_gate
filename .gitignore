@@ -14,3 +14,6 @@ tests/pg_regress/regression.out
 tests/drivers/.deps
 __pycache__/
 *.pyc
+
+# Release bundles built locally (git archive); they are uploaded, not versioned.
+dist/

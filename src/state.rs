@@ -28,9 +28,45 @@
 //!   every record rides on the durable commit that change needs.
 //!
 //! Both are forgotten when the transaction ends, however it ends.
+//!
+//! WHAT AN ABORT TAKES FROM THE RECORD (0.2.10). The record is written in the caller's
+//! transaction, and transaction control is allowed in an agent session -- a driver
+//! opens BEGIN by itself. So ROLLBACK, ROLLBACK TO SAVEPOINT, or a session that leaves
+//! without COMMIT takes rows of the record with it, refused attempts included (found
+//! by an external audit of 0.2.8). The gate cannot keep a row its caller rolls back.
+//! It remembers, per nesting level, each row it wrote; a commit forgets them, and an
+//! abort writes the ones it takes to the server log -- outside every transaction, at
+//! LOG, which the agent's session does not receive. The record's own rows are never
+//! written inside one of the gate's internal subtransactions, so an abort of those
+//! never matches one.
 
 use pgrx::prelude::*;
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::SeqCst};
+
+thread_local! {
+    /// Rows the record wrote in this transaction, by the nesting level they were written at.
+    static UNCOMMITTED: RefCell<Vec<(i32, String)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The record wrote a row; `line` says what it was, on one line, if it has to be told.
+pub(crate) fn written_to_record(line: String) {
+    let level = unsafe { pg_sys::GetCurrentTransactionNestLevel() };
+    UNCOMMITTED.with(|u| u.borrow_mut().push((level, line)));
+}
+
+/// An abort at `level` takes every row written at that level or deeper: say so in the log.
+fn lost_to_abort(level: i32, with: &str) {
+    let lost: Vec<String> = UNCOMMITTED.with(|u| {
+        let mut u = u.borrow_mut();
+        let (lost, kept): (Vec<_>, Vec<_>) = u.drain(..).partition(|(l, _)| *l >= level);
+        *u = kept;
+        lost.into_iter().map(|(_, line)| line).collect()
+    });
+    for line in lost {
+        log!("pg_agent_gate: rolled back with {with}, so not in the record: {line}");
+    }
+}
 
 static TRUSTED: AtomicU32 = AtomicU32::new(0);
 static PROPOSAL: AtomicU32 = AtomicU32::new(0);
@@ -168,6 +204,12 @@ pub(crate) unsafe extern "C-unwind" fn on_xact_event(
     _arg: *mut std::ffi::c_void,
 ) {
     use pg_sys::XactEvent::*;
+    if event == XACT_EVENT_ABORT {
+        lost_to_abort(0, "the transaction");
+    }
+    if event == XACT_EVENT_COMMIT || event == XACT_EVENT_PREPARE {
+        UNCOMMITTED.with(|u| u.borrow_mut().clear());
+    }
     if event == XACT_EVENT_ABORT || event == XACT_EVENT_PARALLEL_ABORT {
         reset_counters();
     }
@@ -178,5 +220,29 @@ pub(crate) unsafe extern "C-unwind" fn on_xact_event(
         || event == XACT_EVENT_PREPARE
     {
         forget_transaction();
+    }
+}
+
+/// A savepoint rolled back takes the rows written inside it; one released hands them to
+/// its parent. Called while the subtransaction is still the current one.
+#[pg_guard]
+pub(crate) unsafe extern "C-unwind" fn on_subxact_event(
+    event: pg_sys::SubXactEvent::Type,
+    _my_subid: pg_sys::SubTransactionId,
+    _parent_subid: pg_sys::SubTransactionId,
+    _arg: *mut std::ffi::c_void,
+) {
+    use pg_sys::SubXactEvent::*;
+    let level = pg_sys::GetCurrentTransactionNestLevel();
+    if event == SUBXACT_EVENT_ABORT_SUB {
+        lost_to_abort(level, "a savepoint");
+    } else if event == SUBXACT_EVENT_COMMIT_SUB {
+        UNCOMMITTED.with(|u| {
+            for (l, _) in u.borrow_mut().iter_mut() {
+                if *l >= level {
+                    *l = level - 1;
+                }
+            }
+        });
     }
 }

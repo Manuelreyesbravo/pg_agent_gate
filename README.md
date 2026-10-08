@@ -276,7 +276,9 @@ Nothing is reimplemented. Each check is PostgreSQL itself:
    the policy and beneath a view, and the estimate told another tenant's frequent
    value (34 rows) from an absent one (1) -- through the table (0.2.6), through a
    SQL function the planner inlines after the tree was built, and through a view
-   that isolates tenants without row-level security (both 0.2.8). The agent's SQL
+   that isolates tenants without row-level security (both 0.2.8). It errs on the
+   withholding side: `SELECT` on a partitioned parent without its partitions, or on
+   some columns only, withholds the estimate too, although nothing would leak. The agent's SQL
    never runs in a parallel worker (0.2.8): the backend runs the whole plan, where
    the gate's hooks see it. DDL (for agents allowed it) is verified instead by running
    it in a subtransaction that is rolled back.
@@ -318,6 +320,24 @@ Only the gate writes the record. The writing functions are `SECURITY DEFINER`
 and first ask the gate whether the caller is the gate's own code -- a flag no
 SQL can set, kept down while the agent's own SQL runs. A proposal cannot forge
 its history; an agent calling those functions by name is refused by the hook.
+
+**What a rollback takes, the server log keeps.** The record is written in the
+caller's transaction, and an agent session may control its transaction (a driver
+such as psycopg opens `BEGIN` by itself). So `ROLLBACK`, `ROLLBACK TO SAVEPOINT`,
+or a session that disconnects without `COMMIT` takes those rows with it -- a
+refused attempt and a read included. The gate cannot keep a row its caller rolls
+back, and refusing transaction blocks would break every driver that opens one.
+Instead, when an abort takes rows from the record, each one is written to the
+server log at `LOG` -- outside every transaction, never sent to the agent's
+session -- on one line, with the agent's text JSON-escaped:
+
+```
+LOG:  pg_agent_gate: rolled back with the transaction, so not in the record: proposal 1 of agent rollback (role ...): kind=ddl ok=false intent="probe one" sql="drop table shop.orders"
+```
+
+`acts()` and the tables show what was committed; the server log shows what an
+abort took (since 0.2.10, from an external audit of 0.2.8; `tests/rollback.sh`).
+A server crash before the log line is written loses it, as it would lose any.
 
 ### How durable the record is
 

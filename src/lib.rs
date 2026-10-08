@@ -233,6 +233,7 @@ pub extern "C-unwind" fn _PG_init() {
         PRELOADED = pg_sys::process_shared_preload_libraries_in_progress;
         hooks::install();
         pg_sys::RegisterXactCallback(Some(state::on_xact_event), std::ptr::null_mut());
+        pg_sys::RegisterSubXactCallback(Some(state::on_subxact_event), std::ptr::null_mut());
     }
 }
 

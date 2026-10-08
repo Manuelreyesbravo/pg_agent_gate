@@ -1,0 +1,10 @@
+-- 0.2.9 -> 0.2.10
+--
+-- No catalog change. 0.2.10 changes, inside the library, what happens when the caller's
+-- transaction -- or a savepoint of it -- aborts after the gate wrote to its record: the
+-- rows the abort takes are written to the server log, at LOG, on one line each (the
+-- agent's text JSON-escaped). The record is written in the caller's transaction, and an
+-- agent session may control its transaction, so BEGIN ... ROLLBACK used to take refused
+-- attempts and reads with it and leave nothing that said so (external audit of 0.2.8;
+-- tests/rollback.sh). The SQL surface of an upgraded database and a fresh one stay
+-- identical (tests/upgrade.sh compares them).

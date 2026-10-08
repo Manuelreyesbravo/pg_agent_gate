@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.2.10 -- 2026-10-08
+
+From an external audit of 0.2.8 (c87b343), re-measured here before it was changed.
+
+* **What a rollback takes from the record, the server log keeps.** The record is
+  written in the caller's transaction and an agent session may control it, so `BEGIN;
+  ...; ROLLBACK` took refused attempts and reads with it: two refused attacks and two
+  reads, and the record stayed at 0/0. A rolled-back savepoint and a session that
+  disconnects without `COMMIT` did the same. Refusing transaction blocks would break
+  every driver that opens one, and the gate cannot keep a row its caller rolls back;
+  it now writes each row an abort takes to the server log, at `LOG`, one line each,
+  the agent's text JSON-escaped so it cannot start a line of its own. A row that
+  commits is not logged. The server log did hold a `LOG` per proposal before, with
+  its statement, but nothing that said the record had lost it.
+* README: the estimate is also withheld on partial privileges (a partitioned parent
+  without its partitions, column privileges) -- the safe side, now said.
+* `tests/rollback.sh` (12 checks, in `make verify`): red on 0.2.9 with its controls
+  green -- autocommit keeps its row and logs nothing, the part of a transaction
+  outside a rolled-back savepoint stays and is not logged.
+
 ## 0.2.9 -- 2026-10-08
 
 * **Every function of the gate names `pg_temp` last.** They all said `search_path =
