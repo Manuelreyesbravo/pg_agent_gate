@@ -160,6 +160,20 @@ unsafe extern "C-unwind" fn process_utility(
             }
         }
     }
+    // A utility statement that fires while the gate is running a verified statement can only have
+    // come from a trigger, constraint or function that statement reached -- a path the propose-time
+    // walker does not see and that pg_stat_xact would not even count (a TRUNCATE, GRANT, ALTER or
+    // DROP from there is uncounted and permanent). Refuse it, on the gate's own `executing` flag and
+    // NOT on current_user (inside a SECURITY DEFINER function the agent is already the owner).
+    if !pstmt.is_null() && state::executing() {
+        let agent = crate::current_agent().unwrap_or_default();
+        refuse(
+            &agent,
+            "a trigger, constraint or function reached by this statement tried to run a utility \
+             command (TRUNCATE, GRANT, a DDL, ...); the gate refuses nested utility"
+                .into(),
+        );
+    }
     match PREV_PROCESS_UTILITY {
         Some(prev) => prev(pstmt, query_string, read_only_tree, context, params, query_env, dest, qc),
         None => pg_sys::standard_ProcessUtility(

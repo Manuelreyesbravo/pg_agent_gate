@@ -35,6 +35,10 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::SeqCst};
 static TRUSTED: AtomicU32 = AtomicU32::new(0);
 static PROPOSAL: AtomicU32 = AtomicU32::new(0);
 static CHECKING: AtomicU32 = AtomicU32::new(0);
+// Set ONLY while the gate runs the one verified statement. Any utility that fires then
+// (a TRUNCATE, GRANT, ALTER or DROP from a trigger, constraint or function the statement
+// reached -- which the propose-time walker does not see) is nested and is refused.
+static EXECUTING: AtomicU32 = AtomicU32::new(0);
 
 static TXN_SEEN: AtomicBool = AtomicBool::new(false);
 static TXN_FOREIGN_WRITES: AtomicBool = AtomicBool::new(false);
@@ -72,6 +76,16 @@ fn enter(counter: &'static AtomicU32) -> Guard {
 
 pub(crate) fn trusted() -> Guard {
     enter(&TRUSTED)
+}
+
+/// True while the gate is running the one verified statement -- so a nested utility
+/// statement (from a trigger, constraint or function it reaches) can be refused.
+pub(crate) fn executing() -> bool {
+    EXECUTING.load(SeqCst) > 0
+}
+
+pub(crate) fn executing_verified() -> Guard {
+    enter(&EXECUTING)
 }
 
 pub(crate) fn proposal() -> Guard {

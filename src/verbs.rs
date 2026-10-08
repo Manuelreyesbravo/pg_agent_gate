@@ -461,6 +461,10 @@ fn execute(proposal: i64, mode: Mode) -> Value {
             let rows = {
                 let _running = state::proposal();
                 Spi::connect_mut(|client| {
+                    // Mark that this is the ONE verified statement: any utility a trigger,
+                    // constraint or function reaches from here is nested and must be refused
+                    // (collect_rows below is a read, so it never trips the utility hook).
+                    let _exec = state::executing_verified();
                     match kind {
                         // NOT `select`: read-only SPI runs on the snapshot of the
                         // statement that called the verb, and would not see what

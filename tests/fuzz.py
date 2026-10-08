@@ -499,6 +499,28 @@ def main():
             max_rows_oracle_fails.append("allow-list accepted a SECURITY DEFINER trigger table -- it must stay "
                                          f"refused by no_amplification, got failed_check={failed_check(pr)!r}")
         su.execute("select agent_gate.disallow_write('fuzzer', 'shop.sditems')")
+        # (h) a nested utility (TRUNCATE/GRANT/DDL) reached from a function the walker does NOT see
+        # -- here a CHECK constraint -- is refused at commit. propose accepts the plain insert (the
+        # walker does not reach the CHECK's function), but when the insert runs, the CHECK fires the
+        # function, it tries to TRUNCATE, and the gate refuses the nested utility and aborts. Without
+        # this the TRUNCATE would run uncounted (pg_stat_xact does not count it) and be kept.
+        run_schema()
+        su.execute("create table shop.victim (id int)")
+        su.execute("insert into shop.victim select generate_series(1, 50)")
+        su.execute("create function shop.nuke() returns boolean language plpgsql security definer as $$ begin truncate shop.victim; return true; end $$")
+        su.execute("create table shop.bait (id int, check (shop.nuke()))")
+        su.execute(f"grant select, insert on shop.bait to {AGENT}")
+        pr = probe.execute("select agent_gate.propose(%s, %s)",
+                           ("insert into shop.bait values (1)", "nested utility check")).fetchone()[0]
+        if not (isinstance(pr, dict) and pr.get("ok") is True and pr.get("proposal") is not None):
+            max_rows_oracle_fails.append(f"nested-utility: propose should accept the plain insert, got {pr}")
+        else:
+            cr = probe.execute("select agent_gate.commit(%s)", (pr["proposal"],)).fetchone()[0]
+            victim = su.execute("select count(*) from shop.victim").fetchone()[0]
+            outcome = cr.get("outcome") if isinstance(cr, dict) else cr
+            if outcome != "aborted" or victim != 50:
+                max_rows_oracle_fails.append(f"nested-utility: a CHECK that TRUNCATEs ran through the gate -- "
+                                             f"outcome={outcome!r}, victim rows={victim} (expected aborted, 50)")
         # (g) an amplifier on an INHERITANCE CHILD or a RULE refuses a write to the table, and
         # discover agrees with propose (both go through _unsafe_amplifier).
         run_schema()

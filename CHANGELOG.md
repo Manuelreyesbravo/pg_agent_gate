@@ -2,16 +2,22 @@
 
 ## 0.2.4 -- unreleased
 
-Test and docs hardening from the adversarial review of 0.2.3, and one newly measured limitation
-(no runtime change yet; the fix is the walker-closure below).
+A runtime fix for an uncounted write reached through an unseen function, plus test and docs
+hardening from the adversarial review of 0.2.3.
 
-* **Measured: a `TRUNCATE` reached through an unseen function is not bounded.** `no_opaque_function`
-  walks the proposal's query tree, not a function the catalog attaches (a `CHECK`, `DEFAULT`,
-  generated column, expression index, domain constraint, or view body). For ordinary DML the commit
-  backstop still counts the rows, but `TRUNCATE` is not counted by `pg_stat_xact` at all: a `CHECK`
-  whose function `TRUNCATE`s a table ran on a plain `INSERT` an agent proposed, the backstop saw one
-  row, the commit was kept, and the table was emptied. It needs a DBA to have placed such a function;
-  documented in the threat model, and closed by resolving these positions at `propose`.
+* **The gate now refuses a nested utility statement (fixes an uncounted write via an unseen
+  function).** `no_opaque_function` walks the proposal's query tree, not a function the catalog
+  attaches (a `CHECK`, `DEFAULT`, generated column, expression index, domain constraint, or view
+  body). Measured: a `CHECK` whose `SECURITY DEFINER` function `TRUNCATE`d a table ran on a plain
+  `INSERT` an agent proposed -- the walker did not see it, and `pg_stat_xact` does not count
+  `TRUNCATE`, so the backstop let it through and the table was emptied, kept. Fix: while the gate
+  runs the one verified statement, any utility a trigger, constraint or function reaches from there
+  -- `TRUNCATE`, `GRANT`, `ALTER`, `DROP` -- is refused, on the gate's own execution flag, NOT on
+  `current_user` (inside a `SECURITY DEFINER` function the agent is already the owner). Measured
+  again: the same `CHECK` now aborts and the table is intact. Regression in `tests/fuzz.py`. The
+  DISCLOSURE half of the class -- a `SECURITY DEFINER` function in a READ returning rows the agent
+  cannot see -- is a read, not a utility, so this does not close it; it still waits on the walker
+  resolving those positions at `propose`.
 * **An amplification tooth in 0.2.2/0.2.3 passed for the wrong reason.** The fuzzer's trigger
   tooth asserted only that `insert into shop.child` was refused -- and it was, but at `resolves`
   (the agent held no INSERT on the table), never reaching `no_amplification`. The check it was
@@ -20,8 +26,8 @@ Test and docs hardening from the adversarial review of 0.2.3, and one newly meas
   counts, and the agent is granted the privilege. Surfaced by the review of the 0.2.3 release.
 * The discover/propose parity now covers allow-listed tables (non-SECURITY DEFINER: writable and
   not refused; SECURITY DEFINER: refused by both). Docs: the walker's unreached-function gap is
-  named as a class; "bounded by the backstop" is qualified to count (and for `TRUNCATE`, not even
-  that), not tenant or privilege.
+  named as a class; "bounded by the backstop" is qualified to count, not tenant or privilege
+  (and `TRUNCATE` reached that way, once uncounted, is now refused outright, per the fix above).
 
 ## 0.2.3 -- 2026-10-08
 
@@ -39,7 +45,8 @@ Closes the rest of the amplification class 0.2.2 opened, and makes the result us
   `max_rows`, so a trigger, cascade, rule or function that moves more rows than the
   statement names aborts the kept set. It counts tuple operations, so it over-counts (the
   safe side -- rows a trigger writes then rolls back in its own EXCEPTION still count), and
-  it does not see TRUNCATE (blocked as DDL). The gate's own bookkeeping is excluded.
+  it does not see TRUNCATE (blocked as DDL at the top level; a TRUNCATE nested in a function
+  the walker does not see is addressed in 0.2.4). The gate's own bookkeeping is excluded.
 * **A per-agent allow-list, so a legitimate trigger is not a wall.** `agent_gate.allow_write
   (agent, relation)` lets an agent write a table that carries an `updated_at` or audit trigger
   that is NOT `SECURITY DEFINER`: it relaxes `no_amplification` for that one case only, never

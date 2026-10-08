@@ -139,12 +139,13 @@ half can pass vacuously (a known change must move the fingerprint; `propose` mus
 known `DROP` and `GRANT`), and run against the `v0.2.0` tag the fuzzer reports the historical
 `set_config` hole. **CI runs `FUZZ_ITERS=0 make fuzz` -- the teeth and the oracle, no
 generation -- on every push, in the required `end-to-end` job**; the generative fuzz
-(`FUZZ_ITERS` > 0) runs weekly. Each tooth asserts WHICH check refuses a statement, not merely
-that one did, so a refusal by a parse error or a missing privilege cannot pass it. Negative
-control (measured 2026-10-08): disabling `no_amplification` turns `FUZZ_ITERS=0` red -- 9 checks
-fail (the cascade and trigger teeth, the allow-list breach checks, and the discover/propose
-parity) -- so the teeth are not vacuous. `tests/fuzz.py` says plainly what it does and does not
-catch.
+(`FUZZ_ITERS` > 0) runs weekly. Each tooth asserts WHICH check refuses a statement (via
+`failed_check`), not merely that one did, so it cannot pass unless the right check fired -- a
+refusal by a parse error or a missing privilege does not count. That is the structural guard
+against a vacuous pass. As a spot negative control (measured 2026-10-08), disabling
+`no_amplification` turns `FUZZ_ITERS=0` red: 9 checks fail (the cascade and trigger teeth, the
+allow-list breach checks, the discover/propose parity). `tests/fuzz.py` says plainly what it does
+and does not catch.
 
 Two of these suites were green while a hole was open: see
 [what found the 0.2.1 fixes](#what-found-the-021-fixes). A green suite is a
@@ -583,6 +584,13 @@ prompt-injected, or a fully hostile client: it holds a connection as its role
 and can send anything the wire protocol carries -- any statement, any startup
 parameter, the extended protocol, a cursor, garbage.
 
+**Where the line is.** The gate bounds what the agent *names* -- the statement it
+proposes and the rows that statement changes -- plus the row count. What a DBA
+attaches to a table (a trigger, a `CHECK` or `DEFAULT`, a generated column, a
+view) is trusted code that runs with its own rules: the gate refuses the nested
+*utility* such code fires (0.2.4) and counts the rows it writes, but it does not
+read a definer function's body or re-decide what a view may show.
+
 **What the gate guarantees against it**, each with a suite above:
 
 * nothing the session types executes except the six verbs;
@@ -686,18 +694,21 @@ Said here so nobody learns it the hard way:
   expression index, or the body of a view or another function the statement touches. For ordinary
   DML done this way the commit backstop still counts the rows against `max_rows` (bounded in COUNT,
   though not in tenant or privilege -- like an allow-listed trigger, a row written this way is
-  counted but not tenant-filtered). **`TRUNCATE` is the sharp exception: `pg_stat_xact` does not
-  count it, so the backstop does not bound it at all.** Measured: a `CHECK` constraint whose
-  function `TRUNCATE`s a table ran on a plain `INSERT` the agent proposed -- the walker did not see
-  the function, `propose` accepted, the backstop counted one row, the commit was kept, and the
-  table was emptied. For a READ there is no backstop at all -- a `SECURITY DEFINER` function a DBA
-  placed in one of those positions could return rows the agent cannot see, a disclosure a
-  rolled-back subtransaction does not undo. Both need a DBA to have put a function in exactly such
-  a spot; until the walker resolves these positions at `propose` (next), do not place a function
-  that writes, `TRUNCATE`s, or reads across tenants in a `CHECK`, `DEFAULT`, generated column,
-  expression index, domain constraint, or view reachable by an agent. It needs a DBA-defined
-  definer object in exactly such a spot; resolving these positions at `propose` closes the class
-  next.
+  counted but not tenant-filtered). A nested UTILITY is worse than uncounted: `pg_stat_xact`
+  ignores `TRUNCATE`, so the backstop could not bound a `TRUNCATE`, `GRANT`, `ALTER` or `DROP` a
+  function fires. **0.2.4 refuses any utility a trigger, constraint or function reaches while the
+  gate runs the verified statement** (on the gate's own execution flag, not `current_user` --
+  inside a `SECURITY DEFINER` function the agent is already the owner). Measured: a `CHECK` whose
+  function `TRUNCATE`d a table ran on a plain `INSERT` the agent proposed -- before 0.2.4 the table
+  was emptied and kept; now the same statement aborts and the table is intact. What stays open is
+  the READ half: a `SECURITY DEFINER` function a DBA placed in one of these positions, reached by a
+  `SELECT`, could return rows the agent cannot see -- a disclosure, not a utility, so the
+  nested-utility refusal does not touch it, and a rolled-back subtransaction does not undo it.
+  `dry_run` runs the same invisible code: it rolls back the data, but not effects outside the
+  transaction. Both need a DBA to have put such a function in exactly that spot; until the walker
+  resolves these positions at `propose`, do not place a function that writes or reads across tenants
+  in a `CHECK`, `DEFAULT`, generated column, expression index, domain constraint, or view reachable
+  by an agent.
 * **A cascade, trigger or rule that amplifies a write is refused (0.2.2/0.2.3).**
   Its extra rows run as the table owner, outside the agent's `max_rows` and -- for a
   referential action -- its tenant. `agent_gate.allow_write(agent, table)` re-permits
