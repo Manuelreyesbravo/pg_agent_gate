@@ -56,6 +56,8 @@ probe against a two-tenant database with a superuser watching.
 * Not yet covered (0.2.3): a volatile or SECURITY DEFINER function that writes,
   which is a read at `propose`. No schema changes; the upgrade script only moves
   the version.
+* Published as [GHSA-89xf-63fg-xx5h](https://github.com/Manuelreyesbravo/pg_agent_gate/security/advisories/GHSA-89xf-63fg-xx5h)
+  (CVSS 3.1: 9.6, Critical). Upgrade from any version before 0.2.2.
 
 ## 0.2.1 -- 2026-10-06
 
