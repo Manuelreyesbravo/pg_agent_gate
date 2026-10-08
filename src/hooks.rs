@@ -37,7 +37,8 @@ use pgrx::pg_sys::panic::ErrorReport;
 use pgrx::prelude::*;
 use std::ffi::{c_char, CStr};
 
-pub(crate) const VERBS: &[&str] = &["discover", "propose", "dry_run", "commit", "acts", "whoami"];
+pub(crate) const VERBS: &[&str] =
+    &["discover", "propose", "dry_run", "commit", "propose_and_commit", "acts", "whoami"];
 
 const SHAPE: &str = "an agent session may only run SELECT agent_gate.<verb>(...) with literals or parameters";
 
@@ -110,7 +111,8 @@ pub(crate) fn refuse(agent: &str, why: String) -> ! {
     .set_detail(why)
     .set_hint(
         "Call agent_gate.propose(sql, intent), then agent_gate.dry_run(proposal) or \
-         agent_gate.commit(proposal). agent_gate.discover() shows what this agent may touch.",
+         agent_gate.commit(proposal) -- or agent_gate.propose_and_commit(sql, intent) for both \
+         in one call. agent_gate.discover() shows what this agent may touch.",
     )
     .report(PgLogLevel::ERROR);
     unreachable!()

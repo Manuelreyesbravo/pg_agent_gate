@@ -8,7 +8,8 @@ Four numbers, each against the threshold it was declared with BEFORE the code ex
      which pays its own durable commit;
   3. throughput lost by sessions that are NOT agents when the library is preloaded
      (pgbench -S), which is what every other session of the server pays;
-  4. extra time per read act with attempt_durability = durable.
+  4. extra time per read act with attempt_durability = durable;
+  5. the same, done in ONE call (propose_and_commit): one transaction, one flush instead of two.
 
 FAIRNESS, because a benchmark of a guard is easy to make flattering:
   * "directly" means an IDENTICAL role -- same grants, same database, same statement,
@@ -55,7 +56,7 @@ OUT = ROOT / "target" / "bench"
 
 READ = "select abalance from pgbench_accounts where aid = $1::int"
 WRITE = "update pgbench_accounts set abalance = abalance + 1 where aid = $1::int"
-THRESHOLDS = {"read": 10.0, "write": 5.0, "non_agent_pct": 3.0, "durable_read": 10.0}
+THRESHOLDS = {"read": 10.0, "write": 5.0, "non_agent_pct": 3.0, "durable_read": 10.0, "durable_one_call": 10.0}
 
 
 def cluster(*args: str, check: bool = True) -> None:
@@ -122,28 +123,34 @@ def act(a: psycopg.Connection, sql: str, aid: int, intent: str) -> None:
         raise RuntimeError(f"the act did not complete: {r}")
 
 
+def act_one_call(a: psycopg.Connection, sql: str, aid: int, intent: str) -> None:
+    r = a.execute("select agent_gate.propose_and_commit(%s, %s, %s)", (sql, intent, [str(aid)])).fetchone()[0]
+    if r.get("outcome") not in ("read", "kept"):
+        raise RuntimeError(f"the one-call act did not complete: {r}")
+
+
 def direct(d: psycopg.Connection, sql: str, aid: int) -> None:
     cur = d.execute(sql.replace("$1::int", "%s"), (aid,))
     if cur.description:
         cur.fetchall()
 
 
-def paired(sql: str, intent: str) -> dict:
+def paired(sql: str, intent: str, how=act) -> dict:
     """ITER iterations, gate and direct back to back, order alternating."""
     extra, gate_ms, direct_ms = [], [], []
     with conn(AGENT) as a, conn(DIRECT) as d:
         for _ in range(20):  # warm both paths, caches and plans
             aid = random.randint(1, 1_000_000)
-            act(a, sql, aid, "warm up")
+            how(a, sql, aid, "warm up")
             direct(d, sql, aid)
         for i in range(ITER):
             aid = random.randint(1, 1_000_000)
             if i % 2 == 0:
-                g = timed(lambda: act(a, sql, aid, intent))
+                g = timed(lambda: how(a, sql, aid, intent))
                 x = timed(lambda: direct(d, sql, aid))
             else:
                 x = timed(lambda: direct(d, sql, aid))
-                g = timed(lambda: act(a, sql, aid, intent))
+                g = timed(lambda: how(a, sql, aid, intent))
             gate_ms.append(g)
             direct_ms.append(x)
             extra.append(g - x)
@@ -209,6 +216,8 @@ def main() -> None:
     with conn(USER) as s:
         s.execute(f"alter role {AGENT} set agent_gate.attempt_durability = durable")
     result["durable_read"] = paired(READ, "bench durable read")
+    print("  read act with attempt_durability = durable, in one call ...", flush=True)
+    result["durable_one_call"] = paired(READ, "bench durable read one call", act_one_call)
     with conn(USER) as s:
         s.execute(f"alter role {AGENT} reset agent_gate.attempt_durability")
     print(f"  sessions that are not agents: {PAIRS} pairs of {SECONDS} s ...", flush=True)
@@ -220,8 +229,10 @@ def main() -> None:
         ("extra time per kept write over the same UPDATE directly", "write", "extra_median_ms", "ms"),
         ("throughput lost by sessions that are not agents (pgbench -S)", "non_agent", "loss_median_pct", "%"),
         ("extra time per read act, attempt_durability = durable", "durable_read", "extra_median_ms", "ms"),
+        ("extra time per read act, durable, in one call (propose_and_commit)", "durable_one_call", "extra_median_ms", "ms"),
     ]
-    key = {"read": "read", "write": "write", "non_agent": "non_agent_pct", "durable_read": "durable_read"}
+    key = {"read": "read", "write": "write", "non_agent": "non_agent_pct", "durable_read": "durable_read",
+           "durable_one_call": "durable_one_call"}
     lines = ["| what | threshold | measured (median) | verdict |", "|---|---|---|---|"]
     for label, part, field, unit in rows:
         value, limit = result[part][field], THRESHOLDS[key[part]]

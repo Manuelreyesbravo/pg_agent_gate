@@ -2,7 +2,7 @@
    "name": "pg_agent_gate",
    "abstract": "Agents propose, PostgreSQL decides: a native gate between LLM agents and the database",
    "description": "An LLM agent connected to PostgreSQL today usually goes through an MCP server that hands it tools and runs whatever it asks. pg_agent_gate inverts that inside the database. An agent does not run SQL: it has six verbs -- discover what it may touch (derived from the live catalog and its own privileges), propose one statement, dry_run it to see the exact effect with the before and after of every row, commit it, read its own acts, and ask whoami. PostgreSQL verifies every proposal against itself before anything runs: its own parser (exactly one statement), its own planner through EXPLAIN (every table, column, type and function resolves, nothing executes), the kind of statement against what the agent may do. It then executes with the agent's own privileges inside a subtransaction and keeps or undoes it: a row limit, deferred constraints fired inside the gate, and bound assertions from pg_living_assertions that must still hold after the change. Every proposal and every execution is recorded append-only, including what was checked and why something was refused. The part plain SQL cannot do is why this is an extension with a shared library: in a session that belongs to an agent, parser and executor hooks refuse everything except the verbs -- direct DML, DO blocks, CALL, PREPARE, EXPLAIN ANALYZE, COPY, cursors, writing CTEs, foreign functions next to a verb or as its argument, and direct access to the record. Verified, not claimed: make verify runs 164 checks -- the hand-written suites, attacks on purpose, each judged from a superuser's side of the database -- and passes in a fresh container that only gets the repository. An LLM proposing through the gate against a two-tenant database found two holes (a CTE that writes dodged max_rows; set_config() inside a proposal moved the tenant), and 0.2.1 closes both; 0.2.2 and 0.2.3 then closed an amplification class the same shape -- a cascading foreign key that crossed tenants, a trigger, a rule, an opaque function -- whose regressions run on every push via make fuzz (teeth plus a differential max_rows oracle), not under make verify. 0.2.4 refuses a utility a function reaches from inside the verified statement (a TRUNCATE a CHECK fires, which pg_stat_xact does not count). Measured with make bench against an identical role that is not an agent: 0.93 ms extra per read act and 1.8 ms per kept write (the gate's own work in the server is 0.48 ms; most of the rest is writing the record), and 0.24% throughput lost by sessions that are not agents.",
-   "version": "0.2.4",
+   "version": "0.2.5",
    "maintainer": [
       "Manuel Reyes <manuelreyesbravo@gmail.com>"
    ],
@@ -12,7 +12,7 @@
          "abstract": "Agents propose, PostgreSQL verifies, runs and records -- and an agent session cannot do anything else",
          "file": "src/lib.rs",
          "docfile": "README.md",
-         "version": "0.2.4"
+         "version": "0.2.5"
       }
    },
    "prereqs": {

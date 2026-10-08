@@ -396,6 +396,67 @@ mod tests {
         let w = crate::verbs::whoami().0;
         assert_eq!(w["attempt_durability"], "fast", "{w}");
         assert_eq!(w["enforced"], true, "{w}");
+        assert!(
+            w["verbs"].as_array().is_some_and(|v| v.iter().any(|x| x == "propose_and_commit")),
+            "whoami does not list the one-call verb: {w}"
+        );
+    }
+
+    /// propose_and_commit is propose followed by commit, in one transaction: the read runs,
+    /// and the record holds BOTH rows -- the proposal and its execution -- tied together.
+    #[pg_test]
+    fn a_one_call_read_runs_and_records_both_rows() {
+        Spi::run("create table gate_o (id int primary key, n int)").unwrap();
+        Spi::run("insert into gate_o select g, g * 10 from generate_series(1, 3) g").unwrap();
+        let r = crate::verbs::propose_and_commit(
+            "select id, n from gate_o where n > $1::int order by id",
+            "list big ones in one call",
+            Some(vec![Some("10".into())]),
+        )
+        .0;
+        assert_eq!(r["outcome"], "read", "{r}");
+        assert_eq!(r["commit"]["rows_returned"], 2, "{r}");
+        assert_eq!(r["commit"]["rows"][0]["n"], 20, "{r}");
+        let p = id(&r["proposal"]);
+        assert_eq!(r["commit"]["proposal"], p, "the execution is not tied to its proposal: {r}");
+        let recorded: Option<i64> = Spi::get_one(&format!(
+            "select count(*) from agent_gate_internal.executions where proposal = {p} and mode = 'commit'"
+        ))
+        .unwrap();
+        assert_eq!(recorded, Some(1), "the execution of a one-call act was not recorded");
+    }
+
+    /// A statement that does not verify never reaches execute: no commit, nothing changed,
+    /// and the refused proposal is still in the record.
+    #[pg_test]
+    fn a_one_call_act_refused_at_propose_runs_nothing() {
+        Spi::run("create table gate_q (id int primary key)").unwrap();
+        Spi::run("insert into gate_q select generate_series(1, 3)").unwrap();
+        for sql in ["drop table gate_q", "with d as (delete from gate_q returning 1) select count(*) from d", "selec 1"] {
+            let r = crate::verbs::propose_and_commit(sql, "something that must not run", None).0;
+            assert_eq!(r["outcome"], "refused_at_propose", "{sql}: {r}");
+            assert!(r["commit"].is_null(), "{sql} reached execute: {r}");
+            assert_eq!(r["proposal"]["ok"], false, "{sql}: {r}");
+        }
+        let left: Option<i64> = Spi::get_one("select count(*) from gate_q").unwrap();
+        assert_eq!(left, Some(3), "a refused one-call act changed rows");
+    }
+
+    /// The guards are commit's own: a write over the row limit aborts and keeps nothing,
+    /// and a write within it is kept.
+    #[pg_test]
+    fn a_one_call_write_has_the_guards_of_commit() {
+        Spi::run("create table gate_w (id int primary key, plan text not null)").unwrap();
+        Spi::run("insert into gate_w select g, 'free' from generate_series(1, 1500) g").unwrap();
+        let over = crate::verbs::propose_and_commit("update gate_w set plan = 'pro'", "upgrade everyone", None).0;
+        assert_eq!(over["outcome"], "aborted", "{over}");
+        let untouched: Option<i64> = Spi::get_one("select count(*) from gate_w where plan = 'free'").unwrap();
+        assert_eq!(untouched, Some(1500), "an aborted one-call write kept rows");
+
+        let one = crate::verbs::propose_and_commit("update gate_w set plan = 'pro' where id = 1", "upgrade one", None).0;
+        assert_eq!(one["outcome"], "kept", "{one}");
+        let kept: Option<String> = Spi::get_one("select plan from gate_w where id = 1").unwrap();
+        assert_eq!(kept.as_deref(), Some("pro"));
     }
 }
 

@@ -194,6 +194,9 @@ attack session "a SELECT whose CTE writes" "" \
 attack session "a verb argument that calls a function" "" \
     agent -c "select agent_gate.propose(pg_read_file('/etc/hostname'), 'read a file through an argument')"
 
+attack session "the one-call verb with an argument that calls a function" "" \
+    agent -c "select agent_gate.propose_and_commit(pg_read_file('/etc/hostname'), 'read a file through an argument')"
+
 attack session "a subselect of what it was not granted" "$SECRET" \
     agent -c "select (select string_agg(clave, ',') from secretos)"
 
@@ -233,43 +236,54 @@ expect session "a replication connection never gets that far" "WAL sender" \
 # because while a proposal runs the gate's own SQL is allowed by design. The SQL
 # travels dollar-quoted so that quoting an attack is not an attack on the quoting.
 
-propose_and_commit() {
+# Every attack goes through BOTH ways an agent can act: propose then commit (two calls), and
+# propose_and_commit (one call, one transaction). The second runs commit's own checks, and this
+# is where that is measured instead of assumed.
+two_calls() {
     local sql=$1 intent=$2 out id
     out=$(agent -c "select agent_gate.propose(\$s\$$sql\$s\$, \$i\$$intent\$i\$)")
     id=$(proposal_id "$out")
     printf '%s | %s' "$out" "$(agent -c "select agent_gate.commit(${id:-0})")"
 }
+one_call() {
+    local sql=$1 intent=$2
+    agent -c "select agent_gate.propose_and_commit(\$s\$$sql\$s\$, \$i\$$intent\$i\$)"
+}
+attack_both() {  # <what> <sql> <intent>
+    attack proposal "$1" "" two_calls "$2" "$3"
+    attack proposal "$1 -- in one call" "" one_call "$2" "$3"
+}
 
-attack proposal "two statements in one proposal" "" \
-    propose_and_commit "select 1; update clientes set plan = 'hacked' where id = 1" "two at once"
+attack_both "two statements in one proposal" \
+    "select 1; update clientes set plan = 'hacked' where id = 1" "two at once"
 
-attack proposal "a second statement hidden after a comment" "" \
-    propose_and_commit "select 1; -- looks like the end
+attack_both "a second statement hidden after a comment" \
+    "select 1; -- looks like the end
 update clientes set plan = 'hacked' where id = 2" "hidden after a comment"
 
-attack proposal "DDL from an agent that was not allowed DDL" "" \
-    propose_and_commit "create table agent_gate_adv_ddl (x int)" "make myself a table"
+attack_both "DDL from an agent that was not allowed DDL" \
+    "create table agent_gate_adv_ddl (x int)" "make myself a table"
 
-attack proposal "COPY TO PROGRAM as a proposal" "" \
-    propose_and_commit "copy clientes to program 'touch $MARKER'" "reach the shell"
+attack_both "COPY TO PROGRAM as a proposal" \
+    "copy clientes to program 'touch $MARKER'" "reach the shell"
 
-attack proposal "SELECT INTO as a proposal" "" \
-    propose_and_commit "select * into agent_gate_adv_into from clientes" "copy the table"
+attack_both "SELECT INTO as a proposal" \
+    "select * into agent_gate_adv_into from clientes" "copy the table"
 
-attack proposal "SELECT FOR UPDATE beyond max_rows" "" \
-    propose_and_commit "select * from clientes for update" "lock every row"
+attack_both "SELECT FOR UPDATE beyond max_rows" \
+    "select * from clientes for update" "lock every row"
 
-attack proposal "a write that touches more rows than max_rows" "" \
-    propose_and_commit "update clientes set plan = 'hacked'" "upgrade everyone"
+attack_both "a write that touches more rows than max_rows" \
+    "update clientes set plan = 'hacked'" "upgrade everyone"
 
 # The same write hidden in a CTE, under a statement that returns ONE row. max_rows counted
 # the rows of the outer statement, so this touched all three customers under a limit of
 # two (found by the cycle harness of yggdrasil, 2026-10-06). Two shapes of it.
-attack proposal "a CTE that writes, under a SELECT that returns one row" "" \
-    propose_and_commit "with d as (update clientes set plan = 'hacked' returning 1) select count(*) from d" \
+attack_both "a CTE that writes, under a SELECT that returns one row" \
+    "with d as (update clientes set plan = 'hacked' returning 1) select count(*) from d" \
     "upgrade everyone, counted as one row"
-attack proposal "a CTE that writes, under a SELECT that does not even read it" "" \
-    propose_and_commit "with d as (update clientes set plan = 'hacked' returning 1) select 1" \
+attack_both "a CTE that writes, under a SELECT that does not even read it" \
+    "with d as (update clientes set plan = 'hacked' returning 1) select 1" \
     "upgrade everyone, counted as one row"
 
 # A verification is a statement about the database at a moment. The TTL is SUSET,
@@ -317,6 +331,17 @@ expect control "and the world really changed" "upgraded" \
 expect control "committing the same proposal twice is refused" "already committed" \
     "$(agent -c "select agent_gate.commit(${write_id:-0})")"
 expect control "acts tells the agent its own history" "upgrade customer 1" \
+    "$(agent -c 'select agent_gate.acts(500)')"
+
+# The one-call verb, from a real agent session: a read returns rows, a write is kept and the
+# world really changes, and both land in the agent's history.
+expect control "a read in one call returns rows" '"outcome": "read"' \
+    "$(one_call "select id, plan from clientes order by id" "list the customers in one call")"
+expect control "a write in one call is kept" '"outcome": "kept"' \
+    "$(one_call "update clientes set plan = 'one call' where id = 3" "upgrade customer 3 in one call")"
+expect control "and the world really changed" "one call" \
+    "$(su -c 'select plan from clientes where id = 3')"
+expect control "acts shows the one-call act" "upgrade customer 3 in one call" \
     "$(agent -c 'select agent_gate.acts(500)')"
 
 echo "session: $session, proposal: $proposal, control: $control"

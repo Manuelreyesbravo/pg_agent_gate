@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.2.5 -- unreleased
+
+A seventh verb, so a durable act pays one flush instead of two.
+
+* **`propose_and_commit(sql, intent[, params])`: propose + commit in one call (schema change:
+  `pg_agent_gate--0.2.4--0.2.5.sql`).** With `attempt_durability = durable` every record pays its
+  own flush, and an act is two records in two transactions: counted from `pg_stat_io`, exactly
+  2.00 WAL fsyncs per act, so a durable act costs mostly the disk's flushes. The new verb writes
+  the proposal and its execution in ONE transaction: 1.00 fsync per act. Measured on the same
+  btrfs NVMe in two states the same day (20 clean rounds each, interleaved, PostgreSQL 19beta2
+  without assertions): with `fdatasync` at 0.88 ms, 2.65 -> 1.68 ms (-36.7% [35.0..38.0]); with it
+  at 3.9 ms under sustained I/O, 10.86 ms [95% CI 9.30..12.56] -- straddling the 10 ms criterion
+  -> 5.06 ms [4.87..5.36], under it with the whole interval (-53.4% [44.3..60.0]).
+  It is `propose` then `commit`, not a shortcut: the same `execute`, so the statement is verified
+  at propose and again at execution, under the same row limit, backstop, assertions and record.
+  What it gives up is the `dry_run` in between, and -- one transaction cuts both ways -- a call
+  cancelled or failing outside the gate's subtransaction leaves neither row, where two calls
+  would have kept the proposal (the server log keeps the verdict). The two-call flow is unchanged.
+* **`tests/flushes.sh` (new suite in `make verify`)** counts the WAL flushes an act pays instead
+  of inferring them from a timing: fast read 0, any kept change 1, durable two calls 2, durable one
+  call 1 -- reads and kept writes, two calls and one. The durable two-call case is the control of
+  the instrument: blind to this backend's fsyncs, it would read 0 there and fail.
+* **Every attack in `tests/adversarial.sh` that goes through `propose` now also goes through
+  `propose_and_commit`**, judged the same way, by the world a superuser reads afterwards; plus a
+  session attack (a function as its argument) and four controls. `tests/fuzz.py` sends every
+  generated input through it as well, under the same oracles, and adds its own: a proposal that
+  did not verify never reaches execution.
+* **`tests/upgrade.sh` now compares the upgraded schema with a fresh install**, function by
+  function (arguments, result, strictness, volatility), and an agent registered before the
+  upgrade uses the new verb. The first version of that comparison passed an upgrade script that
+  forgot the verb: both sides returned the same ERROR (`text || "char"` is ambiguous) and two
+  equal errors compared equal. Caught by its negative control; the check now needs the fresh
+  side to be a real list that names this version's verb, and the control was run both ways.
+* `make bench` has a fifth row, the durable read act in one call, with the same 10 ms threshold
+  declared before it was measured; the README's table is one clean run of all five (the run
+  before it was flagged by the calibration sentinel and repeated), and the section now shows the
+  durable act on a fast and a slow disk, because that number is mostly the disk's. A cost
+  measured on an `--enable-cassert` build (pgrx's own instance) is not comparable: it inflates
+  every row.
+
 ## 0.2.4 -- 2026-10-08
 
 A runtime fix for an uncounted write reached through an unseen function, plus test and docs

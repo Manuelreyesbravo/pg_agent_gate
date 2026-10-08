@@ -514,6 +514,7 @@ select jsonb_build_object(
                        || '#'
                        || coalesce((select string_agg(j::text, '|' order by nspname, proname) from funcs), '')),
     'how', 'propose(sql, intent[, params]) -> dry_run(proposal) -> commit(proposal). '
+           || 'propose_and_commit(sql, intent[, params]) does propose + commit in one call (no dry_run between). '
            || 'Parameters travel as text: cast them in the SQL ($1::int).'
 )
 "#;

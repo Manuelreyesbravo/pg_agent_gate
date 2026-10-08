@@ -25,7 +25,7 @@ A small, free model operating it live, verified end to end:
 
 **Contents:** [See it in one minute](#see-it-in-one-minute) ·
 [Verify it yourself](#verify-it-yourself) · [How it works](#how-it-works) ·
-[The six verbs](#the-six-verbs) · [Setup](#setup) ·
+[The seven verbs](#the-seven-verbs) · [Setup](#setup) ·
 [Run the two side by side](#run-the-two-side-by-side) ·
 [The pipe: what JSON costs](#the-pipe-what-json-costs) ·
 [A client that only speaks MCP](#for-a-client-that-only-speaks-mcp-a-shim-with-no-power) ·
@@ -160,13 +160,14 @@ The model decides; the server obeys. Every guarantee lives in that server's
 code, outside the database, and the database never learns what was checked.
 
 `pg_agent_gate` moves the decision into PostgreSQL. An agent does not run SQL.
-It has six verbs, and in a session that belongs to an agent **it cannot do
+It has seven verbs, and in a session that belongs to an agent **it cannot do
 anything else** -- not `DELETE`, not `DO`, not `COPY`, not `PREPARE`. The
 database verifies every proposal against itself, runs it with the agent's own
 privileges, and keeps the record.
 
 ```
 discover  ->  propose  ->  dry_run  ->  commit
+          ->  propose_and_commit           (both in one call)
                                          acts, whoami
 ```
 
@@ -204,7 +205,7 @@ Anything else, from that session:
 => delete from clientes where id > 0;
 ERROR:  pg_agent_gate: this session belongs to agent "billing": it proposes, it does not execute
 DETAIL:  DELETE does not reach the database from an agent session
-HINT:  Call agent_gate.propose(sql, intent), then agent_gate.dry_run(proposal) or agent_gate.commit(proposal).
+HINT:  Call agent_gate.propose(sql, intent), then agent_gate.dry_run(proposal) or agent_gate.commit(proposal) -- or agent_gate.propose_and_commit(sql, intent) for both in one call.
 ```
 
 ## Run the two side by side
@@ -220,7 +221,7 @@ may touch, every check with its verdict, and the exact before/after of the
 change, *before* anything is kept. The piece you take out returned a result; the
 piece in its place returns a decision you can see.
 
-## The six verbs
+## The seven verbs
 
 | verb | does |
 |---|---|
@@ -228,6 +229,7 @@ piece in its place returns a decision you can see.
 | `propose(sql, intent, params)` | verifies one statement and records it. Runs nothing |
 | `dry_run(proposal)` | runs it inside a subtransaction and rolls it back: rows touched, before/after of every row of a write, whether bound assertions would still hold |
 | `commit(proposal)` | verifies again, runs it and keeps it if every guard agrees. A proposal is committed at most once |
+| `propose_and_commit(sql, intent, params)` | `propose` then `commit` in ONE call, so in one transaction: the same checks (verified at propose and again at execution), the same record, one commit instead of two. No `dry_run` in between -- for a statement whose effect the agent has already seen, or a read. Returns `{outcome, proposal, commit}`; a statement that does not verify never reaches execution (`refused_at_propose`, `commit` null) |
 | `acts(max_acts)` | what this agent proposed and did, with every execution and why anything was refused |
 | `whoami()` | which agent this session is, whether the gate is enforced in it, and how durable attempts are |
 
@@ -308,7 +310,12 @@ its history; an agent calling those functions by name is refused by the hook.
   read, a refusal, anything that changed no data -- rides on an asynchronous
   commit. A server crash inside the WAL writer's window can lose the record of
   an attempt that changed nothing. (pgaudit's log is not fsynced either.)
-* **`durable`:** every record pays its own flush.
+* **`durable`:** every record pays its own flush -- so `propose` + `commit` pay
+  two, and `propose_and_commit` pays **one**: the proposal and its execution ride
+  on the same commit. Counted, not inferred: `tests/flushes.sh` reads the WAL
+  fsyncs of client backends from `pg_stat_io` around 50 acts of every kind, and
+  gets exactly 2.00 and 1.00 per act (0.00 for a fast read, 1.00 for any kept
+  change).
 
 Never relaxed in a transaction that had already written something before the
 first verb ran: those writes are not the gate's to relax.
@@ -359,8 +366,8 @@ the same. You do not need an MCP server, and that is the point: the piece that
 used to hold the connection and run what the model asked is gone.
 
 For a client that only speaks MCP, `gated-mcp/` fills the gap without bringing
-that power back. It is a small Bun + Hono server exposing the six verbs as six
-MCP tools over Streamable HTTP, and it connects **as the agent role**, so it is
+that power back. It is a small Bun + Hono server exposing six of the verbs as six
+MCP tools (`propose_and_commit`, added in 0.2.5, is not exposed there yet) over Streamable HTTP, and it connects **as the agent role**, so it is
 not where the gate lives -- replace it with anything and it still can only call
 the verbs. It is a compatibility layer, not the product. Six tools, never one
 per table: what the agent may touch comes from `discover`.
@@ -417,7 +424,7 @@ not just asserted.
 MCP is JSON-RPC, and JSON has no 64-bit integer, no exact decimal and no binary.
 An agent that reaches the database through it moves its data over that pipe; one
 that reaches the gate over a native connection does not. The gate's guarantee is
-identical either way -- the same six verbs, the same verification -- so what you
+identical either way -- the same verbs, the same verification -- so what you
 weigh is the pipe. `make transfer` measures it on a replica of a real workload
 (a 64-bit id, exact money, binary, arrays, nested documents, at volume):
 
@@ -452,9 +459,9 @@ declared before the code that it measures.
 | invented proposals refused at `propose`: missing table/column/function, wrong literal type, operator without a type, unbound parameter, hidden second statement, broken syntax, transaction control, DDL without permission | 100% | **17 of 17, no side effect** |
 | **control**: correct proposals pass and do exactly what they say | 100% | **10 of 10** |
 | **control**: a kept change survives an immediate shutdown (no checkpoint) with its proposal and its execution | 100% | **10 of 10** |
-| every channel a session can type, tried on purpose (`tests/adversarial.sh`): two statements in one query, `PREPARE`/`EXECUTE`, a cursor, `COPY TO`/`FROM PROGRAM`, `DO`, `CALL`, `EXPLAIN ANALYZE`, `CREATE TABLE`/`FUNCTION`, `SELECT INTO`, a writing CTE, a function as a verb argument, a subselect of what it was not granted, `SET ROLE`, `SET SESSION AUTHORIZATION`, `RESET ALL`, `DISCARD ALL`, `VACUUM`, `CHECKPOINT`, `LISTEN`/`NOTIFY`, `lo_export`, and a replication connection | 0 | **0 of 22 had any effect** |
-| what can be slipped past `propose` (`tests/adversarial.sh`): two statements, a second one hidden after a comment, DDL without permission, `COPY TO PROGRAM`, `SELECT INTO`, `FOR UPDATE` and a write beyond `max_rows`, an expired verification, another agent's proposal | 0 | **0 of 9** |
-| **control**: an agent still runs `whoami`, `discover`, proposes, sees before/after in `dry_run`, commits a read and a write, is refused a second commit, and reads its `acts` | 100% | **11 of 11** |
+| every channel a session can type, tried on purpose (`tests/adversarial.sh`): two statements in one query, `PREPARE`/`EXECUTE`, a cursor, `COPY TO`/`FROM PROGRAM`, `DO`, `CALL`, `EXPLAIN ANALYZE`, `CREATE TABLE`/`FUNCTION`, `SELECT INTO`, a writing CTE, a function as a verb argument, a subselect of what it was not granted, `SET ROLE`, `SET SESSION AUTHORIZATION`, `RESET ALL`, `DISCARD ALL`, `VACUUM`, `CHECKPOINT`, `LISTEN`/`NOTIFY`, `lo_export`, a function as the argument of `propose_and_commit`, and a replication connection | 0 | **0 of 24 had any effect** |
+| what can be slipped past `propose` (`tests/adversarial.sh`): two statements, a second one hidden after a comment, DDL without permission, `COPY TO PROGRAM`, `SELECT INTO`, `FOR UPDATE` and a write beyond `max_rows`, two writing CTEs under a `SELECT`, an expired verification, another agent's proposal -- and each of the first nine again through `propose_and_commit` | 0 | **0 of 20** |
+| **control**: an agent still runs `whoami`, `discover`, proposes, sees before/after in `dry_run`, commits a read and a write, is refused a second commit, and reads its `acts`; in one call, reads rows and keeps a write that shows in `acts` | 100% | **15 of 15** |
 | garbage into `propose` and `commit` (`tests/hostile.sh`): malformed SQL, unbalanced parentheses, an unterminated comment and dollar quote, a NUL byte, 500 levels of nesting, 100 KB of SQL, 500 parameters, fewer parameters than placeholders, a type that does not exist, invalid UTF-8, a 10 KB identifier, an empty proposal, ids that do not exist, an endless query | 0 crashes | **0 of 16, same postmaster** |
 | the record rewritten (`tests/hostile.sh`): `DELETE`, `TRUNCATE`, disabling the triggers and dropping them, as the agent and as the owner | 0 | **0 of 7** |
 | the world moved between `propose` and `commit` (`tests/hostile.sh`): table renamed, column dropped, privilege revoked, row gone, a bound assertion broken meanwhile, two sessions at once, and the same proposal committed twice at once | 100% | **9 of 9** |
@@ -507,18 +514,40 @@ alternating which goes first. The thresholds were declared before the code.
 
 | what | threshold | measured (median) |
 |---|---|---|
-| extra time per read act (`propose` + `commit`) over the same query directly | <= 10 ms | **0.93 ms** (p25 0.828, p75 0.953) |
-| extra time per kept write over the same `UPDATE` directly, which pays its own durable commit | <= 5 ms | **1.807 ms** (p25 1.746, p75 1.911) |
-| throughput lost by sessions that are **not** agents when the library is preloaded (`pgbench -S`, 7 alternating pairs of 15 s) | <= 3% | **0.24%** |
-| extra time per read act with `attempt_durability = durable` | <= 10 ms | **2.587 ms** (p25 2.508, p75 2.771) |
+| extra time per read act (`propose` + `commit`) over the same query directly | <= 10 ms | **0.962 ms** |
+| extra time per kept write over the same `UPDATE` directly, which pays its own durable commit | <= 5 ms | **1.366 ms** |
+| throughput lost by sessions that are **not** agents when the library is preloaded (`pgbench -S`, 7 alternating pairs of 15 s) | <= 3% | **1.75%** |
+| extra time per read act with `attempt_durability = durable` | <= 10 ms | **2.821 ms** |
+| the same durable read act in ONE call (`propose_and_commit`) | <= 10 ms | **1.694 ms** |
 
 **Where the time goes.** Of the ~1 ms a read act takes end to end, the gate's
 own work inside the server -- parse, plan, the amplification and function checks,
 run, decide -- is about 0.48 ms. Most of the rest is the record: every act is a
 proposal and an execution written to append-only tables, in their own commits.
 That is not overhead to optimize away; it is what makes an agent's actions
-auditable. With `durable` every one of those records pays its own flush, which is
-the 2.6 ms.
+auditable. With `durable` every one of those records pays its own flush, and a
+flush is the disk: `propose` + `commit` pay two, `propose_and_commit` writes both
+records in one commit and pays one (counted by `tests/flushes.sh`). A durable act
+costs about the gate's own work plus one or two flushes, so its number is mostly
+the disk's.
+
+**The same disk, two states, the same day.** The table above ran with `fdatasync`
+at 0.79 ms (`pg_test_fsync` on the data directory). Hours earlier, under sustained
+I/O from other work on the machine, the same disk took 3.9-5.1 ms per flush.
+Sampled both times as 20 clean rounds of 300 pairs (CCX-pinned lane, calibration
+before and after every round, the two ways interleaved):
+
+| durable read act | fast disk (0.88 ms per flush) | slow disk (3.9 ms per flush) |
+|---|---|---|
+| two calls (`propose` + `commit`) | 2.65 ms [95% CI 2.62..2.67] | 10.86 ms [95% CI 9.30..12.56] -- crosses the threshold |
+| one call (`propose_and_commit`) | 1.68 ms [95% CI 1.65..1.72] | 5.06 ms [95% CI 4.87..5.36] |
+| one call vs two | -36.7% [95% CI -38.0..-35.0] | -53.4% [95% CI -60.0..-44.3] |
+
+With a healthy disk both ways are far under the threshold; with a slow one the
+two-call act straddles it and the one-call act stays under it with its whole
+interval. The disk has no calibration of its own -- fsync latency is not what the
+sentinel measures -- so a durable number is only as good as the disk it was taken
+on: measure yours.
 
 These numbers are on a small schema. Two of the checks scale with the catalog: the
 commit backstop reads `pg_stat_xact_user_tables` (twice per kept write), and
@@ -527,16 +556,15 @@ of tables, expect the per-act cost to grow; re-run `make bench` against your own
 rather than trust these.
 
 **Every pair of the throughput test**, because a median hides how noisy one
-pair is. Loss with the library preloaded, in %: `0.42`, `1.71`, `0.4`, `-0.37`,
-`0.24`, `-21.07`, `-0.75`. One 15-second `bare` run hiccuped -- that -21% is its
-own throughput dropping, not the gate making anything faster -- which is exactly
-why the criterion is the median of several pairs and not any one run: an earlier,
-uncontrolled run of this same test reported
-3.16% and failed the criterion, and both it and an older 0.43% fall inside this
-spread.
+pair is. Loss with the library preloaded, in %: `8.28`, `-3.4`, `1.75`, `-7.57`,
+`2.25`, `1.65`, `1.99`. Single 15-second runs hiccup in both directions -- a -7.6%
+is a `bare` run dropping, not the gate making anything faster -- which is exactly
+why the criterion is the median of several pairs and not any one run: earlier runs
+of this same test reported 0.24%, 0.43%, 0.83% and, uncontrolled, 3.16%.
 
-Measured on PostgreSQL 19beta2 built without assertions, AMD Ryzen AI 9 HX 370,
-data directory on Btrfs, `fsync` and `synchronous_commit` on, with the benchmark
+Measured on 2026-10-08 on PostgreSQL 19beta2 built without assertions (an
+`--enable-cassert` build, such as pgrx's own instance, inflates every number here),
+AMD Ryzen AI 9 HX 370, data directory on Btrfs, `fsync` and `synchronous_commit` on, with the benchmark
 pinned to its own cores and a calibration run before and after to reject any
 measurement taken while the machine was contended. Your numbers will differ;
 `make bench` writes them to `target/bench/result.json`.
@@ -593,7 +621,7 @@ read a definer function's body or re-decide what a view may show.
 
 **What the gate guarantees against it**, each with a suite above:
 
-* nothing the session types executes except the six verbs;
+* nothing the session types executes except the seven verbs;
 * a proposal runs only after PostgreSQL's parser, planner, analyzer and
   rewriter accept it as one statement of a kind the agent may run;
 * a write that touches more than `max_rows` rows, or breaks a bound assertion,
@@ -739,8 +767,11 @@ Said here so nobody learns it the hard way:
   marked `IMMUTABLE` could run at `propose`. Marking functions honestly is a
   prerequisite.
 * **The record is transactional.** Inside an explicit transaction that the
-  caller rolls back, the record rolls back too. Every verdict is also written
-  to the server log, which does not.
+  caller rolls back, the record rolls back too; so does a `propose_and_commit`
+  that is cancelled, or that fails outside the gate's own subtransaction, where
+  `propose` + `commit` would have kept the proposal. Every verdict is also written
+  to the server log, which does not roll back -- the verdict (agent, proposal id,
+  kind, outcome), not the statement: with parameters, the log shows `$1`.
 * **Parameters travel as text.** Cast them in the SQL (`$1::int`).
 * **User-defined casts** around a verb's arguments are allowed, like any cast.
   Creating a cast already needs ownership of the types.

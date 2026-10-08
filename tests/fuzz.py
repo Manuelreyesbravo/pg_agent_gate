@@ -657,6 +657,33 @@ def main():
     danger_sqlstate = Counter()   # SQLSTATE of aborted dangerous-function commits: 42501
                                   # (insufficient_privilege) is the win, 57014 a timeout
     danger_kept = []              # a dangerous FUNCTION that APPLIED a change -- a real escape
+    one_call = Counter()          # outcomes of propose_and_commit, the one-call way to act
+
+    def judge(cres, payload, safe_before, rows_before, via, counter):
+        """The oracles of an executed proposal, the SAME for both ways of acting (propose then
+        commit, or propose_and_commit): what the superuser sees afterwards, never the gate's
+        own numbers."""
+        if isinstance(cres, dict):   # an outcome rather than a raise
+            oc = cres.get("outcome", "?")
+            counter[oc] += 1
+            if DANGER_FN_RE.search(payload):
+                danger_outcomes[oc] += 1
+                if oc == "kept":                 # a dangerous function applied a change: ESCAPE
+                    danger_kept.append(f"dangerous function applied a change ({via}): " + payload)
+                elif oc == "aborted":
+                    err = cres.get("error")
+                    ss = err.get("sqlstate") if isinstance(err, dict) else None
+                    if ss:
+                        danger_sqlstate[ss] += 1
+        if safe_fp() != safe_before:   # a committed proposal must never touch catalog/role/tenant 2
+            protected.append(f"commit changed protected state ({via}): " + payload)
+        # MEASURE how many rows actually changed, from the superuser's snapshot -- never trust
+        # cres["rows_affected"], the gate's own number (the 0.2.1 CTE reported 1, deleted 8).
+        moved = rows_changed(rows_before, row_state())
+        if moved > MAX_ROWS:   # the max_rows guarantee, checked against what the database shows
+            said = cres.get("rows_affected") if isinstance(cres, dict) else None
+            over_rows.append(f"commit changed {moved} rows (gate reported {said}), over {MAX_ROWS} ({via}): " + payload)
+
     for i in range(ITERS):
         payload = gen()
 
@@ -712,27 +739,33 @@ def main():
                 reconnects += 1; reconnect()
             except (psycopg.Error, Exception):
                 pass
-            if isinstance(cres, dict):   # commit() returned an outcome rather than raising
-                oc = cres.get("outcome", "?")
-                outcomes[oc] += 1
-                if DANGER_FN_RE.search(payload):
-                    danger_outcomes[oc] += 1
-                    if oc == "kept":                 # a dangerous function applied a change: ESCAPE
-                        danger_kept.append("dangerous function applied a change: " + payload)
-                    elif oc == "aborted":
-                        err = cres.get("error")
-                        ss = err.get("sqlstate") if isinstance(err, dict) else None
-                        if ss:
-                            danger_sqlstate[ss] += 1
-            if safe_fp() != safe_before:   # a committed proposal must never touch catalog/role/tenant 2
-                protected.append("commit changed protected state: " + payload)
-            # MEASURE how many rows actually changed, from the superuser's snapshot -- never trust
-            # cres["rows_affected"], the gate's own number (the 0.2.1 CTE reported 1, deleted 8).
-            moved = rows_changed(rows_before, row_state())
-            if moved > MAX_ROWS:   # the max_rows guarantee, checked against what the database shows
-                said = cres.get("rows_affected") if isinstance(cres, dict) else None
-                over_rows.append(f"commit changed {moved} rows (gate reported {said}), over {MAX_ROWS}: " + payload)
+            judge(cres, payload, safe_before, rows_before, "two calls", outcomes)
             run_schema(); baseline = full_fp()  # a kept write changed the agent's own tenant; reset
+
+        # 3. The same input through propose_and_commit: one call, one transaction, commit's own
+        #    checks -- so the same oracles, and it must escape exactly as often as step 2: never.
+        #    Its own invariant on top: a proposal that did not verify never reaches execute.
+        safe_before = safe_fp()
+        rows_before = row_state()
+        ores = None
+        try:
+            with agent[0].cursor() as c:
+                ores = c.execute("select agent_gate.propose_and_commit(%s, %s)", (payload, "fuzz one call")).fetchone()[0]
+        except psycopg.OperationalError:
+            reconnects += 1; reconnect()
+        except (psycopg.Error, Exception):
+            pass
+        executed = None
+        if isinstance(ores, dict):
+            executed = ores.get("commit")
+            verified = isinstance(ores.get("proposal"), dict) and ores["proposal"].get("ok") is True
+            if executed is not None and not verified:
+                protected.append("one call executed a proposal that did not verify: " + payload)
+            if executed is None:
+                one_call[ores.get("outcome", "?")] += 1
+        judge(executed, payload, safe_before, rows_before, "one call", one_call)
+        if executed is not None:
+            run_schema(); baseline = full_fp()
 
         if not alive():
             crashes.append(payload); break
@@ -751,6 +784,11 @@ def main():
     print(f"proposals accepted:     {accepted}   committed: {sum(outcomes.values())}")
     print(f"    commit outcomes: kept {outcomes['kept']} · read {outcomes['read']} · "
           f"aborted {outcomes['aborted']} · refused {outcomes['refused']}")
+    print(f"one-call acts (propose_and_commit): {sum(one_call.values())}   executed: "
+          f"{sum(v for k, v in one_call.items() if k != 'refused_at_propose')}")
+    print(f"    one-call outcomes: kept {one_call['kept']} · read {one_call['read']} · "
+          f"aborted {one_call['aborted']} · refused {one_call['refused']} · "
+          f"refused at propose {one_call['refused_at_propose']}")
     if danger_outcomes:
         df = " · ".join(f"{k} {v}" for k, v in sorted(danger_outcomes.items()))
         print(f"    dangerous-function commits: {df}   (a 'kept' is an escape, enforced below)")

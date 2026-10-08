@@ -1,7 +1,7 @@
 // Copyright 2026 Manuel Reyes Bravo
 // SPDX-License-Identifier: Apache-2.0
 
-//! The six verbs. They are the whole surface an agent has.
+//! The seven verbs. They are the whole surface an agent has.
 //!
 //! They replace an MCP server's `tools/list` + `tools/call`, with one
 //! difference that is the point of the extension: the agent never calls
@@ -17,6 +17,8 @@
 //!   that changed data -- is committed asynchronously when the setting is
 //!   `fast` (the default). A server crash inside the walwriter's window can
 //!   lose it. With `durable` every record pays its own flush.
+//! * `propose_and_commit` writes the proposal and its execution in ONE transaction,
+//!   so both ride on one commit: with `durable` the act pays one flush, not two.
 //! * never relaxed in a transaction that had written something before the
 //!   first verb ran: those writes are not the gate's to relax.
 //!
@@ -208,6 +210,44 @@ pub fn discover(filter: default!(Option<&str>, "NULL"), max_objects: default!(i3
 #[pg_extern]
 pub fn propose(sql: &str, intent: &str, params: default!(Option<Vec<Option<String>>>, "NULL")) -> JsonB {
     begin_verb();
+    JsonB(propose_one(sql, intent, params))
+}
+
+/// Propose one statement and, if it verifies, commit it -- in ONE call, so in one
+/// transaction: the proposal and its execution are written by the same commit, and with
+/// `attempt_durability = durable` an act pays one flush instead of two (measured
+/// 2026-10-08: `propose` + `commit` pay exactly 2.00 WAL fsyncs per act, 5.1 ms each on
+/// a btrfs NVMe -- a floor of 10.2 ms before the gate does any work).
+///
+/// It is `propose` followed by `commit`, not a way around them: the statement is verified
+/// here and AGAIN, against the database of that instant, by the same `execute` that
+/// `commit` runs, so the refusals, the row limit, the backstop, the assertions and the
+/// record are the ones `commit` has. What it gives up is the look in between -- there is
+/// no `dry_run` before the change -- so it suits a statement whose effect the agent has
+/// already seen, or a read.
+///
+/// One transaction cuts both ways. A statement cancelled, or an error the gate's own
+/// subtransaction does not catch, leaves neither row in the record, where `propose` +
+/// `commit` would have kept the proposal; the server log keeps the verdict either way.
+/// That is the README's "the record is transactional", applied to a single call.
+#[pg_extern]
+pub fn propose_and_commit(sql: &str, intent: &str, params: default!(Option<Vec<Option<String>>>, "NULL")) -> JsonB {
+    begin_verb();
+    let mut proposal = propose_one(sql, intent, params);
+    let commit = match (proposal["ok"].as_bool(), proposal["proposal"].as_i64()) {
+        (Some(true), Some(id)) => {
+            proposal["next"] = json!("committed in this same call: see commit");
+            execute(id, Mode::Commit)
+        }
+        _ => Value::Null,
+    };
+    let outcome = if commit.is_null() { json!("refused_at_propose") } else { commit["outcome"].clone() };
+    JsonB(json!({ "outcome": outcome, "proposal": proposal, "commit": commit }))
+}
+
+/// The body of `propose`, shared with `propose_and_commit`: verify, record, answer. The
+/// caller has already run `begin_verb`.
+fn propose_one(sql: &str, intent: &str, params: Option<Vec<Option<String>>>) -> Value {
     if intent.trim().chars().count() < 3 {
         error!("pg_agent_gate: say what the proposal is for (intent); it stays in the record");
     }
@@ -235,7 +275,7 @@ pub fn propose(sql: &str, intent: &str, params: default!(Option<Vec<Option<Strin
 
     log!("pg_agent_gate: agent={} proposal={} kind={} ok={}", who.agent, id, kind, verdict.ok);
 
-    JsonB(json!({
+    json!({
         "proposal": id,
         "ok": verdict.ok,
         "kind": verdict.kind.map(|k| k.as_str()),
@@ -247,7 +287,7 @@ pub fn propose(sql: &str, intent: &str, params: default!(Option<Vec<Option<Strin
         } else {
             "fix what failed and propose again"
         },
-    }))
+    })
 }
 
 /// Run the proposal and undo it: the exact effect, before/after of every row,

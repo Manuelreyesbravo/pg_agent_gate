@@ -105,6 +105,37 @@ expect "an agent from before the upgrade still commits" '"outcome": "kept"' \
     "$(agent -c "select agent_gate.commit($(proposal_id "$despues"))")"
 expect "and the change is really there" "despues" "$(su -c 'select texto from libro where id = 2')"
 
+# The upgraded surface must BE the fresh one, not resemble it: every function of the gate's
+# schema -- name, arguments, result, strictness, volatility -- compared with a CREATE EXTENSION of
+# the same version in a database of its own. Checking chosen pieces (above) misses the piece
+# nobody thought of; a verb an upgrade forgot would make every agent of that database fail.
+SURFACE="select string_agg(p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ') -> '
+            || pg_get_function_result(p.oid) || ' strict=' || p.proisstrict::text || ' vol=' || p.provolatile::text,
+            ' ; ' order by p.proname, pg_get_function_identity_arguments(p.oid))
+        from pg_proc p where p.pronamespace = 'agent_gate'::regnamespace"
+FRESH=${DB}_fresh
+claim_database "$FRESH"
+fresh() { "$BIN/psql" -X -U "$SUPERUSER" -d "$FRESH" -tA "$@" 2>&1 || true; }
+made=$(fresh -c "create extension pg_agent_gate")
+fresh_surface=$(fresh -c "$SURFACE")
+upgraded_surface=$(su -c "$SURFACE")
+[[ "$made" == *ERROR* ]] && fresh_surface="(the fresh install failed: $made)"
+# Equal is not enough: two identical ERRORs are equal too, and that is how the first version of
+# this check passed an upgrade that forgot the verb (caught by its negative control, 2026-10-08).
+# The fresh surface must be a real list that names this version's verb.
+if [[ "$fresh_surface" == *"propose_and_commit("* && "$fresh_surface" != *ERROR* ]] \
+    && [ "$fresh_surface" = "$upgraded_surface" ]; then
+    report "the upgraded gate has exactly the functions of a fresh install" yes ""
+else
+    report "the upgraded gate has exactly the functions of a fresh install" no \
+        "fresh: $fresh_surface || upgraded: $upgraded_surface"
+fi
+
+# And the verb this version adds works for an agent registered before it existed.
+expect "an agent from before the upgrade can use propose_and_commit" '"outcome": "kept"' \
+    "$(agent -c "select agent_gate.propose_and_commit(\$s\$update libro set texto = 'una llamada' where id = 1\$s\$, \$i\$one call after the upgrade\$i\$)")"
+expect "and that change is really there" "una llamada" "$(su -c 'select texto from libro where id = 1')"
+
 su -c "truncate agent_gate_internal.executions, agent_gate_internal.proposals" >/dev/null
 expect "TRUNCATE no longer empties the record" "$HISTORIA" \
     "$(su -c "select count(*) || ':' || coalesce(md5(string_agg(id || intent, '|' order by id)), '') from agent_gate_internal.proposals where intent = 'proposed before the upgrade'")"
