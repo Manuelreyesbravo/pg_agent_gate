@@ -493,23 +493,25 @@ alternating which goes first. The thresholds were declared before the code.
 
 | what | threshold | measured (median) |
 |---|---|---|
-| extra time per read act (`propose` + `commit`) over the same query directly | <= 10 ms | **0.269 ms** (p25 0.258, p75 0.285) |
-| extra time per kept write over the same `UPDATE` directly, which pays its own durable commit | <= 5 ms | **0.475 ms** (p25 0.430, p75 0.575) |
-| throughput lost by sessions that are **not** agents when the library is preloaded (`pgbench -S`, 7 alternating pairs of 15 s) | <= 3% | **0.09%** |
-| extra time per read act with `attempt_durability = durable` | <= 10 ms | **2.119 ms** (p25 2.028, p75 2.342) |
+| extra time per read act (`propose` + `commit`) over the same query directly | <= 10 ms | **0.93 ms** (p25 0.828, p75 0.953) |
+| extra time per kept write over the same `UPDATE` directly, which pays its own durable commit | <= 5 ms | **1.807 ms** (p25 1.746, p75 1.911) |
+| throughput lost by sessions that are **not** agents when the library is preloaded (`pgbench -S`, 7 alternating pairs of 15 s) | <= 3% | **0.24%** |
+| extra time per read act with `attempt_durability = durable` | <= 10 ms | **2.587 ms** (p25 2.508, p75 2.771) |
 
-**Where the time goes.** Of the 0.29 ms a read act takes end to end, the gate's
-own work inside the server -- verify, run, decide -- is 0.09 ms. Most of the rest
-is the record: every act is a proposal and an execution written to append-only
-tables, in their own commits. That is not overhead to optimize away; it is what
-makes an agent's actions auditable. With `durable` every one of those records
-pays its own flush, which is the 2.1 ms.
+**Where the time goes.** Of the ~1 ms a read act takes end to end, the gate's
+own work inside the server -- parse, plan, the amplification and function checks,
+run, decide -- is about 0.48 ms. Most of the rest is the record: every act is a
+proposal and an execution written to append-only tables, in their own commits.
+That is not overhead to optimize away; it is what makes an agent's actions
+auditable. With `durable` every one of those records pays its own flush, which is
+the 2.6 ms.
 
 **Every pair of the throughput test**, because a median hides how noisy one
-pair is. Loss with the library preloaded, in %: `0.09`, `5.22`, `-0.37`, `0.87`,
-`-1.06`, `0.56`, `-3.65`. A single 15-second pair on a desktop swings by about
-four points either way. That is why the criterion is the median of several pairs
-and not any one run: an earlier, uncontrolled run of this same test reported
+pair is. Loss with the library preloaded, in %: `0.42`, `1.71`, `0.4`, `-0.37`,
+`0.24`, `-21.07`, `-0.75`. One 15-second `bare` run hiccuped -- that -21% is its
+own throughput dropping, not the gate making anything faster -- which is exactly
+why the criterion is the median of several pairs and not any one run: an earlier,
+uncontrolled run of this same test reported
 3.16% and failed the criterion, and both it and an older 0.43% fall inside this
 spread.
 
