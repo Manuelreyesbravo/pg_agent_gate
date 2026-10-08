@@ -43,6 +43,8 @@
 # FUZZ_FORCE=1. The seed is printed for a clean or local run, but WITHHELD from the public CI
 # output of a run that found a real escape -- there it would be a ready reproducer of a bug that
 # is not yet fixed; reproduce locally instead. Facts are measured by the database, never asserted.
+import hashlib
+import hmac
 import os
 import random
 import re
@@ -53,9 +55,22 @@ import psycopg
 DSN = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("FUZZ_DSN", "")
 AGENT = "fuzz_agent"
 ITERS = int(os.environ.get("FUZZ_ITERS", "3000"))
-SEED = int(os.environ.get("FUZZ_SEED", str(random.randrange(1 << 30))))
-rng = random.Random(SEED)
 IN_CI = bool(os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS"))
+RUN_ID = os.environ.get("GITHUB_RUN_ID", "")
+# Where the seed comes from, in order: an explicit FUZZ_SEED always wins (reproducing a known
+# run). Otherwise, if a repo SECRET (FUZZ_SEED_KEY) and the CI run id are both present, derive the
+# seed as HMAC(secret, run_id): the public log names only the run id, and whoever holds the secret
+# recomputes the exact seed -- so a withheld seed still leaves the MAINTAINER a reproducer, not the
+# public a ready exploit. Failing both, a random seed (printed, since nothing could recompute it).
+_explicit, _key = os.environ.get("FUZZ_SEED"), os.environ.get("FUZZ_SEED_KEY")
+if _explicit:
+    SEED, SEED_SOURCE = int(_explicit), "explicit"
+elif _key and RUN_ID:
+    SEED = int.from_bytes(hmac.new(_key.encode(), RUN_ID.encode(), hashlib.sha256).digest()[:4], "big") & ((1 << 30) - 1)
+    SEED_SOURCE = "hmac"
+else:
+    SEED, SEED_SOURCE = random.randrange(1 << 30), "random"
+rng = random.Random(SEED)
 
 # Statements an agent must never get to run, directly or through propose(). Each is a thing
 # plain SQL can do that the gate exists to stop.
@@ -161,13 +176,16 @@ def gen():
     return bytes(rng.randrange(256) for _ in range(rng.randint(0, 64))).decode("latin-1")
 
 
-# Words whose presence makes an input one the gate MUST refuse at propose. MERGE, UPDATE,
-# DELETE and INSERT are deliberately absent: they are the data changes the gate exists to
-# allow (bounded by max_rows at commit), not refuse.
+# Words whose presence makes an input one the gate MUST refuse at propose. MERGE, UPDATE, DELETE
+# and INSERT are deliberately absent: they are the data changes the gate exists to allow (bounded
+# by max_rows at commit), not refuse. So are "superuser" and "function": gaining superuser or
+# defining a function is always an ALTER, CREATE or DROP -- already listed -- so as bare words they
+# would only match a harmless identifier (a column or alias named "superuser"/"function"), the
+# false positive the parse-tree gate does not make (e.g. `select pg_sleep(10) superuser`).
 DANGER_WORDS = ("drop", "truncate", "alter", "create", "grant", "revoke", "copy", "do ",
                 "call", "prepare", "vacuum", "reindex", "cluster", "comment", "lock",
                 "listen", "notify", "set_config", "set role", "reset", "security",
-                "extension", "pg_read_file", "pg_ls", "function", "superuser")
+                "extension", "pg_read_file", "pg_ls")
 
 
 def looks_dangerous(s):
@@ -358,8 +376,13 @@ def main():
             pass
         agent[0] = psycopg.connect(DSN, user=AGENT, autocommit=True)
 
-    direct_bypass, propose_bypass, crashes = [], [], []
-    reached = client_rejected = reconnects = 0
+    # Escapes, kept in separate buckets so the category survives into the CI summary even when the
+    # inputs are hidden there. propose/commit splits three ways: the word list should have refused,
+    # a commit that moved protected state, and a commit over max_rows (the measured check).
+    # accepted/committed count how much the run actually exercised the two verbs.
+    direct_bypass, crashes = [], []
+    word_miss, protected, over_rows = [], [], []
+    reached = client_rejected = reconnects = accepted = committed = 0
     for i in range(ITERS):
         payload = gen()
 
@@ -399,28 +422,31 @@ def main():
             ok = False; reconnects += 1; reconnect()
         except (psycopg.Error, Exception):
             ok = False
-        if ok and looks_dangerous(payload):
-            propose_bypass.append(payload)
+        if ok:
+            accepted += 1
+            if looks_dangerous(payload):
+                word_miss.append(payload)
 
         if ok and pid is not None:
             safe_before = safe_fp()
             rows_before = row_state()
-            committed = None
+            cres = None
             try:
                 with agent[0].cursor() as c:
-                    committed = c.execute("select agent_gate.commit(%s)", (pid,)).fetchone()[0]
+                    cres = c.execute("select agent_gate.commit(%s)", (pid,)).fetchone()[0]
+                committed += 1
             except psycopg.OperationalError:
                 reconnects += 1; reconnect()
             except (psycopg.Error, Exception):
                 pass
             if safe_fp() != safe_before:   # a committed proposal must never touch catalog/role/tenant 2
-                propose_bypass.append("commit changed protected state: " + payload)
+                protected.append("commit changed protected state: " + payload)
             # MEASURE how many rows actually changed, from the superuser's snapshot -- never trust
-            # committed["rows_affected"], the gate's own number (the 0.2.1 CTE reported 1, deleted 8).
+            # cres["rows_affected"], the gate's own number (the 0.2.1 CTE reported 1, deleted 8).
             moved = rows_changed(rows_before, row_state())
             if moved > MAX_ROWS:   # the max_rows guarantee, checked against what the database shows
-                said = committed.get("rows_affected") if isinstance(committed, dict) else None
-                propose_bypass.append(f"commit changed {moved} rows (gate reported {said}), over the limit of {MAX_ROWS}: " + payload)
+                said = cres.get("rows_affected") if isinstance(cres, dict) else None
+                over_rows.append(f"commit changed {moved} rows (gate reported {said}), over {MAX_ROWS}: " + payload)
             run_schema(); baseline = full_fp()  # a kept write changed the agent's own tenant; reset
 
         if not alive():
@@ -430,23 +456,33 @@ def main():
             run_schema(); baseline = full_fp()
 
         if (i + 1) % 500 == 0:
-            print(f"  {i + 1}/{ITERS}  direct_bypass={len(direct_bypass)} propose_bypass={len(propose_bypass)} crashes={len(crashes)}")
+            pc = len(word_miss) + len(protected) + len(over_rows)
+            print(f"  {i + 1}/{ITERS}  direct={len(direct_bypass)} propose/commit={pc} crashes={len(crashes)}")
 
+    propose_commit = len(word_miss) + len(protected) + len(over_rows)
     print("\n--- result ---")
     print(f"inputs generated:       {ITERS}")
     print(f"reached the server:     {reached}  (rejected by the client, e.g. a NUL byte: {client_rejected})")
+    print(f"proposals accepted:     {accepted}   committed: {committed}")
     print(f"agent reconnections:    {reconnects}")
     print(f"server crashes:         {len(crashes)}")
     print(f"direct-execution escapes: {len(direct_bypass)}")
-    print(f"propose/commit escapes:   {len(propose_bypass)}")
+    print(f"propose/commit escapes:   {propose_commit}")
+    # Per category, so the CI summary shows WHICH oracle fired even though the inputs are hidden.
+    print(f"    word list should have refused:   {len(word_miss)}")
+    print(f"    commit moved protected state:    {len(protected)}")
+    print(f"    commit over max_rows (measured): {len(over_rows)}")
 
     # A public CI log is readable by anyone with a GitHub account, so in CI print only WHICH escape
-    # (its position among those found, not the iteration), never the input -- reproduce it locally.
-    for label, items in (("CRASH", crashes), ("DIRECT ESCAPE", direct_bypass), ("PROPOSE/COMMIT ESCAPE", propose_bypass)):
+    # (its position within its category, never the iteration) and never the input -- the counts
+    # above already carry the category; reproduce an input locally from the seed.
+    categories = (("CRASH", crashes), ("DIRECT ESCAPE", direct_bypass),
+                  ("WORD-LIST MISS", word_miss), ("PROTECTED-STATE", protected), ("OVER-MAX-ROWS", over_rows))
+    for label, items in categories:
         for idx, s in enumerate(items[:10], 1):
             print(f"  {label} {idx} of {len(items)}" + ("" if IN_CI else f": {s!r}"))
 
-    escapes = len(crashes) + len(direct_bypass) + len(propose_bypass)
+    escapes = len(crashes) + len(direct_bypass) + propose_commit
     # Health: did the run actually exercise the gate? The one failure signal is reaching the server
     # too little -- then it proved nothing. Reconnections are NOT a failure: an agent is no
     # superuser and has no pg_signal_backend, so the only backend it can terminate is its own,
@@ -458,23 +494,30 @@ def main():
         print(f"  UNHEALTHY: only {reached}/{ITERS} inputs reached the server")
     healthy = not too_few_reached
 
-    # Reveal the seed unless this is a real-gate run that found an escape in public CI -- there the
-    # seed reproduces an unpatched bug for anyone reading the log, so withhold it and reproduce
-    # locally. A clean run, a local run and the negative control all keep it (harmless provenance).
+    # On a real escape in public CI the SEED is withheld -- printed, it would hand anyone a ready
+    # reproducer of an unfixed bug. The maintainer does not lose the reproducer: an HMAC-derived
+    # seed is recomputed from the run id (named below) with the repo secret; only a random seed has
+    # nothing to recompute it from, and there the fallback is to re-run locally. A clean or local
+    # run, and the negative control, print the seed outright (harmless provenance).
     reveal_seed = not (gate_on and escapes and IN_CI)
     if not gate_on:
         # Negative control: escapes are the PASS; a clean run means the oracle is blind.
         verdict = (f"NEGATIVE CONTROL: {escapes} escape(s) found, as expected" if escapes
                    else "NEGATIVE CONTROL FAILED: no escapes without the gate -- the oracle is blind")
         ok_exit = escapes > 0 and healthy
+    elif escapes == 0:
+        verdict = "CLEAN: nothing escaped"
+        ok_exit = healthy
+    elif reveal_seed:
+        verdict = f"FOUND {escapes} escape(s) -- reproduce with FUZZ_SEED={SEED}"
+        ok_exit = False
+    elif SEED_SOURCE == "hmac":
+        verdict = (f"FOUND {escapes} escape(s) -- seed withheld; recompute it from GITHUB_RUN_ID={RUN_ID} "
+                   "with the repo's FUZZ_SEED_KEY, then FUZZ_SEED=<it> make fuzz")
+        ok_exit = False
     else:
-        if escapes == 0:
-            verdict = "CLEAN: nothing escaped"
-        elif reveal_seed:
-            verdict = f"FOUND {escapes} escape(s) -- reproduce locally with FUZZ_SEED={SEED}"
-        else:
-            verdict = f"FOUND {escapes} escape(s) -- seed withheld in public CI; re-run `make fuzz` locally to reproduce"
-        ok_exit = escapes == 0 and healthy
+        verdict = f"FOUND {escapes} escape(s) -- seed withheld in public CI; re-run `make fuzz` locally"
+        ok_exit = False
     print(f"\n{verdict}" + (f" (seed {SEED})" if reveal_seed else ""))
 
     # The public summary carries the numbers and the seed, never an escaping input.
@@ -484,8 +527,9 @@ def main():
             f.write(
                 f"### fuzz{f' (seed {SEED})' if reveal_seed else ''}\n\n"
                 f"- inputs: {ITERS} — reached the server: {reached}, client-rejected: {client_rejected}\n"
-                f"- agent reconnections: {reconnects}\n"
-                f"- crashes: {len(crashes)} · direct escapes: {len(direct_bypass)} · propose/commit escapes: {len(propose_bypass)}\n"
+                f"- proposals accepted: {accepted} · committed: {committed} · agent reconnections: {reconnects}\n"
+                f"- crashes: {len(crashes)} · direct escapes: {len(direct_bypass)} · propose/commit escapes: {propose_commit}\n"
+                f"- by category — word-list miss: {len(word_miss)} · moved protected state: {len(protected)} · over max_rows: {len(over_rows)}\n"
                 f"- **{verdict}**\n"
             )
     sys.exit(0 if ok_exit else 1)
