@@ -8,6 +8,7 @@
 #
 #   tests/cluster.sh package             build the release artifact for PG_CONFIG
 #   tests/cluster.sh init                fresh data directory
+#        LIVING_ASSERTIONS_DIR=<checkout>  load pg_living_assertions from there
 #   tests/cluster.sh start [preload|bare]   bare = without the library preloaded
 #   tests/cluster.sh stop [fast|immediate]  immediate = no checkpoint, like a crash
 #   tests/cluster.sh psql [args...]
@@ -32,12 +33,22 @@ case "${1:-}" in
     "$BIN/pg_ctl" -D "$DATA" -m immediate -w stop >/dev/null 2>&1 || true
     rm -rf "$DATA"
     "$BIN/initdb" -D "$DATA" --auth=trust -E UTF8 >/dev/null
+    # pg_living_assertions from a checkout (LIVING_ASSERTIONS_DIR) ahead of the one
+    # installed in this PostgreSQL, linked the way the gate's own artifact is: a suite
+    # that needs a given version of it gets it without installing anything.
+    LA_EXT=
+    if [ -n "${LIVING_ASSERTIONS_DIR:-}" ]; then
+        mkdir -p "$DATA/la/extension"
+        ln -s "$LIVING_ASSERTIONS_DIR"/pg_living_assertions.control \
+              "$LIVING_ASSERTIONS_DIR"/pg_living_assertions--*.sql "$DATA/la/extension/"
+        LA_EXT="$DATA/la:"
+    fi
     cat >>"$DATA/postgresql.conf" <<EOF
 port = $PORT
 listen_addresses = 'localhost'
 unix_socket_directories = '$DATA'
 dynamic_library_path = '$LIBDIR:\$libdir'
-extension_control_path = '$SHAREDIR:\$system'
+extension_control_path = '$LA_EXT$SHAREDIR:\$system'
 EOF
     echo "initialised $DATA on port $PORT"
     ;;

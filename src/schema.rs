@@ -103,7 +103,7 @@ extension_sql!(
 -- THE RECORD IS NOT EDITED. A superuser can still disable these triggers for
 -- retention; that is an act of administration, and it is not silent.
 CREATE FUNCTION agent_gate_internal._append_only() RETURNS trigger
-LANGUAGE plpgsql SET search_path = pg_catalog AS $$
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
 BEGIN
     RAISE EXCEPTION 'pg_agent_gate: % on % is not allowed: what agents proposed and did is append-only',
         TG_OP, TG_TABLE_NAME USING ERRCODE = 'insufficient_privilege';
@@ -124,7 +124,7 @@ CREATE TRIGGER executions_no_truncate BEFORE TRUNCATE ON agent_gate_internal.exe
     FOR EACH STATEMENT EXECUTE FUNCTION agent_gate_internal._append_only();
 
 CREATE FUNCTION agent_gate_internal._only_the_gate() RETURNS void
-LANGUAGE plpgsql SET search_path = pg_catalog AS $$
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
 BEGIN
     IF NOT agent_gate._inside_gate() THEN
         RAISE EXCEPTION 'pg_agent_gate: only the gate reads and writes its own record'
@@ -137,7 +137,7 @@ CREATE FUNCTION agent_gate_internal._record_proposal(
     p_agent text, p_role text, p_intent text, p_sql text, p_params text[],
     p_kind text, p_ok boolean, p_checks jsonb, p_estimated double precision)
 RETURNS bigint LANGUAGE plpgsql SECURITY DEFINER
-SET search_path = pg_catalog, agent_gate_internal AS $$
+SET search_path = pg_catalog, agent_gate_internal, pg_temp AS $$
 DECLARE
     new_id bigint;
 BEGIN
@@ -154,7 +154,7 @@ CREATE FUNCTION agent_gate_internal._record_execution(
     p_rows_returned integer, p_truncated boolean, p_assertions jsonb, p_sample jsonb,
     p_duration_ms double precision)
 RETURNS bigint LANGUAGE plpgsql SECURITY DEFINER
-SET search_path = pg_catalog, agent_gate_internal AS $$
+SET search_path = pg_catalog, agent_gate_internal, pg_temp AS $$
 DECLARE
     new_id bigint;
 BEGIN
@@ -171,7 +171,7 @@ END $$;
 
 CREATE FUNCTION agent_gate_internal._load_proposal(p_id bigint, p_lock boolean DEFAULT false)
 RETURNS jsonb
-LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, agent_gate_internal AS $$
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, agent_gate_internal, pg_temp AS $$
 BEGIN
     PERFORM agent_gate_internal._only_the_gate();
     -- TWO COMMITS OF THE SAME PROPOSAL AT THE SAME TIME BOTH RAN IT. 'committed'
@@ -198,7 +198,7 @@ BEGIN
 END $$;
 
 CREATE FUNCTION agent_gate_internal._agent(p_name text) RETURNS jsonb
-LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, agent_gate_internal AS $$
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, agent_gate_internal, pg_temp AS $$
 BEGIN
     PERFORM agent_gate_internal._only_the_gate();
     RETURN (
@@ -221,32 +221,35 @@ END $$;
 -- would make some cascades safe lands in 0.2.4). A user trigger is allow-listable only when the
 -- target is in p_allowed AND the trigger's own function is not SECURITY DEFINER. Returns the first
 -- such object's name, or NULL when nothing unsafe is reachable. Catalog-only, so STABLE and invoker.
+-- It runs in the agent's session, so it names pg_temp last (0.2.9) and its catalogs by schema: an
+-- unnamed pg_temp is searched FIRST, and an allow_ddl agent's empty pg_temp.pg_constraint used to
+-- hide a cascading foreign key from it (tests/pg_temp.sh).
 CREATE FUNCTION agent_gate_internal._unsafe_amplifier(p_target oid, p_allowed bigint[])
-RETURNS text LANGUAGE sql STABLE SET search_path = pg_catalog, agent_gate_internal AS $$
+RETURNS text LANGUAGE sql STABLE SET search_path = pg_catalog, agent_gate_internal, pg_temp AS $$
     WITH RECURSIVE d(oid) AS (
         SELECT p_target
         UNION
-        SELECT i.inhrelid FROM pg_inherits i JOIN d ON i.inhparent = d.oid
+        SELECT i.inhrelid FROM pg_catalog.pg_inherits i JOIN d ON i.inhparent = d.oid
     )
     SELECT label FROM (
         SELECT 'cascading foreign key '||co.conname AS label
-          FROM pg_constraint co JOIN d ON d.oid = co.confrelid
+          FROM pg_catalog.pg_constraint co JOIN d ON d.oid = co.confrelid
          WHERE co.contype = 'f' AND (co.confdeltype IN ('c','n','d') OR co.confupdtype IN ('c','n','d'))
         UNION ALL
         SELECT 'trigger '||tg.tgname
-          FROM pg_trigger tg JOIN d ON d.oid = tg.tgrelid
-          JOIN pg_proc p ON p.oid = tg.tgfoid
+          FROM pg_catalog.pg_trigger tg JOIN d ON d.oid = tg.tgrelid
+          JOIN pg_catalog.pg_proc p ON p.oid = tg.tgfoid
          WHERE NOT tg.tgisinternal
            AND (p_target::bigint <> ALL (coalesce(p_allowed, '{}'::bigint[])) OR p.prosecdef)
         UNION ALL
         SELECT 'rule '||rw.rulename
-          FROM pg_rewrite rw JOIN d ON d.oid = rw.ev_class
+          FROM pg_catalog.pg_rewrite rw JOIN d ON d.oid = rw.ev_class
          WHERE rw.rulename <> '_RETURN'
     ) s LIMIT 1
 $$;
 
 CREATE FUNCTION agent_gate_internal._acts(p_agent text, p_limit integer) RETURNS jsonb
-LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, agent_gate_internal AS $$
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, agent_gate_internal, pg_temp AS $$
 BEGIN
     PERFORM agent_gate_internal._only_the_gate();
     RETURN coalesce((
@@ -271,10 +274,12 @@ END $$;
 -- states that matter to a commit: holds and unknown let it through; broken and
 -- erroring stop it -- a check that cannot run is not a check that passed.
 CREATE FUNCTION agent_gate_internal._run_assertion(p_name text) RETURNS jsonb
-LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, agent_gate_internal AS $$
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, agent_gate_internal, pg_temp AS $$
 DECLARE
     st text;
     de text;
+    la text;
+    too_old boolean;
 BEGIN
     IF NOT agent_gate._checking() THEN
         RAISE EXCEPTION 'pg_agent_gate: assertions are run by the gate, after a change'
@@ -283,6 +288,24 @@ BEGIN
     IF to_regnamespace('living_assertions') IS NULL THEN
         RETURN jsonb_build_object('assertion', p_name, 'state', 'erroring', 'detail',
             'pg_living_assertions is not installed: a bound assertion nobody can check is not one that passed');
+    END IF;
+    -- Before 0.5.5, pg_living_assertions applied an assertion's recorded search_path without
+    -- naming pg_temp, so a temporary table of the session running the check -- here the
+    -- agent's -- stood in for the table it reads, and an overdraft was kept under an
+    -- assertion that forbade it (tests/pg_temp.sh). A check the agent can answer for is not
+    -- one that passed. A version that does not parse is treated the same way.
+    BEGIN
+        SELECT extversion, string_to_array(extversion, '.')::int[] < '{0,5,5}'
+          INTO la, too_old
+          FROM pg_catalog.pg_extension WHERE extname = 'pg_living_assertions';
+    EXCEPTION WHEN OTHERS THEN
+        too_old := true;
+    END;
+    IF too_old IS NOT FALSE THEN
+        RETURN jsonb_build_object('assertion', p_name, 'state', 'erroring', 'detail',
+            format('pg_living_assertions %s predates 0.5.5: a temporary table of the agent could answer '
+                   'for the table the assertion reads. Upgrade it: ALTER EXTENSION pg_living_assertions UPDATE',
+                   coalesce(la, '?')));
     END IF;
     BEGIN
         EXECUTE 'SELECT state, detail FROM living_assertions.run($1)' INTO st, de USING p_name;
@@ -297,7 +320,7 @@ END $$;
 CREATE FUNCTION agent_gate.register_agent(
     p_name text, p_role regrole, p_description text,
     p_max_rows integer DEFAULT 1000, p_allow_ddl boolean DEFAULT false)
-RETURNS jsonb LANGUAGE plpgsql SET search_path = pg_catalog, agent_gate_internal AS $$
+RETURNS jsonb LANGUAGE plpgsql SET search_path = pg_catalog, agent_gate_internal, pg_temp AS $$
 DECLARE
     role_name name;
     is_super  boolean;
@@ -324,7 +347,7 @@ BEGIN
 END $$;
 
 CREATE FUNCTION agent_gate.unregister_agent(p_name text) RETURNS jsonb
-LANGUAGE plpgsql SET search_path = pg_catalog, agent_gate_internal AS $$
+LANGUAGE plpgsql SET search_path = pg_catalog, agent_gate_internal, pg_temp AS $$
 DECLARE
     role_name name;
 BEGIN
@@ -339,7 +362,7 @@ BEGIN
 END $$;
 
 CREATE FUNCTION agent_gate.bind_assertion(p_agent text, p_assertion text) RETURNS jsonb
-LANGUAGE plpgsql SET search_path = pg_catalog, agent_gate_internal AS $$
+LANGUAGE plpgsql SET search_path = pg_catalog, agent_gate_internal, pg_temp AS $$
 DECLARE
     st text;
 BEGIN
@@ -361,7 +384,7 @@ BEGIN
 END $$;
 
 CREATE FUNCTION agent_gate.unbind_assertion(p_agent text, p_assertion text) RETURNS boolean
-LANGUAGE sql SET search_path = pg_catalog, agent_gate_internal AS $$
+LANGUAGE sql SET search_path = pg_catalog, agent_gate_internal, pg_temp AS $$
     WITH gone AS (DELETE FROM agent_gate_internal.bindings
                    WHERE agent = p_agent AND assertion = p_assertion RETURNING 1)
     SELECT EXISTS (SELECT 1 FROM gone);
@@ -373,7 +396,7 @@ $$;
 -- A cascading foreign key, a rule, or a SECURITY DEFINER trigger is NEVER allow-listable in 0.2.3:
 -- the entry is recorded, but writes stay refused, and the result says so in `still_refused`.
 CREATE FUNCTION agent_gate.allow_write(p_agent text, p_relation regclass, p_note text DEFAULT NULL)
-RETURNS jsonb LANGUAGE plpgsql SET search_path = pg_catalog, agent_gate_internal AS $$
+RETURNS jsonb LANGUAGE plpgsql SET search_path = pg_catalog, agent_gate_internal, pg_temp AS $$
 DECLARE
     still text;
 BEGIN
@@ -393,7 +416,7 @@ BEGIN
 END $$;
 
 CREATE FUNCTION agent_gate.disallow_write(p_agent text, p_relation regclass) RETURNS boolean
-LANGUAGE sql SET search_path = pg_catalog, agent_gate_internal AS $$
+LANGUAGE sql SET search_path = pg_catalog, agent_gate_internal, pg_temp AS $$
     WITH gone AS (DELETE FROM agent_gate_internal.allowlist
                    WHERE agent = p_agent AND relid = p_relation::oid RETURNING 1)
     SELECT EXISTS (SELECT 1 FROM gone);

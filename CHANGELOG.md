@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.2.9 -- 2026-10-08
+
+* **Every function of the gate names `pg_temp` last.** They all said `search_path =
+  pg_catalog, agent_gate_internal`, and PostgreSQL searches an unnamed `pg_temp` first
+  for relations, even before an explicitly listed `pg_catalog`. `_unsafe_amplifier` runs
+  in the agent's session and read the catalogs without a schema, and an `allow_ddl`
+  agent may create temporary tables. Measured against 0.2.8 (`tests/pg_temp.sh`): with an
+  empty temporary `pg_constraint`, a delete whose foreign key cascades passed
+  `no_amplification`, was kept, and the cascade deleted -- as the table owner -- a row of
+  a table the agent holds no grant on; with an empty temporary `pg_rewrite`, a delete
+  under a `DO ALSO` rule was kept and the rule wrote with its owner's rights.
+  `_unsafe_amplifier` also names its catalogs by schema now.
+* **A bound assertion is not run through a pg_living_assertions older than 0.5.5.** Up to
+  0.5.4 a check applied its recorded path without `pg_temp`, so a temporary table of the
+  agent -- whose session runs the check -- answered for the real one, and an overdraft the
+  assertion forbids was kept. `_run_assertion` now answers `erroring`, which stops the
+  commit, naming the version and the fix. `META.json` requires 0.5.5.
+* `tests/upgrade.sh` compares every SQL function of both schemas in full
+  (`pg_get_functiondef`: body and `search_path`), not only the signatures of
+  `agent_gate`; its control -- one `ALTER` removed from the upgrade -- is red. It found two
+  functions an older upgrade carried without their comments; 0.2.9 recreates them, so an
+  upgraded database is now defined exactly as a fresh one.
+* `tests/cluster.sh` can load pg_living_assertions from a checkout
+  (`LIVING_ASSERTIONS_DIR`); the clean machine builds pg_living_assertions v0.5.5.
+* `make verify`: 253 checks (240 in the suites, 13 unit tests), `pg_temp` among the
+  suites; 17/17 there, red on 0.2.8 with its controls green.
+
 ## 0.2.8 -- unreleased
 
 From an external audit of 0.2.7 (e600647), each item re-measured here before it was changed.

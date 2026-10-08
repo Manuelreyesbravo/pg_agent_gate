@@ -131,6 +131,24 @@ else
         "fresh: $fresh_surface || upgraded: $upgraded_surface"
 fi
 
+# The signatures above say nothing of a function's body or of its search_path, and nothing of
+# agent_gate_internal -- which is where 0.2.9 changed both (pg_temp named last). So: every SQL
+# function of both schemas, defined in full by pg_get_functiondef, fresh against upgraded. C
+# functions are left out: their definition names the library file, which differs by install.
+DEFS="select count(*) || ' functions, md5 ' || md5(string_agg(pg_get_functiondef(p.oid), E'\\n'
+                 order by p.oid::regprocedure::text))
+        from pg_proc p
+       where p.pronamespace in ('agent_gate'::regnamespace, 'agent_gate_internal'::regnamespace)
+         and p.prolang <> (select oid from pg_language where lanname = 'c')"
+fresh_defs=$(fresh -c "$DEFS")
+upgraded_defs=$(su -c "$DEFS")
+if [[ "$fresh_defs" == *" functions, md5 "* && "$fresh_defs" = "$upgraded_defs" ]]; then
+    report "every SQL function is defined exactly as in a fresh install (body and search_path)" yes ""
+else
+    report "every SQL function is defined exactly as in a fresh install (body and search_path)" no \
+        "fresh: $fresh_defs || upgraded: $upgraded_defs"
+fi
+
 # And the verb this version adds works for an agent registered before it existed.
 expect "an agent from before the upgrade can use propose_and_commit" '"outcome": "kept"' \
     "$(agent -c "select agent_gate.propose_and_commit(\$s\$update libro set texto = 'una llamada' where id = 1\$s\$, \$i\$one call after the upgrade\$i\$)")"
