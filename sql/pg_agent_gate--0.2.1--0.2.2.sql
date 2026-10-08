@@ -15,10 +15,13 @@
 -- tenant-2 order), which the agent could never have named directly. The gate reported one row
 -- affected and kept it.
 --
--- New check `no_amplification`: a write whose target table has an inbound foreign key with a
--- cascading action (ON DELETE/UPDATE CASCADE, SET NULL, SET DEFAULT), a user trigger, or a rule
--- is refused at propose, naming the constraint, trigger or rule. The effect of such an object
--- is not bounded by the agent's tenant or by max_rows, so the write cannot be proven safe.
+-- New check `no_amplification`: a write whose target has an inbound foreign key with a cascading
+-- action (ON DELETE/UPDATE CASCADE, SET NULL, SET DEFAULT) is refused at propose, naming it. The
+-- same check refuses a target that carries a user trigger or a rule, which amplify the row COUNT
+-- past max_rows (a normal trigger runs as the invoker, so RLS still applies to it; only a SECURITY
+-- DEFINER one would cross a tenant -- rules were not measured, refused conservatively). Inheritance
+-- and partition children of the target are included, and a catalog lookup that fails refuses
+-- rather than passes (fail closed).
 --
 -- Same shape as the two 0.2.1 bugs: the gate counted the statement and the real effect was
 -- larger. Regression case is red against 0.2.1 (tests/fuzz.py, the amplification teeth check and

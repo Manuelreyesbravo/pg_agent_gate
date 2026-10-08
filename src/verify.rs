@@ -246,25 +246,52 @@ pub(crate) fn verify(sql: &str, params: &Option<Vec<Option<String>>>, allow_ddl:
                     return v;
                 }
                 v.check("keeps_its_context", true, "nothing in the statement calls set_config()");
-                if let Some(obj) = amplifying_object(&tree.targets) {
-                    v.kind = Some(kind);
-                    v.check(
-                        "no_amplification",
-                        false,
-                        format!(
-                            "writing this table fires {obj}, whose effect runs as the table owner \
-                             outside the agent's tenant and is not counted against max_rows: a \
-                             cascading foreign key, trigger or rule can change rows the agent could \
-                             never name (set_config aside, this is the other way the top-level count lies)"
-                        ),
-                    );
-                    return v;
+                match amplifying_object(&tree.targets) {
+                    Err(why) => {
+                        // Fail CLOSED: a lookup we could not complete is not "nothing to find".
+                        v.kind = Some(kind);
+                        v.check(
+                            "no_amplification",
+                            false,
+                            format!("the catalog lookup for cascading keys, triggers and rules failed, \
+                                     so this write cannot be proven bounded: {why}"),
+                        );
+                        return v;
+                    }
+                    Ok(Some(obj)) => {
+                        v.kind = Some(kind);
+                        v.check(
+                            "no_amplification",
+                            false,
+                            format!(
+                                "writing this table fires {obj}, whose effect is not counted against \
+                                 max_rows (a cascading foreign key additionally runs as the table owner, \
+                                 outside row-level security, and was measured deleting another tenant's \
+                                 row): the write cannot be proven bounded, so it is refused"
+                            ),
+                        );
+                        return v;
+                    }
+                    Ok(None) => {
+                        if tree.modifies && tree.targets.is_empty() {
+                            // A modifying statement whose target we could not resolve: refuse, do not run.
+                            v.kind = Some(kind);
+                            v.check(
+                                "no_amplification",
+                                false,
+                                "this statement modifies data but its target relation could not be \
+                                 identified, so it cannot be checked for amplification",
+                            );
+                            return v;
+                        }
+                        v.check(
+                            "no_amplification",
+                            true,
+                            "no cascading foreign key, user trigger or rule on this write's target \
+                             (or an inheritance child of it) can amplify it beyond its own rows",
+                        );
+                    }
                 }
-                v.check(
-                    "no_amplification",
-                    true,
-                    "no cascading foreign key, user trigger or rule can amplify this write beyond its own rows",
-                );
             }
             Err(f) => {
                 v.kind = Some(kind);
@@ -284,45 +311,71 @@ pub(crate) fn verify(sql: &str, params: &Option<Vec<Option<String>>>, allow_ddl:
 struct Tree {
     writing_cte: bool,
     set_config: bool,
-    /// Relations a write in this statement targets (its result relations), so the catalog can be
-    /// asked whether writing them fires anything -- a cascading foreign key, a user trigger or a
-    /// rule -- that runs as the table owner, outside the agent's tenant, uncounted by max_rows.
+    /// A data-modifying statement (INSERT/UPDATE/DELETE/MERGE) was seen. A locking read
+    /// (SELECT ... FOR UPDATE) is a "write" to the gate but does not modify data, so it is not
+    /// this -- and must not be refused for lacking a target.
+    modifies: bool,
+    /// Relations a modifying statement targets (its result relations), so the catalog can be asked
+    /// whether writing them -- or an inheritance child of them -- fires a cascading foreign key, a
+    /// user trigger or a rule whose effect is not counted against max_rows (and, for a referential
+    /// action, runs as the table owner outside row-level security).
     targets: Vec<pg_sys::Oid>,
 }
 
-/// Record a Query's result relation (the table an INSERT/UPDATE/DELETE/MERGE writes), if any.
+/// Record a Query's result relation. A data-modifying command sets `modifies`; a locking read does
+/// not (it has no result relation), so it is not mistaken for a write with an unknown target.
 unsafe fn collect_target(q: *mut pg_sys::Query, tree: &mut Tree) {
-    if (*q).commandType != pg_sys::CmdType::CMD_SELECT && (*q).resultRelation > 0 {
-        let rte = pg_sys::list_nth((*q).rtable, (*q).resultRelation - 1) as *mut pg_sys::RangeTblEntry;
-        if !rte.is_null() && (*rte).relid != pg_sys::InvalidOid {
-            tree.targets.push((*rte).relid);
+    if matches!(
+        (*q).commandType,
+        pg_sys::CmdType::CMD_INSERT
+            | pg_sys::CmdType::CMD_UPDATE
+            | pg_sys::CmdType::CMD_DELETE
+            | pg_sys::CmdType::CMD_MERGE
+    ) {
+        tree.modifies = true;
+        if (*q).resultRelation > 0 {
+            let rte = pg_sys::list_nth((*q).rtable, (*q).resultRelation - 1) as *mut pg_sys::RangeTblEntry;
+            if !rte.is_null() && (*rte).relid != pg_sys::InvalidOid {
+                tree.targets.push((*rte).relid);
+            }
         }
     }
 }
 
-/// The first cascading inbound foreign key, user trigger or rule on any target table -- the ways a
-/// single top-level write amplifies into rows the gate never counted and RLS never filtered (a
-/// referential action runs as the table owner and does not force row-level security). None means
-/// the write touches only its own rows.
-fn amplifying_object(targets: &[pg_sys::Oid]) -> Option<String> {
+/// The first cascading inbound foreign key, user trigger or rule on any target table OR an
+/// inheritance/partition child of one -- the planner, not the analyzer, expands those, so the
+/// catalog is asked about the whole hierarchy. `Ok(None)` means nothing amplifies this write;
+/// `Ok(Some(name))` names the object to refuse; `Err` is a lookup that failed -- which must refuse,
+/// never pass (the fail-closed the first version got wrong by swallowing the error into None).
+fn amplifying_object(targets: &[pg_sys::Oid]) -> Result<Option<String>, String> {
     if targets.is_empty() {
-        return None;
+        return Ok(None);
     }
     let ids = targets.iter().map(|o| o.to_u32().to_string()).collect::<Vec<_>>().join(",");
+    // A scalar subquery so the result is always exactly ONE row: the name when something amplifies,
+    // SQL NULL when nothing does. get_one then gives Ok(Some(name)) / Ok(None), and only a real SPI
+    // failure gives Err -- so "no rows" can never be mistaken for "nothing to find" (the fail-open).
     let sql = format!(
-        "select label from (
-           select 'foreign key '||conname as label from pg_catalog.pg_constraint
-             where contype='f' and confrelid in ({ids})
-               and (confdeltype in ('c','n','d') or confupdtype in ('c','n','d'))
-           union all
-           select 'trigger '||tgname from pg_catalog.pg_trigger
-             where tgrelid in ({ids}) and not tgisinternal
-           union all
-           select 'rule '||rulename from pg_catalog.pg_rewrite
-             where ev_class in ({ids}) and rulename <> '_RETURN'
-         ) s limit 1"
+        "select (
+           with recursive descendants(oid) as (
+             select oid from pg_catalog.pg_class where oid in ({ids})
+             union
+             select i.inhrelid from pg_catalog.pg_inherits i join descendants d on i.inhparent = d.oid
+           )
+           select label from (
+             select 'foreign key '||conname as label from pg_catalog.pg_constraint
+               where contype='f' and confrelid in (select oid from descendants)
+                 and (confdeltype in ('c','n','d') or confupdtype in ('c','n','d'))
+             union all
+             select 'trigger '||tgname from pg_catalog.pg_trigger
+               where tgrelid in (select oid from descendants) and not tgisinternal
+             union all
+             select 'rule '||rulename from pg_catalog.pg_rewrite
+               where ev_class in (select oid from descendants) and rulename <> '_RETURN'
+           ) s limit 1
+         )"
     );
-    Spi::get_one::<String>(&sql).ok().flatten()
+    Spi::get_one::<String>(&sql).map_err(|e| e.to_string())
 }
 
 /// Parses the (already verified, single) statement again, runs PostgreSQL's analyzer and

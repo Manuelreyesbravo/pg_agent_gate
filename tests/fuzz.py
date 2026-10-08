@@ -217,10 +217,14 @@ SCHEMA = """
 drop schema if exists shop cascade;
 create schema shop authorization fuzz_agent;
 create table shop.customers (id int primary key, tenant int not null, name text, email text);
-create table shop.orders (id int primary key, tenant int not null, customer int references shop.customers, total numeric);
+create table shop.orders (id int primary key, tenant int not null, customer int references shop.customers(id) on delete cascade, total numeric);
 insert into shop.customers values (1,1,'Ana','ana@one.example'),(2,1,'Bruno','bruno@one.example'),
                                   (3,2,'Iris','iris@two.example'),(4,2,'Juan','juan@two.example');
 insert into shop.orders select g,1,1+g%2,g*10 from generate_series(1,8) g;
+-- A TENANT-2 child of a TENANT-1 parent. Deleting customer 1 cascades into this tenant-2 row (the
+-- breach fixed in 0.2.2), so the gate must refuse the corpus `delete from shop.customers` at
+-- propose. If it ever stops refusing, this row moves and safe_fp (tenant 2) catches it.
+insert into shop.orders values (9, 2, 1, 90);
 alter table shop.customers enable row level security; alter table shop.customers force row level security;
 alter table shop.orders enable row level security;    alter table shop.orders force row level security;
 -- USING alone: for an ALL policy Postgres reuses it as the write check, so a cross-tenant INSERT/UPDATE is refused too (same shape as tests/rls_isolation.sh).
@@ -375,8 +379,10 @@ def main():
         # otherwise the commit path never runs under RLS (no tenant on the role) and the max_rows
         # oracle, measured or not, would pass vacuously on every proposal.
         before = row_state()
+        # orders, not customers: customers is now referenced by a cascading FK, so a write to it is
+        # (correctly) refused. orders is referenced by nothing, so a one-row write to it is allowed.
         r = probe.execute("select agent_gate.propose(%s, %s)",
-                          ("update shop.customers set name = name || '!' where id = 1", "teeth")).fetchone()[0]
+                          ("update shop.orders set total = total + 1 where id = 1", "teeth")).fetchone()[0]
         if not (isinstance(r, dict) and r.get("ok") is True and r.get("proposal") is not None):
             sys.exit("propose() refused a plain one-row UPDATE -- cannot exercise the commit path")
         probe.execute("select agent_gate.commit(%s)", (r["proposal"],))

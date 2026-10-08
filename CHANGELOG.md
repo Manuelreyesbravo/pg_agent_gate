@@ -11,13 +11,21 @@ probe against a two-tenant database with a superuser watching.
   action (ON DELETE/UPDATE CASCADE, SET NULL, SET DEFAULT) runs as the table
   owner and does NOT force RLS. A tenant-1 agent deleting a tenant-1 parent
   cascade-deleted a **tenant-2** child row it could never have named -- the gate
-  reported one row and kept it. User triggers and rules amplify the same way.
-  New check `no_amplification`: a write whose target has an inbound cascading
-  foreign key, a user trigger or a rule is refused at `propose`, naming it.
-* Regression: `tests/fuzz.py` gained an amplification teeth check (cascade and
-  trigger) and a k=1..8 differential oracle for `max_rows`, both run on every
-  push via `FUZZ_ITERS=0`. Red against 0.2.1.
-* No schema changes; the upgrade script only moves the version.
+  reported one row and kept it (measured). New check `no_amplification`: a write
+  whose target table has an inbound cascading foreign key is refused at
+  `propose`, naming it. The same check also refuses a target that carries a user
+  trigger or a rule: those amplify the row COUNT past `max_rows` (a normal
+  trigger runs as the invoker, so RLS still applies to it; only a SECURITY
+  DEFINER one would cross a tenant -- rules were not measured, refused
+  conservatively). Inheritance and partition children of the target are included,
+  and a lookup that fails refuses rather than passes (fail closed).
+* Regression: `tests/fuzz.py` fixes a tenant-2 child of a tenant-1 parent into
+  the schema (so `safe_fp` covers the whole class), an amplification teeth check
+  (cascade and trigger), and a k=1..8 differential oracle for `max_rows` -- all
+  run on every push via `FUZZ_ITERS=0`. Red against 0.2.1.
+* Not yet covered (0.2.3): a volatile or SECURITY DEFINER function that writes,
+  which is a read at `propose`. No schema changes; the upgrade script only moves
+  the version.
 
 ## 0.2.1 -- 2026-10-06
 
