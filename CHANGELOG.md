@@ -17,6 +17,12 @@ median 5.7 ms inside the gate instead of 1.2 ms.
   amplifier check, the opaque-function check, the estimate's privilege check), parameterized
   instead of built as text on every call. The plan cache revalidates them when the catalog
   changes.
+* The prepared plans run on a fresh snapshot (`prepare_mut`), as the gate's own statements do.
+  A read-only plan runs on the snapshot of the statement that called the verb, which does not see
+  a table or a trigger created earlier in the same transaction: the first cut of this release
+  counted no rows for such a table before the statement and all of them after, and aborted a
+  1-row write as a 3001-row one (pgrx unit test `a_one_call_write_has_the_guards_of_commit`, red
+  in CI, green after).
 * **`commit` skips what only the estimate needs** -- the `VERBOSE` plan and the privilege
   lookup -- since it reports no estimate. Every check still runs.
 * Measured in a throwaway cluster with the real schema and the last 500 proposals of that agent,

@@ -189,7 +189,13 @@ pub(crate) fn get_one_prepared<T: FromDatum + IntoDatum>(
     Spi::connect(|client| {
         let plan = match PLANS.with(|p| p.borrow_mut().remove(sql)) {
             Some(plan) => plan,
-            None => client.prepare(sql, types).map_err(|e| e.to_string())?.keep(),
+            // prepare_mut, not prepare: pgrx runs a non-mutating plan READ-ONLY, on the snapshot of
+            // the statement that called the verb, which does not see what earlier statements of
+            // the same transaction did -- a table they created, a trigger they added. The max_rows
+            // counter then missed a table created earlier in the transaction (caught by the pgrx
+            // unit test a_one_call_write_has_the_guards_of_commit in CI). A mutating plan runs on a
+            // fresh snapshot, as the gate's own statements do. It still only reads.
+            None => client.prepare_mut(sql, types).map_err(|e| e.to_string())?.keep(),
         };
         let result = client
             .select(&plan, Some(1), args)
