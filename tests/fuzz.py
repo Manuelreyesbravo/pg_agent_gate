@@ -26,13 +26,18 @@
 # The failure signal is reaching the server too little (then the run proved nothing), not
 # reconnecting.
 #
-# WHAT THIS DOES NOT CATCH, plainly. Property 3 is a word list, not a parser: it does not flag
-# dangerous FUNCTIONS (pg_terminate_backend, pg_sleep, lo_import, dblink, pg_read_*). Those
-# resolve as reads, so propose() accepts them by design; they are committed and bounded by the
-# agent's own privileges (not a superuser, no pg_signal_backend, no server-file read) and by
-# property 2, not refused at propose. Three teeth checks run first every time -- a known change
-# must move the fingerprint, propose() must actually refuse a known DROP and GRANT, and a plain
-# one-row write must commit and be measured as exactly one row -- so no oracle can pass vacuously.
+# WHAT THIS DOES NOT CATCH, plainly. The dangerous FUNCTIONS split in two and the gate treats them
+# differently (measured directly): the ones the agent may not execute -- the file and large-object
+# functions lo_import, lo_export, pg_read_file, pg_stat_file, pg_ls_dir -- fail to plan and are
+# REFUSED at propose, which the word list asserts. The ones it may call (pg_sleep,
+# pg_terminate_backend, pg_cancel_backend) are ACCEPTED and run at commit, where they abort on a
+# privilege or a timeout (pg_terminate_backend -> SQLSTATE 42501, pg_sleep -> 57014) and never
+# apply -- bounded by property 2, not refused at propose. What the row/catalog oracle does NOT see:
+# a function whose side effect leaves no row in the fingerprinted tables -- pg_notify, nextval,
+# pg_advisory_lock -- runs as a "read" and is counted as one. Three teeth checks run first every
+# time -- a known change must move the fingerprint, propose() must refuse a known DROP and GRANT,
+# and a plain one-row write must commit and measure as exactly one row -- so no oracle passes
+# vacuously; and a k=1..8 differential oracle proves the max_rows boundary on each run.
 #
 #   make fuzz PG_CONFIG=/path/to/pg_config            # default 3000 inputs
 #   FUZZ_ITERS=20000 FUZZ_SEED=1 make fuzz            # longer, reproducible
@@ -186,8 +191,8 @@ def gen():
 # false positive the parse-tree gate does not make (e.g. `select pg_sleep(10) superuser`).
 DANGER_WORDS = ("drop", "truncate", "alter", "create", "grant", "revoke", "copy", "do ",
                 "call", "prepare", "vacuum", "reindex", "cluster", "comment", "lock",
-                "listen", "notify", "set_config", "set role", "reset", "security",
-                "extension", "pg_read_file", "pg_ls")
+                "listen", "notify", "set_config", "set role", "reset", "security", "extension",
+                "pg_read_file", "pg_stat_file", "pg_ls", "lo_import", "lo_export")
 
 
 def looks_dangerous(s):
@@ -264,11 +269,11 @@ ROW_STATE = """
   select 'o:'||id, md5(coalesce(tenant::text,'~')||'|'||coalesce(customer::text,'~')||'|'||coalesce(total::text,'~')) from shop.orders
 """
 
-# The dangerous FUNCTIONS -- accepted at propose by design (they resolve as reads), so the point
-# is to watch what they do at COMMIT: they must abort (timeout, permission) or run as a harmless
-# read, never apply a change. This matches a committed statement to that family for the breakdown.
-DANGER_FN_RE = re.compile(r"pg_sleep|pg_terminate_backend|pg_cancel_backend|lo_import|lo_export|"
-                          r"pg_read_file|pg_stat_file|pg_ls", re.I)
+# The dangerous functions the gate ACCEPTS at propose (the agent may execute them): they run at
+# COMMIT, where they must abort (permission, timeout) or run as a harmless read, never apply a
+# change. The file/large-object ones (lo_import, pg_read_file, ...) are NOT here: the agent cannot
+# execute them, so they are refused at propose (asserted by DANGER_WORDS) and never reach commit.
+DANGER_FN_RE = re.compile(r"pg_sleep|pg_terminate_backend|pg_cancel_backend", re.I)
 
 
 def main():
@@ -387,7 +392,10 @@ def main():
         for k in range(1, 9):
             for name, tmpl, is_cte in (
                     ("update", "update shop.orders set total = total + 1 where id <= {k}", False),
+                    ("delete", "delete from shop.orders where id <= {k}", False),
                     ("insert", "insert into shop.orders select 100+g, 1, 1, g from generate_series(1,{k}) g", False),
+                    ("upsert", "insert into shop.orders select 100+g, 1, 1, g from generate_series(1,{k}) g on conflict (id) do update set total = excluded.total", False),
+                    ("update-from", "update shop.orders o set total = total + 1 from shop.customers c where c.id = o.customer and o.id <= {k}", False),
                     ("cte-delete", "with d as (delete from shop.orders where id <= {k} returning 1) select count(*) from d", True)):
                 run_schema()
                 before = row_state()

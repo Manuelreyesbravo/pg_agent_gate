@@ -26,7 +26,7 @@ trap 'bash tests/cluster.sh stop fast >/dev/null 2>&1 || true' EXIT
 
 FUZZ_DSN="postgresql://$USER@127.0.0.1:$PORT/$DB"
 if command -v uv >/dev/null; then
-    uv run --quiet --python 3.13 --with 'psycopg[binary]' python tests/fuzz.py "$FUZZ_DSN"
+    uv run --quiet --python 3.13 --with 'psycopg[binary]==3.3.6' python tests/fuzz.py "$FUZZ_DSN"
 else
     python3 tests/fuzz.py "$FUZZ_DSN"
 fi
