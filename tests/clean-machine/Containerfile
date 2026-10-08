@@ -42,6 +42,11 @@ RUN cargo pgrx init --pg$PG_MAJOR "$PG_CONFIG"
 RUN git clone --depth 1 --branch v0.5.4 https://github.com/Manuelreyesbravo/pg_living_assertions /home/tester/pg_living_assertions \
  && make -C /home/tester/pg_living_assertions install PG_CONFIG="$PG_CONFIG"
 
+# uv brings the one Python dependency the suites use (psycopg, for tests/flushes.sh and the
+# fuzzer), pinned, from its own installer -- like cargo-pgrx and PostgreSQL above.
+RUN curl -LsSf https://astral.sh/uv/0.12.23/install.sh | sh
+ENV PATH=/home/tester/.local/bin:$PATH
+
 COPY --chown=tester . /home/tester/pg_agent_gate
 WORKDIR /home/tester/pg_agent_gate
 CMD ["make", "verify"]
