@@ -267,7 +267,9 @@ Nothing is reimplemented. Each check is PostgreSQL itself:
    to 0.2.5, where `EXPLAIN` came first, a `SECURITY DEFINER` function ran as its
    owner before `no_opaque_function` refused it, and what it raised (a secret)
    came back in the check's detail. Now every refusal is decided on the analyzed
-   tree, which runs nothing (`tests/plan_time.sh` counts the calls).
+   tree, which runs nothing (`tests/plan_time.sh` counts the calls); and since
+   0.2.7 a `SECURITY DEFINER` function reached through a body the tree does not
+   show -- a wrapper the planner folds -- is stopped before it runs.
    `estimated_rows` is `null` when row-level security hides rows of a table the
    statement touches from the agent: the statistics are gathered beneath the
    policy, and the estimate told another tenant's frequent value (34 rows) from
@@ -747,18 +749,19 @@ Said here so nobody learns it the hard way:
   the one utility the gate runs on purpose (an `allow_ddl` agent's own DDL, and the `SET
   CONSTRAINTS`) is exempted, so it still goes through. This refuses ALL nested utility, benign
   included -- a trigger that does `NOTIFY`, `SET LOCAL`, `LOCK TABLE`, `CALL` or `CREATE TEMP TABLE`
-  makes the statement abort (`pg_notify()` called as a function is fine). What stays open is
-  the READ half: a `SECURITY DEFINER` function a DBA placed in one of these positions, reached by a
-  `SELECT`, could return rows the agent cannot see -- a disclosure, not a utility, so the
-  nested-utility refusal does not touch it, and a rolled-back subtransaction does not undo it.
-  `dry_run` runs the same invisible code: it rolls back the data, but not effects outside the
-  transaction. So does `propose`, when such a body is `IMMUTABLE` or `STABLE`: the planner folds or
-  estimates it while computing `estimated_rows`. Measured (0.2.6): an `IMMUTABLE`, non-`SECURITY
-  DEFINER` wrapper whose body calls a `SECURITY DEFINER` function passes `no_opaque_function` and
-  runs that function at `propose` and again at `commit`. Both need a DBA to have put such a function in exactly that spot; until the walker
-  resolves these positions at `propose`, do not place a function that writes or reads across tenants
-  in a `CHECK`, `DEFAULT`, generated column, expression index, domain constraint, or view reachable
-  by an agent.
+  makes the statement abort (`pg_notify()` called as a function is fine). **A `SECURITY DEFINER`
+  function reached through any of these positions is stopped before it runs (0.2.7).** Every
+  `SECURITY DEFINER` call goes through PostgreSQL's `fmgr_security_definer`, which calls the
+  function-manager hook before the body; while SQL the agent wrote is running (verification, the
+  verified statement, its deferred constraints, an allowed DDL) the gate refuses there, however the
+  call was reached -- another function, a `CHECK` or domain constraint, a default, a generated
+  column, an expression index, a trigger, or the planner folding an `IMMUTABLE` wrapper at
+  `propose`. Measured on 0.2.6: such a wrapper verified and ran its `SECURITY DEFINER` callee at
+  `propose` and again at `commit`; now neither, and the write a `CHECK` reached that way is not kept
+  (`tests/plan_time.sh`). There is no allow-list for it. What this does NOT stop, because it is not
+  a `SECURITY DEFINER` call: a non-`SECURITY DEFINER` function in those positions (it runs with the
+  agent's rights; if it writes, the commit backstop counts the rows), a referential action, which
+  runs as the table owner by its own mechanism, and a view without `security_invoker` (below).
 * **A cascade, trigger or rule that amplifies a write is refused (0.2.2/0.2.3).**
   Its extra rows run as the table owner, outside the agent's `max_rows` and -- for a
   referential action -- its tenant. `agent_gate.allow_write(agent, table)` re-permits
@@ -770,8 +773,8 @@ Said here so nobody learns it the hard way:
   `pg_stat_xact_user_tables`, which counts USER TABLES only -- not foreign tables, large
   objects, sequences, or effects outside the transaction; a `TRUNCATE` it does not count is
   instead refused as a nested utility (0.2.4). "What the gate can check" is the honest bound: a non-SECURITY DEFINER
-  trigger can still call a SECURITY DEFINER function, or fire a cascade of its own that
-  runs as a table owner outside RLS -- the gate does not see the body. Its rows are
+  trigger can still fire a cascade of its own that runs as a table owner outside RLS -- the gate
+  does not see the body. (A `SECURITY DEFINER` function it calls is stopped since 0.2.7.) Its rows are
   counted (so the limit holds) but not tenant-filtered. Allow-listing a trigger is a
   risk the DBA accepts for that one table; the backstop is the floor under it, not RLS.
 * **A view is checked with its owner's privileges unless it was created with

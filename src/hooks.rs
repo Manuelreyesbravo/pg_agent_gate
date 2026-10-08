@@ -13,10 +13,11 @@
 //! statement, so it is checked once, before the session's first statement is judged.
 //! Everything else dies before it is planned.
 //!
-//! THREE HOOKS, ONE RULE. `post_parse_analyze` is the gate. `ProcessUtility`
+//! FOUR HOOKS, ONE RULE. `post_parse_analyze` is the gate. `ProcessUtility`
 //! and `ExecutorStart` are the second line, for anything that reaches
 //! execution without a fresh parse (a cached plan, a utility statement issued
-//! from C).
+//! from C). `fmgr_hook` is the floor under verification: while the agent's SQL
+//! runs, no SECURITY DEFINER function starts, however it was reached (0.2.7).
 //!
 //! THE COMMON CASE IS FREE. Once preloaded, these run on every statement of
 //! every session, and almost none belong to an agent. Each hook first asks two
@@ -45,6 +46,7 @@ const SHAPE: &str = "an agent session may only run SELECT agent_gate.<verb>(...)
 static mut PREV_POST_PARSE: pg_sys::post_parse_analyze_hook_type = None;
 static mut PREV_PROCESS_UTILITY: pg_sys::ProcessUtility_hook_type = None;
 static mut PREV_EXECUTOR_START: pg_sys::ExecutorStart_hook_type = None;
+static mut PREV_FMGR: pg_sys::fmgr_hook_type = None;
 static mut INSTALLED: bool = false;
 
 pub(crate) fn installed() -> bool {
@@ -61,6 +63,8 @@ pub(crate) unsafe fn install() {
     pg_sys::ProcessUtility_hook = Some(process_utility);
     PREV_EXECUTOR_START = pg_sys::ExecutorStart_hook;
     pg_sys::ExecutorStart_hook = Some(executor_start);
+    PREV_FMGR = pg_sys::fmgr_hook;
+    pg_sys::fmgr_hook = Some(definer_guard);
     INSTALLED = true;
 }
 
@@ -220,6 +224,69 @@ unsafe extern "C-unwind" fn executor_start(query_desc: *mut pg_sys::QueryDesc, e
         Some(prev) => prev(query_desc, eflags),
         None => pg_sys::standard_ExecutorStart(query_desc, eflags),
     }
+}
+
+/// THE FLOOR UNDER no_opaque_function (0.2.7). The walker refuses a SECURITY DEFINER function the
+/// STATEMENT calls, but not one reached through a body it cannot see: another function (an IMMUTABLE
+/// wrapper passes the walker, and the planner even folds it at propose), a CHECK or domain
+/// constraint, a column default the rewriter did not add, a generated column, an expression index,
+/// a trigger. Measured on 0.2.6: an IMMUTABLE wrapper over a SECURITY DEFINER function verified and
+/// ran it at propose and again at commit.
+///
+/// Every SECURITY DEFINER call goes through fmgr_security_definer, which calls this hook before the
+/// body runs (fmgr.c; no needs_fmgr_hook required). While SQL the AGENT wrote is running -- the
+/// PROPOSAL counter: verification, the verified statement, its deferred constraints, an allowed
+/// DDL -- such a call is refused, however it was reached. The gate's own SECURITY DEFINER functions
+/// never run then (the record functions refuse unless PROPOSAL is down, and no verb runs inside a
+/// proposal), so there is no exemption to get wrong. The common path is one atomic load.
+#[pg_guard]
+unsafe extern "C-unwind" fn definer_guard(
+    event: pg_sys::FmgrHookEventType::Type,
+    flinfo: *mut pg_sys::FmgrInfo,
+    private: *mut pg_sys::Datum,
+) {
+    if event == pg_sys::FmgrHookEventType::FHET_START && state::proposal_running() && !flinfo.is_null() {
+        if let Some(name) = security_definer_name((*flinfo).fn_oid) {
+            ErrorReport::new(
+                PgSqlErrorCode::ERRCODE_INSUFFICIENT_PRIVILEGE,
+                format!(
+                    "pg_agent_gate: the proposal reached SECURITY DEFINER function {name}, which would run \
+                     as its owner; it was stopped before it ran"
+                ),
+                "pg_agent_gate",
+            )
+            .set_detail(
+                "it was reached through a body the gate cannot check -- another function, a constraint, a \
+                 default, a generated column, an index expression or a trigger -- so its effect would be \
+                 neither verified nor bound to the agent's tenant",
+            )
+            .set_hint("Do not place a SECURITY DEFINER function where an agent's statement reaches it.")
+            .report(PgLogLevel::ERROR);
+        }
+    }
+    if let Some(prev) = PREV_FMGR {
+        prev(event, flinfo, private);
+    }
+}
+
+/// `schema.name` of the function if it is SECURITY DEFINER, else None. Read from the syscache: this
+/// runs inside the function manager, where SPI is not an option.
+unsafe fn security_definer_name(oid: pg_sys::Oid) -> Option<String> {
+    let tup = pg_sys::SearchSysCache1(pg_sys::SysCacheIdentifier::PROCOID as _, pg_sys::Datum::from(oid));
+    if tup.is_null() {
+        return None;
+    }
+    let form = pg_sys::heap_tuple_get_struct::<pg_sys::FormData_pg_proc>(tup);
+    let secdef = (*form).prosecdef;
+    let nsp = (*form).pronamespace;
+    let name = CStr::from_ptr((*form).proname.data.as_ptr()).to_string_lossy().into_owned();
+    pg_sys::ReleaseSysCache(tup);
+    if !secdef {
+        return None;
+    }
+    let schema = pg_sys::get_namespace_name(nsp);
+    let schema = if schema.is_null() { "?".into() } else { CStr::from_ptr(schema).to_string_lossy().into_owned() };
+    Some(format!("{schema}.{name}()"))
 }
 
 unsafe fn plan_reads_relations(rtable: *mut pg_sys::List) -> bool {

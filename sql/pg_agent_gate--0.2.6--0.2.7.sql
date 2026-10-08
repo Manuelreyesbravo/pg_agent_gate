@@ -1,0 +1,7 @@
+-- 0.2.6 -> 0.2.7
+--
+-- No catalog change. 0.2.7 adds a fourth hook to the library: while SQL the agent wrote is running,
+-- a SECURITY DEFINER function is stopped before its body runs, however it was reached -- through
+-- another function, a constraint, a default, a generated column, an index expression or a trigger.
+-- It lives in the 0.2.7 library this script ships with; the SQL surface of an upgraded database
+-- and a fresh one stay identical (tests/upgrade.sh compares them).

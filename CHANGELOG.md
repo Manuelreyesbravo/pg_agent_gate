@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.2.7 -- unreleased
+
+The case 0.2.6 measured and left open, closed as a class and not as the one case.
+
+* **A `SECURITY DEFINER` function reached through a body the gate cannot see no longer runs.**
+  `no_opaque_function` refuses a `SECURITY DEFINER` function the statement calls, but its walker
+  sees the statement's tree, not the body of another function, a `CHECK` or domain constraint, a
+  default, a generated column, an expression index or a trigger. Measured on 0.2.6: an `IMMUTABLE`,
+  non-`SECURITY DEFINER` wrapper over one verified and ran it at `propose` (the planner folds the
+  wrapper) and again at `commit`; one over a function that raised returned its owner's secret; and
+  a `CHECK` that reached one through a wrapper kept the write. The gate now installs PostgreSQL's
+  function-manager hook (`fmgr_hook`): every `SECURITY DEFINER` call passes through
+  `fmgr_security_definer`, which calls it before the body runs, and while SQL the agent wrote is
+  running -- verification, the verified statement, its deferred constraints, an allowed DDL -- the
+  gate refuses there with `42501`, naming the function. On 0.2.7 the counter does not move, the
+  secret does not travel, and the `CHECK`'s write is not kept. The gate's own `SECURITY DEFINER`
+  functions never run inside that window, so there is no exemption; there is no allow-list either.
+  Outside an agent's SQL the hook is one atomic load.
+* **Not covered, and said in the README:** a non-`SECURITY DEFINER` function in those positions
+  (it runs with the agent's rights; what it writes, the commit backstop counts), a referential
+  action (it runs as the table owner by its own mechanism, not as a `SECURITY DEFINER` call) and a
+  view without `security_invoker`.
+* **`tests/plan_time.sh`** gains eight checks, all red against 0.2.6, and two that must stay green:
+  a wrapper with no `SECURITY DEFINER` under it still verifies and runs, and -- the control of the
+  instrument -- the superuser calling the wrapper moves the counter. Writing them found that the
+  `CHECK` case passed against 0.2.6 for the wrong reason: with `INSERT` alone the commit aborted on
+  `permission denied`, because the gate appends `RETURNING to_jsonb(old/new)` to a write it runs. The
+  agent there now holds `SELECT` too. (That an agent with `INSERT` but no `SELECT` passes `propose`
+  and fails every `commit` is a separate rough edge, not changed here.)
+* **`tests/fuzz.py`: the nested-utility teeth test their own mechanism again.** Their `CHECK` and
+  trigger functions were `SECURITY DEFINER`, so on 0.2.7 the new hook stopped them before the
+  `TRUNCATE` or `GRANT` was reached, and the four teeth that assert the reason "nested utility"
+  failed -- with the outcome still `aborted` and nothing kept, but a tooth that names a mechanism
+  must exercise it. The functions are now ordinary, and the agent holds the privileges they use, so
+  without the nested-utility refusal the `TRUNCATE` and the `GRANT` would succeed. The
+  `SECURITY DEFINER` shape stays as its own tooth for the hook.
+
 ## 0.2.6 -- unreleased
 
 Two findings, both measured against 0.2.5 on PostgreSQL 18.6 with the extension built and

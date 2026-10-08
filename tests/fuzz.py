@@ -506,22 +506,33 @@ def main():
         # from a DEFERRED constraint trigger, which fires during the gate's SET CONSTRAINTS), plus
         # positive controls that MUST go through: a benign CHECK, the session after an abort, and an
         # allow_ddl agent's own DDL (which the executing window must not refuse as nested).
+        # The functions are NOT security definer and the agent holds the privileges they use, so
+        # without the nested-utility refusal the TRUNCATE and the GRANT would SUCCEED: the tooth can
+        # fail. (Up to 0.2.6 they were security definer; since 0.2.7 the fmgr hook stops those first,
+        # which left these teeth asserting a refusal that no longer happened -- found by this file.)
         run_schema()
         su.execute("create table shop.victim (id int)")
         su.execute("insert into shop.victim select generate_series(1, 50)")
         su.execute("create role fuzz_grantee")
-        su.execute("create function shop.nuke() returns boolean language plpgsql security definer as $$ begin truncate shop.victim; return true; end $$")
-        su.execute("create function shop.grab() returns boolean language plpgsql security definer as $$ begin grant select on shop.victim to fuzz_grantee; return true; end $$")
-        su.execute("create function shop.dtrunc() returns trigger language plpgsql security definer as $$ begin truncate shop.victim; return null; end $$")
+        su.execute("create function shop.nuke() returns boolean language plpgsql as $$ begin truncate shop.victim; return true; end $$")
+        su.execute("create function shop.grab() returns boolean language plpgsql as $$ begin grant select on shop.victim to fuzz_grantee; return true; end $$")
+        su.execute("create function shop.dtrunc() returns trigger language plpgsql as $$ begin truncate shop.victim; return null; end $$")
         su.execute("create table shop.deferred_tbl (id int)")
         su.execute("create constraint trigger dt after insert on shop.deferred_tbl deferrable initially deferred for each row execute function shop.dtrunc()")
-        su.execute("create function shop.ins_deferred() returns boolean language plpgsql security definer as $$ begin insert into shop.deferred_tbl values (1); return true; end $$")
+        su.execute("create function shop.ins_deferred() returns boolean language plpgsql as $$ begin insert into shop.deferred_tbl values (1); return true; end $$")
         su.execute("create table shop.bait_trunc (id int, check (shop.nuke()))")
         su.execute("create table shop.bait_grant (id int, check (shop.grab()))")
         su.execute("create table shop.bait_defer (id int, check (shop.ins_deferred()))")
         su.execute("create table shop.bait_ok (id int check (id >= 0))")
         for t in ("victim", "deferred_tbl", "bait_trunc", "bait_grant", "bait_defer", "bait_ok"):
             su.execute(f"grant select, insert on shop.{t} to {AGENT}")
+        su.execute(f"grant truncate on shop.victim to {AGENT}")
+        su.execute(f"grant select on shop.victim to {AGENT} with grant option")
+        # 0.2.7: the same TRUNCATE behind a SECURITY DEFINER function is stopped by the fmgr hook,
+        # before its body runs -- checked by its own reason.
+        su.execute("create function shop.nuke_sd() returns boolean language plpgsql security definer as $$ begin truncate shop.victim; return true; end $$")
+        su.execute("create table shop.bait_sd (id int, check (shop.nuke_sd()))")
+        su.execute(f"grant select, insert on shop.bait_sd to {AGENT}")
 
         def commit_outcome(conn, sql, why):
             pr = conn.execute("select agent_gate.propose(%s, %s)", (sql, why)).fetchone()[0]
@@ -538,6 +549,10 @@ def main():
             if outcome != "aborted" or "nested utility" not in (cr.get("reason") or ""):
                 max_rows_oracle_fails.append(f"nested-utility ({why}): expected abort by 'nested utility', "
                                              f"got outcome={outcome!r} reason={cr.get('reason')!r}")
+        outcome, cr = commit_outcome(probe, "insert into shop.bait_sd values (1)", "security definer check")
+        if outcome != "aborted" or "SECURITY DEFINER function shop.nuke_sd()" not in (cr.get("reason") or ""):
+            max_rows_oracle_fails.append(f"security-definer guard: a CHECK reaching a SECURITY DEFINER function must "
+                                         f"abort naming it, got outcome={outcome!r} reason={cr.get('reason')!r}")
         if su.execute("select count(*) from shop.victim").fetchone()[0] != 50:
             max_rows_oracle_fails.append("nested-utility: a nested TRUNCATE actually emptied the table")
         # positive controls: a benign CHECK is kept, and the session still works right after an abort
@@ -553,7 +568,7 @@ def main():
         su.execute("grant usage, create on schema shop to fuzz_ddl")
         su.execute("select agent_gate.register_agent('fuzz_ddl', 'fuzz_ddl', 'ddl positive control', p_max_rows => 50, p_allow_ddl => true)")
         su.execute(f"grant select, insert on shop.bait_trunc to fuzz_ddl")
-        su.execute(f"grant select on shop.victim to fuzz_ddl")
+        su.execute(f"grant select, truncate on shop.victim to fuzz_ddl")
         with psycopg.connect(DSN, user="fuzz_ddl", autocommit=True) as ddl:
             outcome, cr = commit_outcome(ddl, "create index idxtbl_n on shop.idxtbl (n)", "own index")
             if outcome != "kept":

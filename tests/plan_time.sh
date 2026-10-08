@@ -82,7 +82,25 @@ CREATE FUNCTION vault.peek_stable() RETURNS text LANGUAGE plpgsql STABLE SECURIT
 CREATE FUNCTION vault.boom() RETURNS text LANGUAGE plpgsql IMMUTABLE SECURITY DEFINER AS
   \$\$ BEGIN RAISE EXCEPTION 'leak: %', (SELECT s FROM vault.secret); END \$\$;
 
+-- 0.2.7: SECURITY DEFINER reached through a body the walker cannot see. An IMMUTABLE wrapper that
+-- is NOT security definer passes no_opaque_function; so does a CHECK, which is not in the tree.
+CREATE FUNCTION vault.wrap() RETURNS text LANGUAGE plpgsql IMMUTABLE AS
+  \$\$ BEGIN RETURN vault.peek(); END \$\$;
+CREATE FUNCTION vault.wrap_boom() RETURNS text LANGUAGE plpgsql IMMUTABLE AS
+  \$\$ BEGIN RETURN vault.boom(); END \$\$;
+CREATE FUNCTION vault.ok(t text) RETURNS boolean LANGUAGE plpgsql IMMUTABLE AS
+  \$\$ BEGIN PERFORM vault.peek(); RETURN true; END \$\$;
+-- And the wrapper that must keep working: no SECURITY DEFINER anywhere under it.
+CREATE FUNCTION vault.shout(t text) RETURNS text LANGUAGE plpgsql IMMUTABLE AS
+  \$\$ BEGIN RETURN upper(t); END \$\$;
+CREATE TABLE shop.notes (body text CHECK (vault.ok(body)));
+
 GRANT USAGE ON SCHEMA shop, vault TO :"role";
+-- SELECT too: the gate appends RETURNING to_jsonb(old/new) to a write it runs, which needs it. With
+-- INSERT alone the commit aborts on "permission denied" and the CHECK case below would pass for
+-- that reason on a gate without the hook (found by running this file against 0.2.6).
+GRANT SELECT, INSERT ON shop.notes TO :"role";
+GRANT EXECUTE ON FUNCTION vault.wrap(), vault.wrap_boom(), vault.ok(text), vault.shout(text) TO :"role";
 GRANT SELECT ON shop.orders, shop.catalog TO :"role";
 GRANT EXECUTE ON FUNCTION vault.peek(), vault.peek_stable(), vault.boom() TO :"role";
 ALTER ROLE :"role" SET app.tenant_id = '1';
@@ -149,6 +167,39 @@ equals "and NONE of those calls ran the SECURITY DEFINER body (the counter did n
 out=$(propose "select * from shop.orders where secret = vault.boom()")
 contains "a function that raises its owner's secret is refused" '"ok": false' "$out"
 absent "  ...and the secret is not in what the agent receives" "$SECRET" "$out"
+
+# --- 0.2.7: nor through a body the walker cannot see --------------------------------------
+# The walker sees what the STATEMENT calls. A SECURITY DEFINER function reached through another
+# function, a constraint or a trigger is stopped by the gate's fmgr hook, before its body runs.
+next_proposal() {
+    as_super -c "select coalesce(max(id), 0) + 1 from agent_gate_internal.proposals"
+}
+before=$(hits)
+out=$(propose "select * from shop.orders where secret = vault.wrap()")
+contains "an IMMUTABLE wrapper over a SECURITY DEFINER function is refused at propose" '"ok": false' "$out"
+contains "  ...naming the function it reached" 'SECURITY DEFINER function vault.peek()' "$out"
+id=$(next_proposal)
+out=$(as_agent -c "select agent_gate.propose('select vault.wrap()', 'read through the wrapper')" -c "select agent_gate.commit($id)")
+contains "  ...and a commit of it is refused too" '"outcome": "refused"' "$out"
+out=$(propose "select * from shop.orders where secret = vault.wrap_boom()")
+contains "a wrapper over a function that raises its owner's secret is refused" '"ok": false' "$out"
+absent "  ...and the secret is not in what the agent receives" "$SECRET" "$out"
+# A CHECK is not in the statement's tree and is not evaluated by the planner: the proposal verifies,
+# and the SECURITY DEFINER call happens at commit -- where the hook stops it and nothing is kept.
+id=$(next_proposal)
+out=$(as_agent -c "select agent_gate.propose('insert into shop.notes values (''hello'')', 'write a note')" -c "select agent_gate.commit($id)")
+absent "a CHECK that reaches a SECURITY DEFINER function does not keep the write" '"outcome": "kept"' "$out"
+contains "  ...the gate says why" 'SECURITY DEFINER function vault.peek()' "$out"
+equals "  ...and the table is still empty, seen by the superuser" 0 "$(as_super -c 'select count(*) from shop.notes')"
+equals "none of the wrapper, the raising wrapper or the CHECK ran the SECURITY DEFINER body" "$before" "$(hits)"
+# What must keep working: a wrapper with no SECURITY DEFINER under it.
+id=$(next_proposal)
+out=$(as_agent -c "select agent_gate.propose(\$q\$select vault.shout('quiet') as s\$q\$, 'shout')" -c "select agent_gate.commit($id)")
+contains "a wrapper with no SECURITY DEFINER under it still verifies and runs" 'QUIET' "$out"
+# The control: the wrapper DOES reach the function, or the counter above proved nothing.
+before=$(hits)
+as_super -c "select vault.wrap()" >/dev/null
+equals "control: the superuser calls vault.wrap() once and the counter moves by 1" $((before + 1)) "$(hits)"
 
 # Privileges are still the FIRST thing a proposal fails on. The analyzer that now runs before
 # the planner does not check them (EXPLAIN did, at executor start), so without a check of its own
