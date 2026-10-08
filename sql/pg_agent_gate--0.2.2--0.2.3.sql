@@ -47,6 +47,34 @@ $$;
 REVOKE EXECUTE ON FUNCTION agent_gate.allow_write(text, regclass, text) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION agent_gate.disallow_write(text, regclass) FROM PUBLIC;
 
+-- The single decision shared by propose (verify.rs) and discover, so they never disagree: the
+-- first unsafe amplifier (cascade or rule -- never allow-listable in 0.2.3; a user trigger unless
+-- the target is allowed AND its function is not SECURITY DEFINER) reachable from a write, over
+-- inheritance children, or NULL.
+CREATE FUNCTION agent_gate_internal._unsafe_amplifier(p_target oid, p_allowed bigint[])
+RETURNS text LANGUAGE sql STABLE SET search_path = pg_catalog, agent_gate_internal AS $$
+    WITH RECURSIVE d(oid) AS (
+        SELECT p_target
+        UNION
+        SELECT i.inhrelid FROM pg_inherits i JOIN d ON i.inhparent = d.oid
+    )
+    SELECT label FROM (
+        SELECT 'cascading foreign key '||co.conname AS label
+          FROM pg_constraint co JOIN d ON d.oid = co.confrelid
+         WHERE co.contype = 'f' AND (co.confdeltype IN ('c','n','d') OR co.confupdtype IN ('c','n','d'))
+        UNION ALL
+        SELECT 'trigger '||tg.tgname
+          FROM pg_trigger tg JOIN d ON d.oid = tg.tgrelid
+          JOIN pg_proc p ON p.oid = tg.tgfoid
+         WHERE NOT tg.tgisinternal
+           AND (p_target::bigint <> ALL (coalesce(p_allowed, '{}'::bigint[])) OR p.prosecdef)
+        UNION ALL
+        SELECT 'rule '||rw.rulename
+          FROM pg_rewrite rw JOIN d ON d.oid = rw.ev_class
+         WHERE rw.rulename <> '_RETURN'
+    ) s LIMIT 1
+$$;
+
 -- _agent now also reports the allow-list (DISCOVER_SQL's third parameter and config() read it).
 CREATE OR REPLACE FUNCTION agent_gate_internal._agent(p_name text) RETURNS jsonb
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, agent_gate_internal AS $$

@@ -213,6 +213,37 @@ BEGIN
          WHERE a.name = p_name);
 END $$;
 
+-- The one place that decides whether writing a relation fires something the gate cannot vouch for.
+-- propose (through verify.rs) and discover both call it, so they can never disagree. Recurses over
+-- inheritance children. A cascading foreign key and a rule are NEVER allow-listable in 0.2.3 (a
+-- referential action runs as the table owner and can chain past RLS; the recursive closure that
+-- would make some cascades safe lands in 0.2.4). A user trigger is allow-listable only when the
+-- target is in p_allowed AND the trigger's own function is not SECURITY DEFINER. Returns the first
+-- such object's name, or NULL when nothing unsafe is reachable. Catalog-only, so STABLE and invoker.
+CREATE FUNCTION agent_gate_internal._unsafe_amplifier(p_target oid, p_allowed bigint[])
+RETURNS text LANGUAGE sql STABLE SET search_path = pg_catalog, agent_gate_internal AS $$
+    WITH RECURSIVE d(oid) AS (
+        SELECT p_target
+        UNION
+        SELECT i.inhrelid FROM pg_inherits i JOIN d ON i.inhparent = d.oid
+    )
+    SELECT label FROM (
+        SELECT 'cascading foreign key '||co.conname AS label
+          FROM pg_constraint co JOIN d ON d.oid = co.confrelid
+         WHERE co.contype = 'f' AND (co.confdeltype IN ('c','n','d') OR co.confupdtype IN ('c','n','d'))
+        UNION ALL
+        SELECT 'trigger '||tg.tgname
+          FROM pg_trigger tg JOIN d ON d.oid = tg.tgrelid
+          JOIN pg_proc p ON p.oid = tg.tgfoid
+         WHERE NOT tg.tgisinternal
+           AND (p_target::bigint <> ALL (coalesce(p_allowed, '{}'::bigint[])) OR p.prosecdef)
+        UNION ALL
+        SELECT 'rule '||rw.rulename
+          FROM pg_rewrite rw JOIN d ON d.oid = rw.ev_class
+         WHERE rw.rulename <> '_RETURN'
+    ) s LIMIT 1
+$$;
+
 CREATE FUNCTION agent_gate_internal._acts(p_agent text, p_limit integer) RETURNS jsonb
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, agent_gate_internal AS $$
 BEGIN
@@ -411,24 +442,7 @@ rel_json as (
             case when has_table_privilege(r.oid, 'INSERT') then 'insert' end,
             case when has_table_privilege(r.oid, 'UPDATE') then 'update' end,
             case when has_table_privilege(r.oid, 'DELETE') then 'delete' end], null)),
-        'write_refused', (
-            with recursive descendants(oid) as (
-                select r.oid
-                union
-                select i.inhrelid from pg_inherits i join descendants d on i.inhparent = d.oid
-            )
-            select case when r.oid::bigint = any($3::bigint[])
-                        then null
-                   else (select label from (
-                           select 'cascading foreign key '||conname as label from pg_constraint
-                             where contype='f' and confrelid in (select oid from descendants)
-                               and (confdeltype in ('c','n','d') or confupdtype in ('c','n','d'))
-                           union all select 'trigger '||tgname from pg_trigger
-                             where tgrelid in (select oid from descendants) and not tgisinternal
-                           union all select 'rule '||rulename from pg_rewrite
-                             where ev_class in (select oid from descendants) and rulename <> '_RETURN'
-                         ) s limit 1)
-                   end),
+        'write_refused', agent_gate_internal._unsafe_amplifier(r.oid, $3::bigint[]),
         'comment', obj_description(r.oid, 'pg_class'),
         'columns', (select jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
                         'name', a.attname,

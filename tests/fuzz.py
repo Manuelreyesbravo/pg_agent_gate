@@ -470,6 +470,19 @@ def main():
             if got != want:
                 max_rows_oracle_fails.append(f"backstop/allow-list k={k}: expected {want}, got {got}")
         su.execute("select agent_gate.disallow_write('fuzzer', 'shop.items')")
+        # a SECURITY DEFINER trigger is NOT allow-listable (it runs as its owner): even allow-listed,
+        # a write to its table stays refused.
+        su.execute("create table shop.sditems (id int primary key, n int)")
+        su.execute("insert into shop.sditems values (1, 1)")
+        su.execute("create function shop.ausd() returns trigger language plpgsql security definer as $$ begin insert into shop.log(m) values ('sd'); return new; end $$")
+        su.execute("create trigger ausd after update on shop.sditems for each row execute function shop.ausd()")
+        su.execute(f"alter table shop.sditems owner to {AGENT}")
+        su.execute("select agent_gate.allow_write('fuzzer', 'shop.sditems', 'should NOT help: trigger is SECURITY DEFINER')")
+        pr = probe.execute("select agent_gate.propose(%s, %s)",
+                           ("update shop.sditems set n = n + 1 where id = 1", "backstop check")).fetchone()[0]
+        if isinstance(pr, dict) and pr.get("ok") is True:
+            max_rows_oracle_fails.append("allow-list accepted a SECURITY DEFINER trigger table -- it must stay refused")
+        su.execute("select agent_gate.disallow_write('fuzzer', 'shop.sditems')")
         run_schema(); baseline = full_fp()
         probe.close()
 

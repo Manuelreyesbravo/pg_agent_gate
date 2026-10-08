@@ -272,11 +272,11 @@ pub(crate) fn verify(
                             "no_amplification",
                             false,
                             format!(
-                                "writing this table fires {obj}, which can change rows outside the \
-                                 agent's reach and tenant and is not counted against max_rows. If it is \
-                                 legitimate -- an updated_at or audit trigger that is not SECURITY \
-                                 DEFINER, or a cascade to a table the agent may change that has no \
-                                 row-level security -- allow it with agent_gate.allow_write"
+                                "writing this table fires {obj}, whose effect the gate cannot check \
+                                 and which is not counted against max_rows. A non-SECURITY DEFINER \
+                                 trigger you accept can be allow-listed with agent_gate.allow_write; a \
+                                 cascade, a rule, or a SECURITY DEFINER trigger cannot be allow-listed \
+                                 in this version -- remove it or restructure the write"
                             ),
                         );
                         return v;
@@ -385,60 +385,27 @@ unsafe fn collect_target(q: *mut pg_sys::Query, tree: &mut Tree) {
     }
 }
 
-/// The first cascading inbound foreign key, user trigger or rule on any target table OR an
-/// inheritance/partition child of one -- the planner, not the analyzer, expands those, so the
-/// catalog is asked about the whole hierarchy. `Ok(None)` means nothing amplifies this write;
-/// `Ok(Some(name))` names the object to refuse; `Err` is a lookup that failed -- which must refuse,
-/// never pass (the fail-closed the first version got wrong by swallowing the error into None).
+/// The first UNSAFE amplifier -- a cascade, a user trigger or a rule that writing a target (or an
+/// inheritance child of one) fires and the gate cannot vouch for -- across the targets, or `None`.
+/// The decision lives in ONE SQL function, agent_gate_internal._unsafe_amplifier, which `discover`
+/// calls too, so the two never disagree. `Err` is a lookup that failed and must refuse, never pass.
 fn amplifying_object(targets: &[pg_sys::Oid], allowed: &[u32]) -> Result<Option<String>, String> {
     if targets.is_empty() {
         return Ok(None);
     }
     let ids = targets.iter().map(|o| o.to_u32().to_string()).collect::<Vec<_>>().join(",");
     let allow = if allowed.is_empty() {
-        "array[]::oid[]".to_string()
+        "array[]::bigint[]".to_string()
     } else {
-        format!("array[{}]::oid[]", allowed.iter().map(|o| o.to_string()).collect::<Vec<_>>().join(","))
+        format!("array[{}]::bigint[]", allowed.iter().map(|o| o.to_string()).collect::<Vec<_>>().join(","))
     };
-    // The first amplifier on a target -- or an inheritance/partition child of one -- that is UNSAFE.
-    // An amplifier is unsafe unless its target was allow-listed AND it is one the agent could already
-    // have caused directly, so the allow-list never buys an escalation (the 0.2.2 breach, which a
-    // blanket allow-list reopened):
-    //   cascade  -> safe only if the agent has the action's privilege on the CHILD and the child has
-    //               no row-level security (a referential action runs as the table owner and ignores
-    //               RLS, so with RLS it would cross tenants the agent cannot);
-    //   trigger  -> safe only if its function is not SECURITY DEFINER (else it runs as its owner);
-    //   rule     -> never safe (it rewrites to statements the gate never saw).
-    // A scalar subquery, so the result is one row: the name, or NULL when nothing is unsafe. get_one
-    // gives Ok(Some)/Ok(None); only a real failure gives Err -- "no rows" is never "nothing to find".
+    // A scalar subquery, so the result is exactly one row: the first unsafe amplifier's name, or
+    // NULL. get_one then gives Ok(Some)/Ok(None); only a real failure gives Err.
     let sql = format!(
-        "select (
-           with recursive d(root, oid) as (
-             select o, o from unnest(array[{ids}]::oid[]) o
-             union
-             select d.root, i.inhrelid from pg_catalog.pg_inherits i join d on i.inhparent = d.oid
-           ),
-           allowed(oid) as (select unnest({allow}))
-           select label from (
-             select 'cascading foreign key '||co.conname as label
-               from pg_catalog.pg_constraint co join d on d.oid = co.confrelid
-              where co.contype='f' and (co.confdeltype in ('c','n','d') or co.confupdtype in ('c','n','d'))
-                and (d.root not in (select oid from allowed)
-                     or not (((co.confdeltype not in ('c','n','d')) or pg_catalog.has_table_privilege(co.conrelid, 'DELETE'))
-                         and ((co.confupdtype not in ('c','n','d')) or pg_catalog.has_table_privilege(co.conrelid, 'UPDATE'))
-                         and not coalesce((select relrowsecurity from pg_catalog.pg_class where oid = co.conrelid), true)))
-             union all
-             select 'trigger '||tg.tgname
-               from pg_catalog.pg_trigger tg join d on d.oid = tg.tgrelid
-               join pg_catalog.pg_proc p on p.oid = tg.tgfoid
-              where not tg.tgisinternal
-                and (d.root not in (select oid from allowed) or p.prosecdef)
-             union all
-             select 'rule '||rw.rulename
-               from pg_catalog.pg_rewrite rw join d on d.oid = rw.ev_class
-              where rw.rulename <> '_RETURN'
-           ) s limit 1
-         )"
+        "select (select x.label
+                   from unnest(array[{ids}]::oid[]) t,
+                        lateral (select agent_gate_internal._unsafe_amplifier(t, {allow}) as label) x
+                  where x.label is not null limit 1)"
     );
     Spi::get_one::<String>(&sql).map_err(|e| e.to_string())
 }

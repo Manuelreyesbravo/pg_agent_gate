@@ -506,6 +506,12 @@ That is not overhead to optimize away; it is what makes an agent's actions
 auditable. With `durable` every one of those records pays its own flush, which is
 the 2.6 ms.
 
+These numbers are on a small schema. Two of the checks scale with the catalog: the
+commit backstop reads `pg_stat_xact_user_tables` (twice per kept write), and
+`no_amplification` walks the inheritance of the target. On a database with thousands
+of tables, expect the per-act cost to grow; re-run `make bench` against your own schema
+rather than trust these.
+
 **Every pair of the throughput test**, because a median hides how noisy one
 pair is. Loss with the library preloaded, in %: `0.42`, `1.71`, `0.4`, `-0.37`,
 `0.24`, `-21.07`, `-0.75`. One 15-second `bare` run hiccuped -- that -21% is its
@@ -658,14 +664,25 @@ Said here so nobody learns it the hard way:
   user functions pass. There is no allow-list for functions in 0.2.3, so a volatile
   helper that does not write should be marked `STABLE` or `IMMUTABLE`. Measured
   (`tests/hostile.sh`): such a function inside a WRITE is refused and writes nothing.
+* **The function check does not yet reach every position in a read.** `no_opaque_function`
+  walks direct calls, operators, `= ANY`/`IN`, aggregates and window functions, but NOT a
+  function reached through a row comparison (`RowCompareExpr`), an aggregate's own transition
+  or final functions, or an I/O cast. A `SECURITY DEFINER` function a DBA put in one of those
+  positions, inside a READ, could return rows the agent cannot see -- a disclosure, which a
+  rolled-back subtransaction does not undo and the commit backstop (writes only) does not
+  bound. It needs a DBA-defined definer object in exactly that spot; closed next by resolving
+  `pg_aggregate` and the `RowCompareExpr` operators.
 * **A cascade, trigger or rule that amplifies a write is refused (0.2.2/0.2.3).**
   Its extra rows run as the table owner, outside the agent's `max_rows` and -- for a
   referential action -- its tenant. `agent_gate.allow_write(agent, table)` re-permits
-  one table, but ONLY where it is provably safe: a cascade to a child the agent may
-  change that has no row-level security, or a trigger whose function is not `SECURITY
-  DEFINER`; a rule, a SECURITY DEFINER trigger, or a cascade into an RLS table stays
-  refused even when allow-listed. The commit backstop still counts every amplified row
-  against `max_rows` (it over-counts, the safe side, and does not see `TRUNCATE`).
+  one table, but only for what the gate can check: a trigger whose own function is not
+  `SECURITY DEFINER`. A cascade and a rule are NOT allow-listable in 0.2.3 (making some
+  cascades safe needs a recursive closure over the cascade edges, and lands in 0.2.4),
+  and a SECURITY DEFINER trigger never is. The commit backstop still counts every
+  amplified row against `max_rows` (it over-counts, the safe side, and does not see
+  `TRUNCATE`). "What the gate can check" is the honest bound: a non-SECURITY DEFINER
+  trigger can still call a SECURITY DEFINER function in its body, which the gate does
+  not see -- but it runs as the agent and its rows are counted.
 * **A view is checked with its owner's privileges unless it was created with
   `security_invoker`.** An agent granted `SELECT` on such a view reads the
   tables behind it, including ones it has no privilege on at all: measured, a
