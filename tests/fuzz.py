@@ -421,16 +421,22 @@ def main():
                 else:
                     if outcome == "kept" or moved != 0:
                         max_rows_oracle_fails.append(f"k={k} {name}: expected abort & 0 rows, got outcome={outcome} moved={moved}")
-        # (e) a write a cascade or a user trigger could amplify beyond the agent's tenant must be
-        # REFUSED at propose -- the cross-tenant breach fixed in 0.2.2 (a referential action runs as
-        # the table owner and does NOT force RLS, so a tenant-1 agent deleting a tenant-1 parent
-        # cascade-deleted a tenant-2 child). Build both and assert the gate refuses the write.
+        # (e) anything whose effect the gate cannot see or bound must be REFUSED at propose: an
+        # inbound cascading FK or a user trigger (0.2.2 -- the referential action ran as the owner
+        # outside RLS and deleted a tenant-2 child), and a user function that is volatile or SECURITY
+        # DEFINER (0.2.3 -- an opaque body may write uncounted or run as its owner). Build each and
+        # assert refusal.
         run_schema()
         su.execute("create table shop.child (id int primary key, parent int references shop.customers(id) on delete cascade)")
         su.execute("create function shop.tf() returns trigger language plpgsql as $$ begin return new; end $$")
         su.execute("create trigger ct after insert on shop.child for each row execute function shop.tf()")
+        su.execute("create function shop.wf() returns int language plpgsql volatile as $$ begin insert into shop.orders values (501,1,1,1); return 1; end $$")
+        su.execute("create function shop.sd() returns int language sql security definer as $$ select 1 $$")
+        su.execute(f"grant execute on function shop.wf(), shop.sd() to {AGENT}")
         for why, danger in (("inbound cascade", "delete from shop.customers where id = 1"),
-                            ("user trigger", "insert into shop.child values (1, 1)")):
+                            ("user trigger", "insert into shop.child values (1, 1)"),
+                            ("opaque volatile function", "select shop.wf()"),
+                            ("security definer function", "select shop.sd()")):
             pr = probe.execute("select agent_gate.propose(%s, %s)", (danger, "amplification check")).fetchone()[0]
             if isinstance(pr, dict) and pr.get("ok") is True:
                 max_rows_oracle_fails.append(f"amplification ({why}): propose ACCEPTED {danger!r} -- it must be refused")

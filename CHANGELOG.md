@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased (towards 0.2.3)
+
+* **An opaque user function amplifies a write the same way a cascade did.** A SELECT
+  may call a user function whose body the gate cannot see: a volatile one may write rows
+  no one counts, a SECURITY DEFINER one runs as its owner, outside the agent's tenant.
+  New propose check `no_opaque_function`: a statement that calls a user function which is
+  volatile or SECURITY DEFINER is refused, naming it. Built-ins (pg_catalog) and
+  non-volatile, non-SECURITY DEFINER user functions pass. Measured: `select wf()` and
+  `select * from wf()` for a writing volatile function, and a SECURITY DEFINER function,
+  refused; `random()`, `now()`, a pure user function and plain DML pass. Regression in
+  `tests/fuzz.py`, run on every push.
+* Still to come in this version: a commit-time row-count backstop
+  (`pg_stat_xact_user_tables` delta vs `max_rows`, both snapshots in one subtransaction)
+  and a per-agent allow-list for legitimate triggers and functions, with `discover`
+  flagging which tables are refused and why. Not tagged until those land.
+
 ## 0.2.2 -- 2026-10-07
 
 A cross-tenant breach, the same shape as the 0.2.1 bugs -- the gate counted the

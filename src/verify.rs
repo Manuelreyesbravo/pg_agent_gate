@@ -218,8 +218,8 @@ pub(crate) fn verify(sql: &str, params: &Option<Vec<Option<String>>>, allow_ddl:
     // Both are refused, failing closed. The tree is the analyzer's and the rewriter's
     // (views expanded), and set_config is matched by OID wherever it sits: where, from,
     // a sublink, a CTE, schema-qualified or not.
-    // NOT covered, and said in the README: a function that already exists and calls
-    // set_config in its own body -- that body is not in this tree.
+    // A user function's body is not in this tree, so it could call set_config or write rows no one
+    // counts. If it is volatile or SECURITY DEFINER, no_opaque_function below refuses the statement.
     if kind != Kind::Ddl {
         let n_params = params.as_ref().map_or(0, |p| p.len());
         match in_subxact(|| unsafe { analyze_tree(&v.statement, n_params) }, |_| false) {
@@ -292,6 +292,35 @@ pub(crate) fn verify(sql: &str, params: &Option<Vec<Option<String>>>, allow_ddl:
                         );
                     }
                 }
+                match risky_function(&tree.funcs) {
+                    Err(why) => {
+                        v.kind = Some(kind);
+                        v.check(
+                            "no_opaque_function",
+                            false,
+                            format!("the catalog lookup for the statement's functions failed, so it \
+                                     cannot be proven safe: {why}"),
+                        );
+                        return v;
+                    }
+                    Ok(Some(f)) => {
+                        v.kind = Some(kind);
+                        v.check(
+                            "no_opaque_function",
+                            false,
+                            format!("the statement calls {f}; a user function that is volatile or \
+                                     SECURITY DEFINER has a body the gate cannot see -- it may write \
+                                     rows no one counts, or run as its owner outside the agent's tenant"),
+                        );
+                        return v;
+                    }
+                    Ok(None) => v.check(
+                        "no_opaque_function",
+                        true,
+                        "every function called is a vetted built-in, or a user function that is \
+                         neither volatile nor SECURITY DEFINER",
+                    ),
+                }
             }
             Err(f) => {
                 v.kind = Some(kind);
@@ -320,6 +349,10 @@ struct Tree {
     /// user trigger or a rule whose effect is not counted against max_rows (and, for a referential
     /// action, runs as the table owner outside row-level security).
     targets: Vec<pg_sys::Oid>,
+    /// Every function the statement calls (direct call, operator, aggregate, window). A USER
+    /// function that is volatile or SECURITY DEFINER has a body the gate cannot see: it may write
+    /// (uncounted, like a trigger) or run as its owner (outside the agent's tenant, like a cascade).
+    funcs: Vec<pg_sys::Oid>,
 }
 
 /// Record a Query's result relation. A data-modifying command sets `modifies`; a locking read does
@@ -378,6 +411,30 @@ fn amplifying_object(targets: &[pg_sys::Oid]) -> Result<Option<String>, String> 
     Spi::get_one::<String>(&sql).map_err(|e| e.to_string())
 }
 
+/// A USER function the statement calls that the gate cannot vouch for: volatile (its body may
+/// write rows no one counted, like a trigger) or SECURITY DEFINER (it runs as its owner, outside
+/// the agent's tenant, like a cascade). Built-in functions (pg_catalog and friends) are vetted and
+/// excluded, as is a non-volatile, non-SECURITY DEFINER user function. Ok(None) = all vouched,
+/// Ok(Some(name)) = refuse naming it, Err = lookup failed (refuse, fail closed).
+fn risky_function(funcs: &[pg_sys::Oid]) -> Result<Option<String>, String> {
+    if funcs.is_empty() {
+        return Ok(None);
+    }
+    let ids = funcs.iter().map(|o| o.to_u32().to_string()).collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "select (
+           select 'function '||n.nspname||'.'||p.proname||
+                  case when p.prosecdef then ' (security definer)' else ' (volatile)' end
+             from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid = p.pronamespace
+             where p.oid in ({ids})
+               and n.nspname not in ('pg_catalog', 'information_schema', 'pg_toast')
+               and (p.prosecdef or p.provolatile = 'v')
+             limit 1
+         )"
+    );
+    Spi::get_one::<String>(&sql).map_err(|e| e.to_string())
+}
+
 /// Parses the (already verified, single) statement again, runs PostgreSQL's analyzer and
 /// rewriter on it with the parameters typed as text -- the way EXPLAIN and the execution
 /// receive them -- and walks every query the rewriter produced.
@@ -415,11 +472,26 @@ unsafe extern "C-unwind" fn walk(node: *mut pg_sys::Node, context: *mut c_void) 
     }
     let tree = &mut *(context as *mut Tree);
     match (*node).type_ {
-        pg_sys::NodeTag::T_FuncExpr
-            if (*(node as *mut pg_sys::FuncExpr)).funcid == pg_sys::Oid::from(pg_sys::F_SET_CONFIG) =>
-        {
-            tree.set_config = true;
-            true
+        pg_sys::NodeTag::T_FuncExpr => {
+            let fe = node as *mut pg_sys::FuncExpr;
+            tree.funcs.push((*fe).funcid);
+            if (*fe).funcid == pg_sys::Oid::from(pg_sys::F_SET_CONFIG) {
+                tree.set_config = true;
+                return true;
+            }
+            pg_sys::expression_tree_walker_impl(node, Some(walk), context)
+        }
+        pg_sys::NodeTag::T_OpExpr | pg_sys::NodeTag::T_DistinctExpr | pg_sys::NodeTag::T_NullIfExpr => {
+            tree.funcs.push((*(node as *mut pg_sys::OpExpr)).opfuncid);
+            pg_sys::expression_tree_walker_impl(node, Some(walk), context)
+        }
+        pg_sys::NodeTag::T_Aggref => {
+            tree.funcs.push((*(node as *mut pg_sys::Aggref)).aggfnoid);
+            pg_sys::expression_tree_walker_impl(node, Some(walk), context)
+        }
+        pg_sys::NodeTag::T_WindowFunc => {
+            tree.funcs.push((*(node as *mut pg_sys::WindowFunc)).winfnoid);
+            pg_sys::expression_tree_walker_impl(node, Some(walk), context)
         }
         pg_sys::NodeTag::T_Query => {
             let q = node as *mut pg_sys::Query;
