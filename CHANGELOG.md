@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.2.2 -- 2026-10-07
+
+A cross-tenant breach, the same shape as the 0.2.1 bugs -- the gate counted the
+top-level statement and the real effect was larger -- but worse, because the
+extra effect also escaped row-level security. Found by the fuzzer's cascade
+probe against a two-tenant database with a superuser watching.
+
+* **A referential action amplified a write across tenants.** A referential
+  action (ON DELETE/UPDATE CASCADE, SET NULL, SET DEFAULT) runs as the table
+  owner and does NOT force RLS. A tenant-1 agent deleting a tenant-1 parent
+  cascade-deleted a **tenant-2** child row it could never have named -- the gate
+  reported one row and kept it. User triggers and rules amplify the same way.
+  New check `no_amplification`: a write whose target has an inbound cascading
+  foreign key, a user trigger or a rule is refused at `propose`, naming it.
+* Regression: `tests/fuzz.py` gained an amplification teeth check (cascade and
+  trigger) and a k=1..8 differential oracle for `max_rows`, both run on every
+  push via `FUZZ_ITERS=0`. Red against 0.2.1.
+* No schema changes; the upgrade script only moves the version.
+
 ## 0.2.1 -- 2026-10-06
 
 Two holes, found by an LLM proposing through the gate against a two-tenant

@@ -246,6 +246,25 @@ pub(crate) fn verify(sql: &str, params: &Option<Vec<Option<String>>>, allow_ddl:
                     return v;
                 }
                 v.check("keeps_its_context", true, "nothing in the statement calls set_config()");
+                if let Some(obj) = amplifying_object(&tree.targets) {
+                    v.kind = Some(kind);
+                    v.check(
+                        "no_amplification",
+                        false,
+                        format!(
+                            "writing this table fires {obj}, whose effect runs as the table owner \
+                             outside the agent's tenant and is not counted against max_rows: a \
+                             cascading foreign key, trigger or rule can change rows the agent could \
+                             never name (set_config aside, this is the other way the top-level count lies)"
+                        ),
+                    );
+                    return v;
+                }
+                v.check(
+                    "no_amplification",
+                    true,
+                    "no cascading foreign key, user trigger or rule can amplify this write beyond its own rows",
+                );
             }
             Err(f) => {
                 v.kind = Some(kind);
@@ -265,6 +284,45 @@ pub(crate) fn verify(sql: &str, params: &Option<Vec<Option<String>>>, allow_ddl:
 struct Tree {
     writing_cte: bool,
     set_config: bool,
+    /// Relations a write in this statement targets (its result relations), so the catalog can be
+    /// asked whether writing them fires anything -- a cascading foreign key, a user trigger or a
+    /// rule -- that runs as the table owner, outside the agent's tenant, uncounted by max_rows.
+    targets: Vec<pg_sys::Oid>,
+}
+
+/// Record a Query's result relation (the table an INSERT/UPDATE/DELETE/MERGE writes), if any.
+unsafe fn collect_target(q: *mut pg_sys::Query, tree: &mut Tree) {
+    if (*q).commandType != pg_sys::CmdType::CMD_SELECT && (*q).resultRelation > 0 {
+        let rte = pg_sys::list_nth((*q).rtable, (*q).resultRelation - 1) as *mut pg_sys::RangeTblEntry;
+        if !rte.is_null() && (*rte).relid != pg_sys::InvalidOid {
+            tree.targets.push((*rte).relid);
+        }
+    }
+}
+
+/// The first cascading inbound foreign key, user trigger or rule on any target table -- the ways a
+/// single top-level write amplifies into rows the gate never counted and RLS never filtered (a
+/// referential action runs as the table owner and does not force row-level security). None means
+/// the write touches only its own rows.
+fn amplifying_object(targets: &[pg_sys::Oid]) -> Option<String> {
+    if targets.is_empty() {
+        return None;
+    }
+    let ids = targets.iter().map(|o| o.to_u32().to_string()).collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "select label from (
+           select 'foreign key '||conname as label from pg_catalog.pg_constraint
+             where contype='f' and confrelid in ({ids})
+               and (confdeltype in ('c','n','d') or confupdtype in ('c','n','d'))
+           union all
+           select 'trigger '||tgname from pg_catalog.pg_trigger
+             where tgrelid in ({ids}) and not tgisinternal
+           union all
+           select 'rule '||rulename from pg_catalog.pg_rewrite
+             where ev_class in ({ids}) and rulename <> '_RETURN'
+         ) s limit 1"
+    );
+    Spi::get_one::<String>(&sql).ok().flatten()
 }
 
 /// Parses the (already verified, single) statement again, runs PostgreSQL's analyzer and
@@ -286,6 +344,7 @@ unsafe fn analyze_tree(statement: &str, n_params: usize) -> Tree {
     for i in 0..list_len(queries) {
         let q = pg_sys::list_nth(queries, i) as *mut pg_sys::Query;
         tree.writing_cte |= (*q).hasModifyingCTE;
+        collect_target(q, &mut tree);
         pg_sys::query_tree_walker_impl(q, Some(walk), &mut tree as *mut Tree as *mut c_void, 0);
         if tree.set_config {
             break;
@@ -312,6 +371,7 @@ unsafe extern "C-unwind" fn walk(node: *mut pg_sys::Node, context: *mut c_void) 
         pg_sys::NodeTag::T_Query => {
             let q = node as *mut pg_sys::Query;
             tree.writing_cte |= (*q).hasModifyingCTE;
+            collect_target(q, tree);
             pg_sys::query_tree_walker_impl(q, Some(walk), context, 0)
         }
         _ => pg_sys::expression_tree_walker_impl(node, Some(walk), context),

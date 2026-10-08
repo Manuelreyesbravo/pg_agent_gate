@@ -1,0 +1,25 @@
+-- 0.2.1 -> 0.2.2
+--
+-- Nothing to change in the schema: the fix lives in the library (verify.rs) and reaches a
+-- database the moment the new .so is loaded. The script exists so the catalog says which version
+-- is running -- an extension whose behaviour changed under the same version number is the failure
+-- this family of extensions exists to close.
+--
+-- What 0.2.2 refuses at propose, found by the fuzzer's cascade probe against a two-tenant
+-- database with a superuser watching (2026-10-07):
+--
+-- AMPLIFICATION BEYOND THE TOP-LEVEL STATEMENT -- a cross-tenant breach, not just a miscount.
+-- max_rows counted the rows of the top-level statement, but a referential action runs as the
+-- table OWNER and does NOT force row-level security. A tenant-1 agent deleting a tenant-1 parent
+-- cascade-deleted a TENANT-2 child row (`delete from customers` -> ON DELETE CASCADE -> a
+-- tenant-2 order), which the agent could never have named directly. The gate reported one row
+-- affected and kept it.
+--
+-- New check `no_amplification`: a write whose target table has an inbound foreign key with a
+-- cascading action (ON DELETE/UPDATE CASCADE, SET NULL, SET DEFAULT), a user trigger, or a rule
+-- is refused at propose, naming the constraint, trigger or rule. The effect of such an object
+-- is not bounded by the agent's tenant or by max_rows, so the write cannot be proven safe.
+--
+-- Same shape as the two 0.2.1 bugs: the gate counted the statement and the real effect was
+-- larger. Regression case is red against 0.2.1 (tests/fuzz.py, the amplification teeth check and
+-- the k=1..8 differential oracle, run on every push).

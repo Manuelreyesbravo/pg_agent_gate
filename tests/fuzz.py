@@ -415,6 +415,19 @@ def main():
                 else:
                     if outcome == "kept" or moved != 0:
                         max_rows_oracle_fails.append(f"k={k} {name}: expected abort & 0 rows, got outcome={outcome} moved={moved}")
+        # (e) a write a cascade or a user trigger could amplify beyond the agent's tenant must be
+        # REFUSED at propose -- the cross-tenant breach fixed in 0.2.2 (a referential action runs as
+        # the table owner and does NOT force RLS, so a tenant-1 agent deleting a tenant-1 parent
+        # cascade-deleted a tenant-2 child). Build both and assert the gate refuses the write.
+        run_schema()
+        su.execute("create table shop.child (id int primary key, parent int references shop.customers(id) on delete cascade)")
+        su.execute("create function shop.tf() returns trigger language plpgsql as $$ begin return new; end $$")
+        su.execute("create trigger ct after insert on shop.child for each row execute function shop.tf()")
+        for why, danger in (("inbound cascade", "delete from shop.customers where id = 1"),
+                            ("user trigger", "insert into shop.child values (1, 1)")):
+            pr = probe.execute("select agent_gate.propose(%s, %s)", (danger, "amplification check")).fetchone()[0]
+            if isinstance(pr, dict) and pr.get("ok") is True:
+                max_rows_oracle_fails.append(f"amplification ({why}): propose ACCEPTED {danger!r} -- it must be refused")
         run_schema(); baseline = full_fp()
         probe.close()
 
