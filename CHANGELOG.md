@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.2.6 -- unreleased
+
+Two findings, both measured against 0.2.5 on PostgreSQL 18.6 with the extension built and
+installed, and both red in the new suite before the fix (`tests/plan_time.sh`).
+
+* **A function the gate refuses no longer runs while it is being verified (high).** The `resolves`
+  check was an `EXPLAIN`, and it came before the tree walk that refuses an opaque function. Planning
+  runs functions: it constant-folds an `IMMUTABLE` call with constant arguments and estimates a
+  `STABLE` one by calling it. So `propose('... where secret = vault.peek()')`, with `vault.peek()`
+  `IMMUTABLE SECURITY DEFINER`, ran the function as its owner and only then was refused by
+  `no_opaque_function` -- measured: a non-transactional counter moved once per refused proposal, 5
+  of 5, `propose_and_commit` included. A function that raised returned its owner's secret verbatim
+  in the `resolves` detail the agent receives (`[P0001] leak: s3cr3t-from-vault`), under a check
+  whose text said "nothing ran". Now every refusal (`no_writing_cte`, `keeps_its_context`,
+  `no_amplification`, `no_opaque_function`) is decided on the analyzed and rewritten tree, which
+  runs nothing, and the planner only sees what passed: the counter stays at 0 and the refusal names
+  the function, not what it would have raised. A name or type that does not resolve still fails
+  `resolves`, now at the analyzer. The order of the checks in the verdict changed accordingly.
+  Privileges are still the first thing a proposal fails on: the analyzer does not check them (the
+  `EXPLAIN` did, at executor start), so the gate now runs the executor's own `ExecCheckPermissions`
+  on every analyzed query. Without it -- measured on the first cut of this fix -- an agent with no
+  grant on a table was told which trigger writing it fires before its `permission denied`.
+* **`estimated_rows` is withheld under row-level security (medium-low).** The estimate comes from
+  statistics gathered over the whole table, beneath the policy. Measured with an agent of tenant 1
+  on a table of 100 tenants: a value only tenant 2 has, 5000 times, was estimated at 34 rows; an
+  absent value at 1. The agent cannot run `EXPLAIN` itself, so the gate was the only channel. It is
+  now `null` whenever PostgreSQL's `row_security_active()` is true for a relation the statement
+  touches (a superuser, a `BYPASSRLS` role and an owner without `FORCE` keep it), and `null` if that
+  lookup fails. Without row-level security the estimate is unchanged -- the suite checks that too,
+  or a `null` would only say the gate stopped estimating.
+* **Still open, and now documented as such:** a non-volatile, non-`SECURITY DEFINER` user function
+  passes `no_opaque_function` and its body is not walked, so a `SECURITY DEFINER` call INSIDE it runs
+  -- at `commit`, as in 0.2.5, and also at `propose` when the planner folds the wrapper. Measured:
+  an `IMMUTABLE` wrapper over `vault.peek()` is accepted and runs it at propose and at commit. It is
+  the class the README already lists ("the body of a view or another function the statement
+  touches"); the cure is not to grant an agent `EXECUTE` on such a wrapper.
+* **`tests/plan_time.sh` (new suite in `make verify`).** Its counter is a sequence, because a
+  function marked `IMMUTABLE` cannot `INSERT` and a table would be rolled back with the `EXPLAIN`'s
+  subtransaction -- either would read 0 whether the body ran or not. Its controls: the superuser
+  calls the function once and the counter must move; as the agent, the planner must tell the hot
+  value from an absent one; and the table without row-level security must keep its estimate.
+
 ## 0.2.5 -- unreleased
 
 A seventh verb, so a durable act pays one flush instead of two.

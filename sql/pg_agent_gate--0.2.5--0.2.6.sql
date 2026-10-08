@@ -1,0 +1,9 @@
+-- 0.2.5 -> 0.2.6
+--
+-- No catalog change. 0.2.6 changes the ORDER of verification inside the library: every refusal
+-- is decided on the analyzed and rewritten tree before the statement is planned, because planning
+-- runs functions (it folds an IMMUTABLE call with constant arguments and estimates a STABLE one by
+-- calling it) -- up to 0.2.5 a SECURITY DEFINER function ran as its owner before
+-- no_opaque_function refused it. And estimated_rows is withheld when row-level security hides
+-- rows from the agent. Both live in the 0.2.6 library this script ships with; the SQL surface of
+-- an upgraded database and a fresh one stay identical (tests/upgrade.sh compares them).

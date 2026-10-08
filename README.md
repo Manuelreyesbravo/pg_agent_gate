@@ -186,8 +186,9 @@ SELECT agent_gate.propose(
 --   "checks": [{"check": "parses",           "passed": true, ...},
 --              {"check": "single_statement", "passed": true, ...},
 --              {"check": "kind_allowed",     "passed": true, ...},
+--              ... no_writing_cte, keeps_its_context, no_amplification, no_opaque_function ...
 --              {"check": "resolves",         "passed": true,
---               "detail": "the planner resolved every table, column, type and function, and nothing ran"}]}
+--               "detail": "the planner resolved every table, column, type and function without executing ..."}]}
 
 -- see the exact effect, then nothing is kept
 SELECT agent_gate.dry_run(42);
@@ -242,16 +243,14 @@ Nothing is reimplemented. Each check is PostgreSQL itself:
    `select 1; delete ...` dies here.
 3. **kind_allowed** -- read, write or DDL, against what the agent may do.
    Transaction control is refused: the gate owns the transaction.
-4. **resolves** -- `EXPLAIN` plans it without executing: every table,
-   column, type, operator and function must exist and fit. DDL (for agents
-   allowed it) is verified by running it in a subtransaction that is rolled
-   back.
-5. **no_writing_cte** -- PostgreSQL's analyzer and rewriter build the query
-   tree, and a CTE that changes data is refused. `max_rows` counts the rows of
+4. **no_writing_cte** -- PostgreSQL's analyzer and rewriter build the query
+   tree (every table, column, type, operator and function must exist and fit,
+   or the proposal fails `resolves` right here), and a CTE that changes data
+   is refused. `max_rows` counts the rows of
    the statement, and a write hidden in a CTE under a `SELECT count(*)` is
    counted as one row: before 0.2.1 it deleted every row under a limit of 5.
    Propose each write as its own statement.
-6. **keeps_its_context** -- `set_config()` anywhere in that tree (the `WHERE`,
+5. **keeps_its_context** -- `set_config()` anywhere in that tree (the `WHERE`,
    the `FROM`, a subquery, a CTE, an expanded view, schema-qualified or not) is
    refused. Inside the statement it moves, while the statement runs, the
    parameter a row-level policy reads; before 0.2.1,
@@ -259,8 +258,23 @@ Nothing is reimplemented. Each check is PostgreSQL itself:
    tenant's rows. **Not covered:** a function that already exists and calls
    `set_config` in its own body -- its body is not in the tree. Do not grant an
    agent `EXECUTE` on one.
+6. **no_amplification**, **no_opaque_function** -- on the same tree: a write
+   whose cascade, trigger or rule the gate cannot vouch for, and a call to a user
+   function that is volatile or `SECURITY DEFINER` (see "What it does not do").
+7. **resolves** -- only now `EXPLAIN` plans it, for the estimate. **The order is
+   a guarantee (0.2.6):** planning runs functions -- it folds an `IMMUTABLE` call
+   with constant arguments and estimates a `STABLE` one by calling it -- so up
+   to 0.2.5, where `EXPLAIN` came first, a `SECURITY DEFINER` function ran as its
+   owner before `no_opaque_function` refused it, and what it raised (a secret)
+   came back in the check's detail. Now every refusal is decided on the analyzed
+   tree, which runs nothing (`tests/plan_time.sh` counts the calls).
+   `estimated_rows` is `null` when row-level security hides rows of a table the
+   statement touches from the agent: the statistics are gathered beneath the
+   policy, and the estimate told another tenant's frequent value (34 rows) from
+   an absent one (1). DDL (for agents allowed it) is verified instead by running
+   it in a subtransaction that is rolled back.
 
-Checks 5 and 6 were found by an LLM proposing through the gate against a
+Checks 4 and 5 were found by an LLM proposing through the gate against a
 two-tenant database, with a superuser comparing the database before and after
 every case -- not by the suites in `tests/`, which were green with both holes
 open. Both now have cases there (`adversarial.sh`, `rls_isolation.sh`) that are
@@ -738,7 +752,10 @@ Said here so nobody learns it the hard way:
   `SELECT`, could return rows the agent cannot see -- a disclosure, not a utility, so the
   nested-utility refusal does not touch it, and a rolled-back subtransaction does not undo it.
   `dry_run` runs the same invisible code: it rolls back the data, but not effects outside the
-  transaction. Both need a DBA to have put such a function in exactly that spot; until the walker
+  transaction. So does `propose`, when such a body is `IMMUTABLE` or `STABLE`: the planner folds or
+  estimates it while computing `estimated_rows`. Measured (0.2.6): an `IMMUTABLE`, non-`SECURITY
+  DEFINER` wrapper whose body calls a `SECURITY DEFINER` function passes `no_opaque_function` and
+  runs that function at `propose` and again at `commit`. Both need a DBA to have put such a function in exactly that spot; until the walker
   resolves these positions at `propose`, do not place a function that writes or reads across tenants
   in a `CHECK`, `DEFAULT`, generated column, expression index, domain constraint, or view reachable
   by an agent.

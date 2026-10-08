@@ -5,10 +5,16 @@
 //! itself, before anything runs.
 //!
 //! Nothing here is a reimplementation. The parser is PostgreSQL's parser, the
-//! name and type resolution is PostgreSQL's planner (through EXPLAIN, which
-//! plans and does not execute). What this file adds is the ORDER, the verdict
-//! and the record of each check -- including the ones that passed, because
-//! "what was checked" is the part the database never kept.
+//! name and type resolution is PostgreSQL's analyzer and rewriter, and the
+//! estimate is PostgreSQL's planner (through EXPLAIN). What this file adds is
+//! the ORDER, the verdict and the record of each check -- including the ones
+//! that passed, because "what was checked" is the part the database never kept.
+//!
+//! The order is part of the guarantee. EXPLAIN does not execute the statement,
+//! but planning it does run functions: it folds an IMMUTABLE call with constant
+//! arguments and estimates a STABLE one by calling it. So every refusal is
+//! decided on the analyzed tree, which runs nothing, and the planner only sees a
+//! statement with nothing opaque left in it (0.2.6, tests/plan_time.sh).
 
 use crate::exec::in_subxact;
 use crate::hooks::list_len;
@@ -169,33 +175,31 @@ pub(crate) fn verify(
     }
     v.check("kind_allowed", true, format!("{} statement ({tag:?})", kind.as_str()));
 
-    // 3. Names, types and functions resolve against the live catalog.
-    match kind {
-        Kind::Read | Kind::Write => {
-            let explain = format!("EXPLAIN (FORMAT JSON) {}", v.statement);
-            let args = text_args(params);
-            match in_subxact(|| explain_plan(&explain, &args), |_| false) {
-                Ok(plan) => {
-                    let (rows, modifies) = read_plan(&plan);
-                    if modifies && kind == Kind::Read {
-                        // A SELECT whose CTE writes is a write.
-                        kind = Kind::Write;
-                    }
-                    v.estimated_rows = rows;
-                    v.check(
-                        "resolves",
-                        true,
-                        "the planner resolved every table, column, type and function, and nothing ran",
-                    );
-                }
-                Err(f) => {
-                    v.kind = Some(kind);
-                    v.check("resolves", false, f.describe());
-                    return v;
-                }
-            }
-        }
-        Kind::Ddl => match in_subxact(|| run_statement(&v.statement), |_| false) {
+    // 3. The analyzed and rewritten tree, BEFORE anything is planned. The order is the fix of
+    // 0.2.6: up to 0.2.5 the EXPLAIN came first, and the planner constant-folds an IMMUTABLE call
+    // with constant arguments -- and estimates a STABLE one -- by RUNNING it. A SECURITY DEFINER
+    // function ran as its owner before no_opaque_function refused it, and what it raised came back
+    // in the `resolves` detail (tests/plan_time.sh). The analyzer and the rewriter resolve names
+    // and types, expand views and add row-level policies, and execute nothing; every refusal below
+    // is decided on that tree, so a function the gate refuses is never called.
+    //
+    // What the tree shows and the plan does not. Two ways a proposal that resolves still escaped
+    // the gate, both measured by the cycle harness of yggdrasil (its sql/139 and sql/141) with a
+    // superuser watching:
+    //   * a CTE that writes is not counted against max_rows -- the gate counts the rows of the
+    //     OUTER statement, so `with d as (delete ...) select count(*) from d` deleted 12 rows
+    //     under a limit of 5;
+    //   * set_config() inside the statement moves, while it runs, a parameter the row-level
+    //     policies read. The session allowlist judges SET and startup parameters, but the gate's
+    //     own execution is where the hooks step aside, so
+    //     `where set_config('app.tenant_id', '2', true) is not null` read another tenant's rows.
+    // Both are refused, failing closed. set_config is matched by OID wherever it sits: where,
+    // from, a sublink, a CTE, schema-qualified or not.
+    // A user function's body is not in this tree, so it could call set_config or write rows no one
+    // counts. If it is volatile or SECURITY DEFINER, no_opaque_function below refuses the statement.
+    let mut hides_rows = false;
+    if kind == Kind::Ddl {
+        match in_subxact(|| run_statement(&v.statement), |_| false) {
             Ok(()) => v.check(
                 "executes",
                 true,
@@ -206,135 +210,156 @@ pub(crate) fn verify(
                 v.check("executes", false, f.describe());
                 return v;
             }
-        },
-    }
-
-    // 4. What the plan cannot show: the analyzed and rewritten tree. Two ways a
-    // proposal that resolves still escaped the gate, both measured by the cycle harness
-    // of yggdrasil (its sql/139 and sql/141) with a superuser watching:
-    //   * a CTE that writes is not counted against max_rows -- the gate counts the rows
-    //     of the OUTER statement, so `with d as (delete ...) select count(*) from d`
-    //     deleted 12 rows under a limit of 5;
-    //   * set_config() inside the statement moves, while it runs, a parameter the
-    //     row-level policies read. The session allowlist judges SET and startup
-    //     parameters, but the gate's own execution is where the hooks step aside, so
-    //     `where set_config('app.tenant_id', '2', true) is not null` read another
-    //     tenant's rows.
-    // Both are refused, failing closed. The tree is the analyzer's and the rewriter's
-    // (views expanded), and set_config is matched by OID wherever it sits: where, from,
-    // a sublink, a CTE, schema-qualified or not.
-    // A user function's body is not in this tree, so it could call set_config or write rows no one
-    // counts. If it is volatile or SECURITY DEFINER, no_opaque_function below refuses the statement.
-    if kind != Kind::Ddl {
+        }
+    } else {
         let n_params = params.as_ref().map_or(0, |p| p.len());
-        match in_subxact(|| unsafe { analyze_tree(&v.statement, n_params) }, |_| false) {
-            Ok(tree) if tree.writing_cte => {
+        let tree = match in_subxact(|| unsafe { analyze_tree(&v.statement, n_params) }, |_| false) {
+            Ok(tree) => tree,
+            Err(f) => {
+                // A name or a type that does not resolve: the analyzer says so before the planner.
+                v.kind = Some(kind);
+                v.check("resolves", false, f.describe());
+                return v;
+            }
+        };
+        if tree.modifies && kind == Kind::Read {
+            // A SELECT whose CTE writes is a write.
+            kind = Kind::Write;
+        }
+        if tree.writing_cte {
+            v.kind = Some(kind);
+            v.check(
+                "no_writing_cte",
+                false,
+                "a CTE here changes data, and max_rows only counts the rows of the outer statement: \
+                 propose each write as its own statement",
+            );
+            return v;
+        }
+        v.check("no_writing_cte", true, "no CTE changes data: max_rows sees every row it touches");
+        if tree.set_config {
+            v.kind = Some(kind);
+            v.check(
+                "keeps_its_context",
+                false,
+                "set_config() would change, while the proposal runs, a parameter its row-level \
+                 policies may read: an agent's context is set on its role",
+            );
+            return v;
+        }
+        v.check("keeps_its_context", true, "nothing in the statement calls set_config()");
+        // The allow-list does NOT skip the check -- it is consulted inside it, so an allowed
+        // table still refuses an UNSAFE amplifier (a cascade the agent could not do directly,
+        // a SECURITY DEFINER trigger, a rule). A blanket skip reopened the 0.2.2 breach.
+        match amplifying_object(&tree.targets, allowed) {
+            Err(why) => {
+                // Fail CLOSED: a lookup we could not complete is not "nothing to find".
                 v.kind = Some(kind);
                 v.check(
-                    "no_writing_cte",
+                    "no_amplification",
                     false,
-                    "a CTE here changes data, and max_rows only counts the rows of the outer statement: \
-                     propose each write as its own statement",
+                    format!("the catalog lookup for cascading keys, triggers and rules failed, \
+                             so this write cannot be proven bounded: {why}"),
                 );
                 return v;
             }
-            Ok(tree) => {
-                v.check("no_writing_cte", true, "no CTE changes data: max_rows sees every row it touches");
-                if tree.set_config {
+            Ok(Some(obj)) => {
+                v.kind = Some(kind);
+                v.check(
+                    "no_amplification",
+                    false,
+                    format!(
+                        "writing this table fires {obj}, whose effect the gate cannot check \
+                         and which is not counted against max_rows. A non-SECURITY DEFINER \
+                         trigger you accept can be allow-listed with agent_gate.allow_write; a \
+                         cascade, a rule, or a SECURITY DEFINER trigger cannot be allow-listed \
+                         in this version -- remove it or restructure the write"
+                    ),
+                );
+                return v;
+            }
+            Ok(None) => {
+                if tree.modifies && tree.targets.is_empty() {
+                    // A modifying statement whose target we could not resolve: refuse, do not run.
                     v.kind = Some(kind);
                     v.check(
-                        "keeps_its_context",
+                        "no_amplification",
                         false,
-                        "set_config() would change, while the proposal runs, a parameter its row-level \
-                         policies may read: an agent's context is set on its role",
+                        "this statement modifies data but its target relation could not be \
+                         identified, so it cannot be checked for amplification",
                     );
                     return v;
                 }
-                v.check("keeps_its_context", true, "nothing in the statement calls set_config()");
-                // The allow-list does NOT skip the check -- it is consulted inside it, so an allowed
-                // table still refuses an UNSAFE amplifier (a cascade the agent could not do directly,
-                // a SECURITY DEFINER trigger, a rule). A blanket skip reopened the 0.2.2 breach.
-                match amplifying_object(&tree.targets, allowed) {
-                    Err(why) => {
-                        // Fail CLOSED: a lookup we could not complete is not "nothing to find".
-                        v.kind = Some(kind);
-                        v.check(
-                            "no_amplification",
-                            false,
-                            format!("the catalog lookup for cascading keys, triggers and rules failed, \
-                                     so this write cannot be proven bounded: {why}"),
-                        );
-                        return v;
-                    }
-                    Ok(Some(obj)) => {
-                        v.kind = Some(kind);
-                        v.check(
-                            "no_amplification",
-                            false,
-                            format!(
-                                "writing this table fires {obj}, whose effect the gate cannot check \
-                                 and which is not counted against max_rows. A non-SECURITY DEFINER \
-                                 trigger you accept can be allow-listed with agent_gate.allow_write; a \
-                                 cascade, a rule, or a SECURITY DEFINER trigger cannot be allow-listed \
-                                 in this version -- remove it or restructure the write"
-                            ),
-                        );
-                        return v;
-                    }
-                    Ok(None) => {
-                        if tree.modifies && tree.targets.is_empty() {
-                            // A modifying statement whose target we could not resolve: refuse, do not run.
-                            v.kind = Some(kind);
-                            v.check(
-                                "no_amplification",
-                                false,
-                                "this statement modifies data but its target relation could not be \
-                                 identified, so it cannot be checked for amplification",
-                            );
-                            return v;
-                        }
-                        v.check(
-                            "no_amplification",
-                            true,
-                            "no unsafe cascade, trigger or rule on this write's target (or an \
-                             inheritance child of it) can amplify it beyond the agent's reach",
-                        );
-                    }
+                v.check(
+                    "no_amplification",
+                    true,
+                    "no unsafe cascade, trigger or rule on this write's target (or an \
+                     inheritance child of it) can amplify it beyond the agent's reach",
+                );
+            }
+        }
+        match risky_function(&tree.funcs) {
+            Err(why) => {
+                v.kind = Some(kind);
+                v.check(
+                    "no_opaque_function",
+                    false,
+                    format!("the catalog lookup for the statement's functions failed, so it \
+                             cannot be proven safe: {why}"),
+                );
+                return v;
+            }
+            Ok(Some(f)) => {
+                v.kind = Some(kind);
+                v.check(
+                    "no_opaque_function",
+                    false,
+                    format!("the statement calls {f}; a user function that is volatile or \
+                             SECURITY DEFINER has a body the gate cannot see -- it may write \
+                             rows no one counts, or run as its owner outside the agent's tenant. \
+                             It was refused before planning, so it did not run. \
+                             If it does not write, mark it STABLE or IMMUTABLE"),
+                );
+                return v;
+            }
+            Ok(None) => v.check(
+                "no_opaque_function",
+                true,
+                "every function called is a vetted built-in, or a user function that is \
+                 neither volatile nor SECURITY DEFINER",
+            ),
+        }
+        // Fail closed: a lookup that failed withholds the estimate, it does not vouch for it.
+        hides_rows = rows_hidden_from_agent(&tree.relations).unwrap_or(true);
+    }
+
+    // 4. The planner, last: only a statement with nothing opaque left in it gets here, so what
+    // the EXPLAIN folds or estimates is a built-in or a vetted user function, run with the
+    // agent's own rights.
+    if kind != Kind::Ddl {
+        let explain = format!("EXPLAIN (FORMAT JSON) {}", v.statement);
+        let args = text_args(params);
+        match in_subxact(|| explain_plan(&explain, &args), |_| false) {
+            Ok(plan) => {
+                let (rows, modifies) = read_plan(&plan);
+                if modifies && kind == Kind::Read {
+                    kind = Kind::Write;
                 }
-                match risky_function(&tree.funcs) {
-                    Err(why) => {
-                        v.kind = Some(kind);
-                        v.check(
-                            "no_opaque_function",
-                            false,
-                            format!("the catalog lookup for the statement's functions failed, so it \
-                                     cannot be proven safe: {why}"),
-                        );
-                        return v;
-                    }
-                    Ok(Some(f)) => {
-                        v.kind = Some(kind);
-                        v.check(
-                            "no_opaque_function",
-                            false,
-                            format!("the statement calls {f}; a user function that is volatile or \
-                                     SECURITY DEFINER has a body the gate cannot see -- it may write \
-                                     rows no one counts, or run as its owner outside the agent's tenant. \
-                                     If it does not write, mark it STABLE or IMMUTABLE"),
-                        );
-                        return v;
-                    }
-                    Ok(None) => v.check(
-                        "no_opaque_function",
-                        true,
-                        "every function called is a vetted built-in, or a user function that is \
-                         neither volatile nor SECURITY DEFINER",
-                    ),
-                }
+                // The estimate comes from statistics gathered over the whole table, beneath
+                // row-level security: an agent that sees none of a value's rows would read how
+                // many another tenant has (measured: 34 against 1 for an absent value). Withheld
+                // whenever a policy hides rows from this role.
+                v.estimated_rows = if hides_rows { None } else { rows };
+                v.check(
+                    "resolves",
+                    true,
+                    "the planner resolved every table, column, type and function without executing \
+                     the statement; it was planned only after every check above passed",
+                );
             }
             Err(f) => {
                 v.kind = Some(kind);
-                v.check("no_writing_cte", false, f.describe());
+                v.check("resolves", false, f.describe());
                 return v;
             }
         }
@@ -363,11 +388,31 @@ struct Tree {
     /// function that is volatile or SECURITY DEFINER has a body the gate cannot see: it may write
     /// (uncounted, like a trigger) or run as its owner (outside the agent's tenant, like a cascade).
     funcs: Vec<pg_sys::Oid>,
+    /// Every relation the statement reads or writes, in any query of the tree (views already
+    /// expanded by the rewriter), so the catalog can be asked whether row-level security hides
+    /// rows of one of them from this role -- and the plan's estimate, which counts them all, is
+    /// withheld.
+    relations: Vec<pg_sys::Oid>,
 }
 
 /// Record a Query's result relation. A data-modifying command sets `modifies`; a locking read does
 /// not (it has no result relation), so it is not mistaken for a write with an unknown target.
 unsafe fn collect_target(q: *mut pg_sys::Query, tree: &mut Tree) {
+    // Privileges first, as when the EXPLAIN came first: it failed them at executor start, and the
+    // analyzer that now runs before it does not check them. Without this an agent with no grant on
+    // a table got the gate's reasoning about that table's triggers before its "permission denied"
+    // (tests/plan_time.sh). The executor's own check, so a view's tables are checked as its owner;
+    // it raises, and the caller reports it as `resolves`.
+    pg_sys::ExecCheckPermissions((*q).rtable, (*q).rteperminfos, true);
+    for i in 0..list_len((*q).rtable) {
+        let rte = pg_sys::list_nth((*q).rtable, i) as *mut pg_sys::RangeTblEntry;
+        if !rte.is_null()
+            && (*rte).rtekind == pg_sys::RTEKind::RTE_RELATION
+            && (*rte).relid != pg_sys::InvalidOid
+        {
+            tree.relations.push((*rte).relid);
+        }
+    }
     if matches!(
         (*q).commandType,
         pg_sys::CmdType::CMD_INSERT
@@ -432,6 +477,22 @@ fn risky_function(funcs: &[pg_sys::Oid]) -> Result<Option<String>, String> {
          )"
     );
     Spi::get_one::<String>(&sql).map_err(|e| e.to_string())
+}
+
+/// Whether row-level security hides rows of any relation the statement touches from the current
+/// role. PostgreSQL's own row_security_active() decides it, so a superuser, a BYPASSRLS role and
+/// a table owner without FORCE ROW LEVEL SECURITY see every row and keep the estimate. Err = the
+/// lookup failed; the caller withholds the estimate (fail closed).
+fn rows_hidden_from_agent(relations: &[pg_sys::Oid]) -> Result<bool, String> {
+    if relations.is_empty() {
+        return Ok(false);
+    }
+    let ids = relations.iter().map(|o| o.to_u32().to_string()).collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "select exists (select 1 from unnest(array[{ids}]::oid[]) r \
+          where pg_catalog.row_security_active(r))"
+    );
+    Spi::get_one::<bool>(&sql).map(|b| b.unwrap_or(true)).map_err(|e| e.to_string())
 }
 
 /// Parses the (already verified, single) statement again, runs PostgreSQL's analyzer and
