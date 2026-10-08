@@ -3,39 +3,46 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Fuzz the gate the way an adversary would, with volume the 164 hand-written attacks do not
-# have. Two properties, checked from a superuser's side of the database after every input:
+# have. Three properties, checked from a superuser's side of the database after every input:
 #
 #   1. DIRECT EXECUTION CHANGES NOTHING. In an agent session SQL does not execute, only the
 #      verbs. So the full fingerprint -- catalog (tables, columns, constraints, triggers,
 #      policies), the role's attributes, and EVERY ROW of both tables -- must be IDENTICAL after
 #      any statement the agent runs directly.
 #   2. A COMMITTED PROPOSAL STAYS IN BOUNDS -- the surface the two 0.2.1 bugs lived on. When
-#      propose() accepts a statement, the fuzzer COMMITS it as the agent and checks that the
-#      catalog, the role and ANOTHER tenant are untouched and that no more than max_rows rows
-#      changed. (The agent may change its own tenant; that is reset between inputs.) This is
-#      where a CTE that dodged max_rows, or a moved context, would show.
+#      propose() accepts a statement, the fuzzer COMMITS it as the agent (whose tenant is set on
+#      the role, so a write actually runs under RLS) and checks that the catalog, the role and
+#      ANOTHER tenant are untouched and that no more than max_rows rows changed -- where "how many
+#      rows changed" is MEASURED by diffing per-row hashes from the superuser, never read from the
+#      number the gate reports (the 0.2.1 CTE bug reported 1 while deleting 8). The agent may
+#      change its own tenant; that is reset between inputs. A teeth check proves a plain one-row
+#      write really commits and is measured as exactly one row, so this oracle cannot pass vacuously.
 #   3. propose() REFUSES THE OBVIOUS -- a word-list heuristic. DROP, GRANT, COPY, a second
 #      statement, a writing CTE and the like should come back ok:false.
 #
 # And after every input the server is still alive; if the agent's backend went away the run
-# reconnects and counts it, and a run with too many reconnections, or too little reaching the
-# server, fails instead of passing vacuously.
+# reconnects and counts it. A reconnect is not a failure: an agent is no superuser and has no
+# pg_signal_backend, so the only backend it can ever terminate is its own -- benign and expected.
+# The failure signal is reaching the server too little (then the run proved nothing), not
+# reconnecting.
 #
 # WHAT THIS DOES NOT CATCH, plainly. Property 3 is a word list, not a parser: it does not flag
 # dangerous FUNCTIONS (pg_terminate_backend, pg_sleep, lo_import, dblink, pg_read_*). Those
 # resolve as reads, so propose() accepts them by design; they are committed and bounded by the
 # agent's own privileges (not a superuser, no pg_signal_backend, no server-file read) and by
-# property 2, not refused at propose. Two teeth checks run first every time -- a known change
-# must move the fingerprint, and propose() must actually refuse a known DROP and GRANT -- so
-# neither oracle can pass vacuously.
+# property 2, not refused at propose. Three teeth checks run first every time -- a known change
+# must move the fingerprint, propose() must actually refuse a known DROP and GRANT, and a plain
+# one-row write must commit and be measured as exactly one row -- so no oracle can pass vacuously.
 #
 #   make fuzz PG_CONFIG=/path/to/pg_config            # default 3000 inputs
 #   FUZZ_ITERS=20000 FUZZ_SEED=1 make fuzz            # longer, reproducible
 #   FUZZ_NO_GATE=1 make fuzz                          # negative control: no gate, escapes expected
 #
 # The inputs are generated from dangerous templates, mutations of them, and random bytes, so a
-# run is reproducible only with its seed (printed at the top), and it refuses any database not
-# named gate_fuzz unless FUZZ_FORCE=1. Facts are measured by the database, never asserted.
+# run is reproducible only with its seed, and it refuses any database not named gate_fuzz unless
+# FUZZ_FORCE=1. The seed is printed for a clean or local run, but WITHHELD from the public CI
+# output of a run that found a real escape -- there it would be a ready reproducer of a bug that
+# is not yet fixed; reproduce locally instead. Facts are measured by the database, never asserted.
 import os
 import random
 import re
@@ -48,6 +55,7 @@ AGENT = "fuzz_agent"
 ITERS = int(os.environ.get("FUZZ_ITERS", "3000"))
 SEED = int(os.environ.get("FUZZ_SEED", str(random.randrange(1 << 30))))
 rng = random.Random(SEED)
+IN_CI = bool(os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS"))
 
 # Statements an agent must never get to run, directly or through propose(). Each is a thing
 # plain SQL can do that the gate exists to stop.
@@ -189,8 +197,9 @@ insert into shop.customers values (1,1,'Ana','ana@one.example'),(2,1,'Bruno','br
 insert into shop.orders select g,1,1+g%2,g*10 from generate_series(1,8) g;
 alter table shop.customers enable row level security; alter table shop.customers force row level security;
 alter table shop.orders enable row level security;    alter table shop.orders force row level security;
-create policy t on shop.customers using (tenant = current_setting('app.tenant_id')::int) with check (tenant = current_setting('app.tenant_id')::int);
-create policy t on shop.orders    using (tenant = current_setting('app.tenant_id')::int) with check (tenant = current_setting('app.tenant_id')::int);
+-- USING alone: for an ALL policy Postgres reuses it as the write check, so a cross-tenant INSERT/UPDATE is refused too (same shape as tests/rls_isolation.sh).
+create policy t on shop.customers using (tenant = current_setting('app.tenant_id')::int);
+create policy t on shop.orders    using (tenant = current_setting('app.tenant_id')::int);
 alter table shop.customers owner to fuzz_agent; alter table shop.orders owner to fuzz_agent;
 """
 
@@ -225,11 +234,23 @@ FULL_FP = "select md5(string_agg(x, '|' order by x)) from (" + _CATALOG_ROLE + _
 SAFE_FP = "select md5(string_agg(x, '|' order by x)) from (" + _CATALOG_ROLE + _SAFE_DATA + ") s(x)"
 MAX_ROWS = 5
 
+# Per-row state from the SUPERUSER's side (a superuser is not subject to RLS): primary key -> a
+# hash of the whole row, for both tables. How many rows a committed proposal ACTUALLY changed is
+# measured by diffing two of these -- keys whose hash moved, plus removed, plus added -- never
+# taken from the gate's own rows_affected (the 0.2.1 CTE bug reported 1 while deleting 8).
+ROW_STATE = """
+  select 'c:'||id, md5(coalesce(tenant::text,'~')||'|'||coalesce(name,'~')||'|'||coalesce(email,'~')) from shop.customers
+  union all
+  select 'o:'||id, md5(coalesce(tenant::text,'~')||'|'||coalesce(customer::text,'~')||'|'||coalesce(total::text,'~')) from shop.orders
+"""
+
 
 def main():
     if not DSN:
         sys.exit("need a superuser DSN as argv[1] or FUZZ_DSN")
-    print(f"fuzzing pg_agent_gate: {ITERS} inputs, seed {SEED}")
+    # The seed is withheld from the START line in CI: whether this run found a real escape is not
+    # known yet, and in CI the log is public. A clean run's seed is added to the summary at the end.
+    print(f"fuzzing pg_agent_gate: {ITERS} inputs" + ("" if IN_CI else f", seed {SEED}"))
     su = psycopg.connect(DSN, autocommit=True)
 
     # This is destructive -- it drops schema shop and the role fuzz_agent. Refuse any database
@@ -247,6 +268,7 @@ def main():
     su.execute(f"drop role if exists {AGENT}")  # noqa: S608 -- fixed identifier
     su.execute(f"create role {AGENT} login")
     su.execute(f"alter role {AGENT} set statement_timeout = '2000'")  # so a pg_sleep cannot hang the run
+    su.execute(f"alter role {AGENT} set app.tenant_id = '1'")  # its tenant, set ON THE ROLE -- the ordinary multi-tenant setup (tests/rls_isolation.sh). Without it a committed DML errors under RLS and nothing would change.
     su.execute("create extension if not exists pg_agent_gate")
     run_schema()
     # FUZZ_NO_GATE leaves the role an ordinary owner (not an agent): a negative control where
@@ -275,6 +297,22 @@ def main():
         except psycopg.Error:
             return False
 
+    def row_state():
+        try:
+            return dict(su.execute(ROW_STATE).fetchall())
+        except psycopg.Error:
+            return None   # a table the snapshot reads was dropped -- a catastrophic change
+
+    def rows_changed(before, after):
+        # Distinct rows that differ between two snapshots: modified + removed + added. A snapshot
+        # that could not be read (None) means the world changed catastrophically -- count it as
+        # over the limit so it is never mistaken for "nothing moved".
+        if before is None or after is None:
+            return MAX_ROWS + 1
+        n = sum(1 for k, h in after.items() if before.get(k) != h)
+        n += sum(1 for k in before if k not in after)
+        return n
+
     baseline = full_fp()
 
     # Prove BOTH oracles have teeth every run. (a) The fingerprint must move for a known data
@@ -295,6 +333,20 @@ def main():
             r = probe.execute("select agent_gate.propose(%s, %s)", (danger, "teeth")).fetchone()[0]
             if not (isinstance(r, dict) and r.get("ok") is False):
                 sys.exit(f"propose() did NOT refuse {danger!r} -- property 2 has no teeth")
+        # (c) a plain one-row write must actually COMMIT and be MEASURED as exactly one row --
+        # otherwise the commit path never runs under RLS (no tenant on the role) and the max_rows
+        # oracle, measured or not, would pass vacuously on every proposal.
+        before = row_state()
+        r = probe.execute("select agent_gate.propose(%s, %s)",
+                          ("update shop.customers set name = name || '!' where id = 1", "teeth")).fetchone()[0]
+        if not (isinstance(r, dict) and r.get("ok") is True and r.get("proposal") is not None):
+            sys.exit("propose() refused a plain one-row UPDATE -- cannot exercise the commit path")
+        probe.execute("select agent_gate.commit(%s)", (r["proposal"],))
+        moved = rows_changed(before, row_state())
+        if moved != 1:
+            sys.exit(f"a committed one-row UPDATE was measured as {moved} rows, not 1 -- the commit "
+                     "oracle is blind (tenant context on the role? RLS?)")
+        run_schema(); baseline = full_fp()
         probe.close()
 
     agent = [psycopg.connect(DSN, user=AGENT, autocommit=True)]
@@ -352,6 +404,7 @@ def main():
 
         if ok and pid is not None:
             safe_before = safe_fp()
+            rows_before = row_state()
             committed = None
             try:
                 with agent[0].cursor() as c:
@@ -362,9 +415,12 @@ def main():
                 pass
             if safe_fp() != safe_before:   # a committed proposal must never touch catalog/role/tenant 2
                 propose_bypass.append("commit changed protected state: " + payload)
-            rows = committed.get("rows_affected") if isinstance(committed, dict) else None
-            if isinstance(rows, int) and rows > MAX_ROWS:   # the max_rows guarantee, enforced at commit
-                propose_bypass.append(f"commit touched {rows} rows over the limit of {MAX_ROWS}: " + payload)
+            # MEASURE how many rows actually changed, from the superuser's snapshot -- never trust
+            # committed["rows_affected"], the gate's own number (the 0.2.1 CTE reported 1, deleted 8).
+            moved = rows_changed(rows_before, row_state())
+            if moved > MAX_ROWS:   # the max_rows guarantee, checked against what the database shows
+                said = committed.get("rows_affected") if isinstance(committed, dict) else None
+                propose_bypass.append(f"commit changed {moved} rows (gate reported {said}), over the limit of {MAX_ROWS}: " + payload)
             run_schema(); baseline = full_fp()  # a kept write changed the agent's own tenant; reset
 
         if not alive():
@@ -384,41 +440,49 @@ def main():
     print(f"direct-execution escapes: {len(direct_bypass)}")
     print(f"propose/commit escapes:   {len(propose_bypass)}")
 
-    # A public CI log is readable by anyone with a GitHub account, and the verdict points at it,
-    # so in CI print only the INDEX of an escape, never the input -- reproduce it locally by seed.
-    in_ci = bool(os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS"))
+    # A public CI log is readable by anyone with a GitHub account, so in CI print only WHICH escape
+    # (its position among those found, not the iteration), never the input -- reproduce it locally.
     for label, items in (("CRASH", crashes), ("DIRECT ESCAPE", direct_bypass), ("PROPOSE/COMMIT ESCAPE", propose_bypass)):
-        for idx, s in enumerate(items[:10]):
-            print(f"  {label} #{idx}" + ("" if in_ci else f": {s!r}"))
+        for idx, s in enumerate(items[:10], 1):
+            print(f"  {label} {idx} of {len(items)}" + ("" if IN_CI else f": {s!r}"))
 
     escapes = len(crashes) + len(direct_bypass) + len(propose_bypass)
-    # Health gates: a run that lost its backend repeatedly, or where little reached the server,
-    # cannot pass as "clean" -- it tested almost nothing.
-    recon_limit = max(5, ITERS // 100)
-    too_many_reconnects = reconnects > recon_limit
+    # Health: did the run actually exercise the gate? The one failure signal is reaching the server
+    # too little -- then it proved nothing. Reconnections are NOT a failure: an agent is no
+    # superuser and has no pg_signal_backend, so the only backend it can terminate is its own,
+    # which is benign; a reconnect storm would itself starve `reached`, which is what we gate on.
+    # (Measured: 0 reconnections over 5000 inputs -- a self-terminate aborts on another backend's
+    # permission error before reaching its own pid.)
     too_few_reached = reached < ITERS // 2
-    if too_many_reconnects:
-        print(f"  UNHEALTHY: {reconnects} reconnections (limit {recon_limit})")
     if too_few_reached:
         print(f"  UNHEALTHY: only {reached}/{ITERS} inputs reached the server")
-    healthy = not (too_many_reconnects or too_few_reached)
+    healthy = not too_few_reached
 
+    # Reveal the seed unless this is a real-gate run that found an escape in public CI -- there the
+    # seed reproduces an unpatched bug for anyone reading the log, so withhold it and reproduce
+    # locally. A clean run, a local run and the negative control all keep it (harmless provenance).
+    reveal_seed = not (gate_on and escapes and IN_CI)
     if not gate_on:
         # Negative control: escapes are the PASS; a clean run means the oracle is blind.
         verdict = (f"NEGATIVE CONTROL: {escapes} escape(s) found, as expected" if escapes
                    else "NEGATIVE CONTROL FAILED: no escapes without the gate -- the oracle is blind")
         ok_exit = escapes > 0 and healthy
     else:
-        verdict = "CLEAN: nothing escaped" if escapes == 0 else f"FOUND {escapes} escape(s) -- reproduce locally with FUZZ_SEED={SEED}"
+        if escapes == 0:
+            verdict = "CLEAN: nothing escaped"
+        elif reveal_seed:
+            verdict = f"FOUND {escapes} escape(s) -- reproduce locally with FUZZ_SEED={SEED}"
+        else:
+            verdict = f"FOUND {escapes} escape(s) -- seed withheld in public CI; re-run `make fuzz` locally to reproduce"
         ok_exit = escapes == 0 and healthy
-    print(f"\n{verdict} (seed {SEED})")
+    print(f"\n{verdict}" + (f" (seed {SEED})" if reveal_seed else ""))
 
     # The public summary carries the numbers and the seed, never an escaping input.
     gh_summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if gh_summary:
         with open(gh_summary, "a") as f:
             f.write(
-                f"### fuzz (seed {SEED})\n\n"
+                f"### fuzz{f' (seed {SEED})' if reveal_seed else ''}\n\n"
                 f"- inputs: {ITERS} — reached the server: {reached}, client-rejected: {client_rejected}\n"
                 f"- agent reconnections: {reconnects}\n"
                 f"- crashes: {len(crashes)} · direct escapes: {len(direct_bypass)} · propose/commit escapes: {len(propose_bypass)}\n"

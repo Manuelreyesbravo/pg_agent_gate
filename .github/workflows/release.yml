@@ -15,6 +15,7 @@ on:
 permissions:
   contents: write     # create the GitHub Release
   packages: write     # push the image to ghcr.io
+  actions: read       # the gate below reads verify.yml's runs with `gh run list`
 
 concurrency:
   group: release-${{ github.event.inputs.tag || github.ref_name }}
