@@ -139,7 +139,12 @@ half can pass vacuously (a known change must move the fingerprint; `propose` mus
 known `DROP` and `GRANT`), and run against the `v0.2.0` tag the fuzzer reports the historical
 `set_config` hole. **CI runs `FUZZ_ITERS=0 make fuzz` -- the teeth and the oracle, no
 generation -- on every push, in the required `end-to-end` job**; the generative fuzz
-(`FUZZ_ITERS` > 0) runs weekly. `tests/fuzz.py` says plainly what it does and does not catch.
+(`FUZZ_ITERS` > 0) runs weekly. Each tooth asserts WHICH check refuses a statement, not merely
+that one did, so a refusal by a parse error or a missing privilege cannot pass it. Negative
+control (measured 2026-10-08): disabling `no_amplification` turns `FUZZ_ITERS=0` red -- 9 checks
+fail (the cascade and trigger teeth, the allow-list breach checks, and the discover/propose
+parity) -- so the teeth are not vacuous. `tests/fuzz.py` says plainly what it does and does not
+catch.
 
 Two of these suites were green while a hole was open: see
 [what found the 0.2.1 fixes](#what-found-the-021-fixes). A green suite is a
@@ -678,11 +683,19 @@ Said here so nobody learns it the hard way:
   any other way: through a row comparison (`RowCompareExpr`), an aggregate's own transition or
   final functions, an I/O or user cast, or a function the *catalog* attaches rather than the
   statement -- a column `DEFAULT`, a `CHECK` or domain constraint, a generated column, an
-  expression index, or the body of a view or another function the statement touches. For a WRITE
-  this is bounded anyway: the commit backstop counts every row the real execution touches against
-  `max_rows`, whatever fired it. For a READ it is not -- a `SECURITY DEFINER` function a DBA placed
-  in one of those positions could return rows the agent cannot see, a disclosure a rolled-back
-  subtransaction does not undo and the write-only backstop does not bound. It needs a DBA-defined
+  expression index, or the body of a view or another function the statement touches. For ordinary
+  DML done this way the commit backstop still counts the rows against `max_rows` (bounded in COUNT,
+  though not in tenant or privilege -- like an allow-listed trigger, a row written this way is
+  counted but not tenant-filtered). **`TRUNCATE` is the sharp exception: `pg_stat_xact` does not
+  count it, so the backstop does not bound it at all.** Measured: a `CHECK` constraint whose
+  function `TRUNCATE`s a table ran on a plain `INSERT` the agent proposed -- the walker did not see
+  the function, `propose` accepted, the backstop counted one row, the commit was kept, and the
+  table was emptied. For a READ there is no backstop at all -- a `SECURITY DEFINER` function a DBA
+  placed in one of those positions could return rows the agent cannot see, a disclosure a
+  rolled-back subtransaction does not undo. Both need a DBA to have put a function in exactly such
+  a spot; until the walker resolves these positions at `propose` (next), do not place a function
+  that writes, `TRUNCATE`s, or reads across tenants in a `CHECK`, `DEFAULT`, generated column,
+  expression index, domain constraint, or view reachable by an agent. It needs a DBA-defined
   definer object in exactly such a spot; resolving these positions at `propose` closes the class
   next.
 * **A cascade, trigger or rule that amplifies a write is refused (0.2.2/0.2.3).**

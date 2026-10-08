@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.2.4 -- unreleased
+
+Test and docs hardening from the adversarial review of 0.2.3, and one newly measured limitation
+(no runtime change yet; the fix is the walker-closure below).
+
+* **Measured: a `TRUNCATE` reached through an unseen function is not bounded.** `no_opaque_function`
+  walks the proposal's query tree, not a function the catalog attaches (a `CHECK`, `DEFAULT`,
+  generated column, expression index, domain constraint, or view body). For ordinary DML the commit
+  backstop still counts the rows, but `TRUNCATE` is not counted by `pg_stat_xact` at all: a `CHECK`
+  whose function `TRUNCATE`s a table ran on a plain `INSERT` an agent proposed, the backstop saw one
+  row, the commit was kept, and the table was emptied. It needs a DBA to have placed such a function;
+  documented in the threat model, and closed by resolving these positions at `propose`.
+* **An amplification tooth in 0.2.2/0.2.3 passed for the wrong reason.** The fuzzer's trigger
+  tooth asserted only that `insert into shop.child` was refused -- and it was, but at `resolves`
+  (the agent held no INSERT on the table), never reaching `no_amplification`. The check it was
+  meant to exercise did not run; the tooth was vacuous. The v0.2.3 tag shipped with it. The teeth
+  now assert WHICH check refuses, so a refusal by a parse error or a missing privilege no longer
+  counts, and the agent is granted the privilege. Surfaced by the review of the 0.2.3 release.
+* The discover/propose parity now covers allow-listed tables (non-SECURITY DEFINER: writable and
+  not refused; SECURITY DEFINER: refused by both). Docs: the walker's unreached-function gap is
+  named as a class; "bounded by the backstop" is qualified to count (and for `TRUNCATE`, not even
+  that), not tenant or privilege.
+
 ## 0.2.3 -- 2026-10-08
 
 Closes the rest of the amplification class 0.2.2 opened, and makes the result usable.
