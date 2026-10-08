@@ -105,6 +105,47 @@ GRANT SELECT ON shop.orders, shop.catalog TO :"role";
 GRANT EXECUTE ON FUNCTION vault.peek(), vault.peek_stable(), vault.boom() TO :"role";
 ALTER ROLE :"role" SET app.tenant_id = '1';
 SELECT agent_gate.register_agent('plan_time', :'role', 'reads the orders of its own tenant');
+
+-- 0.2.8, the estimate. A DBA helper the planner INLINES after the gate's tree was built: STABLE,
+-- SECURITY INVOKER, SQL. Its table is in the plan but not in the analyzed tree (audit of 0.2.7).
+CREATE FUNCTION shop.orders_by_secret(t text) RETURNS SETOF shop.orders LANGUAGE sql STABLE AS
+  \$\$ SELECT * FROM shop.orders WHERE secret = t \$\$;
+GRANT EXECUTE ON FUNCTION shop.orders_by_secret(text) TO :"role";
+-- Isolation by a view, no row-level security anywhere: the agent reads the view, not the table.
+CREATE TABLE shop.invoices (tenant int NOT NULL, secret text NOT NULL);
+INSERT INTO shop.invoices VALUES (1, 'mine-a');
+INSERT INTO shop.invoices SELECT 2, 'hot-b' FROM generate_series(1, 5000);
+INSERT INTO shop.invoices SELECT g % 100 + 1, 'cold-' || g FROM generate_series(1, 10000) g;
+ANALYZE shop.invoices;
+CREATE VIEW shop.my_invoices AS SELECT * FROM shop.invoices WHERE tenant = current_setting('app.tenant_id')::int;
+GRANT SELECT ON shop.my_invoices TO :"role";
+-- The control for over-withholding: a view over a table the agent may read in full keeps its estimate.
+CREATE VIEW shop.catalog_v AS SELECT * FROM shop.catalog;
+GRANT SELECT ON shop.catalog_v TO :"role";
+SQL
+
+# 0.2.8, parallel workers. The hook keys on a counter that lives in the backend; a parallel worker
+# has its own, at 0. A DDL proposal (an allow_ddl agent) is not walked -- the hook is its only guard
+# against a SECURITY DEFINER function -- and CREATE TABLE AS can run its SELECT in workers. With
+# the leader not participating, nothing the leader runs would trip the hook.
+DDL_ROLE=agent_gate_plan_time_ddl
+claim_role "$DDL_ROLE"
+"$BIN/psql" -X -U "$SUPERUSER" -d "$DB" -v ON_ERROR_STOP=1 -q -v ddl="$DDL_ROLE" >/dev/null <<SQL
+CREATE TABLE shop.big AS SELECT g AS id FROM generate_series(1, 200000) g;
+ANALYZE shop.big;
+CREATE FUNCTION vault.peek_par(i int) RETURNS text LANGUAGE sql STABLE PARALLEL SAFE SECURITY DEFINER AS
+  \$\$ SELECT s FROM vault.secret \$\$;
+CREATE SCHEMA loot AUTHORIZATION :"ddl";
+GRANT USAGE ON SCHEMA shop, vault TO :"ddl";
+GRANT SELECT ON shop.big TO :"ddl";
+GRANT EXECUTE ON FUNCTION vault.peek_par(int) TO :"ddl";
+SELECT agent_gate.register_agent('plan_time_ddl', :'ddl', 'creates tables in its own schema', p_allow_ddl => true);
+-- Make a parallel plan certain, and keep the leader out of it.
+ALTER DATABASE $DB SET parallel_setup_cost = 0;
+ALTER DATABASE $DB SET parallel_tuple_cost = 0;
+ALTER DATABASE $DB SET min_parallel_table_scan_size = 0;
+ALTER DATABASE $DB SET max_parallel_workers_per_gather = 2;
+ALTER DATABASE $DB SET parallel_leader_participation = off;
 SQL
 
 failures=0
@@ -245,6 +286,64 @@ else
     echo "       got: $est"
     failures=$((failures + 1))
 fi
+
+# --- 0.2.8: the estimate follows the PLAN, not only the tree ------------------------------
+# The instrument first, as the agent: the inlined helper DOES tell the hot value from an absent one.
+hot=$(plan_rows "select * from shop.orders_by_secret('hot-b')")
+none=$(plan_rows "select * from shop.orders_by_secret('no-such-value')")
+if [[ "$hot" =~ ^[0-9.]+$ && "$none" =~ ^[0-9.]+$ ]] && (( ${hot%.*} > 5 * ${none%.*} )); then
+    echo "  ok   through an inlined SQL helper the planner, as the agent, still tells hot ($hot) from absent ($none)"
+else
+    echo "  FAIL through an inlined SQL helper the planner tells hot from absent"
+    echo "       got: hot=$hot absent=$none -- the scenario cannot show the leak"
+    failures=$((failures + 1))
+fi
+equals "an inlined SQL helper over a table under row-level security gets no estimate" null \
+    "$(estimate "select * from shop.orders_by_secret('hot-b')")"
+equals "  ...nor two of them joined (the estimate would square the signal)" null \
+    "$(estimate "select * from shop.orders_by_secret('hot-b') o join shop.orders_by_secret('hot-b') p using (tenant)")"
+equals "  ...nor one in a sublink" null \
+    "$(estimate "select (select count(*) from shop.orders_by_secret('hot-b'))")"
+equals "a view that isolates tenants without row-level security gets no estimate (the agent cannot read the table)" null \
+    "$(estimate "select * from shop.my_invoices where secret = 'hot-b'")"
+est=$(estimate "select * from shop.catalog_v where sku = 'sku-1'")
+if [[ "$est" =~ ^[0-9.]+$ ]] && [[ "$est" != 0 ]]; then
+    echo "  ok   a view over a table the agent may read in full keeps its estimate ($est)"
+else
+    echo "  FAIL a view over a table the agent may read in full keeps its estimate"
+    echo "       got: $est"
+    failures=$((failures + 1))
+fi
+
+# --- 0.2.8: no parallel worker runs the agent's SQL ---------------------------------------
+# Measured on 0.2.7: a worker inherits agent_gate.agent with its counters at 0, so the session hooks
+# refuse whatever it runs -- post_parse refuses the function body it parses, ExecutorStart a plan
+# fragment that reads a table. No leak, but by accident, and it broke a plain parallel CREATE
+# TABLE AS of an allow_ddl agent. 0.2.8 keeps the agent's SQL out of workers by design, so it runs
+# in the backend, where the hook sees it, and the plain one goes through.
+# The instrument: as the superuser, with debug_parallel_query, that SELECT runs in a worker.
+launched=$(as_super -c "set debug_parallel_query = on" \
+    -c "explain (analyze, format json) select vault.peek_par(g) from generate_series(1, 10) g" \
+    | sed -nE 's/.*"Workers Launched": ([0-9]+).*/\1/p' | head -1)
+if [[ "${launched:-0}" -gt 0 ]]; then
+    echo "  ok   control: outside the gate this SELECT runs in $launched parallel worker(s)"
+else
+    echo "  FAIL control: outside the gate this SELECT runs in a parallel worker"
+    echo "       got: Workers Launched=${launched:-none} -- the scenario cannot show a worker skipping the hook"
+    failures=$((failures + 1))
+fi
+as_super -c "alter database $DB set debug_parallel_query = on" >/dev/null
+ddl() { "$BIN/psql" -X -U "$DDL_ROLE" -d "$DB" -tA -c "select agent_gate.propose_and_commit(\$q\$$1\$q\$, 'build a table in my own schema')" 2>&1 || true; }
+out=$(ddl "create table loot.t as select vault.peek_par(g) as s from generate_series(1, 10) g")
+equals "an allow_ddl agent's CREATE TABLE AS over a SECURITY DEFINER function keeps no table" "" \
+    "$(as_super -c "select to_regclass('loot.t')")"
+contains "  ...stopped by the hook, naming the function" 'SECURITY DEFINER function vault.peek_par()' "$out"
+absent "  ...and the secret is not in what it receives" "$SECRET" "$out"
+# And what must work: a plain CREATE TABLE AS that the planner would run in parallel.
+out=$(ddl "create table loot.ok as select id from shop.big")
+equals "a plain CREATE TABLE AS over a big table is kept (the agent's SQL runs in the backend, not in workers)" \
+    200000 "$(as_super -c "select count(*) from loot.ok" 2>&1)"
+as_super -c "alter database $DB reset debug_parallel_query" >/dev/null
 
 # --- the control of the instrument: a call that DOES run has to move the counter -------
 before=$(hits)

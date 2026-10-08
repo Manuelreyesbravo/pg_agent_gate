@@ -1,0 +1,6 @@
+-- 0.2.7 -> 0.2.8
+--
+-- No catalog change. 0.2.8 changes, inside the library, when estimated_rows is given (only if the
+-- agent could read in full every relation the tree and the plan touch) and keeps the agent's SQL
+-- out of parallel workers. The SQL surface of an upgraded database and a fresh one stay identical
+-- (tests/upgrade.sh compares them).

@@ -270,10 +270,15 @@ Nothing is reimplemented. Each check is PostgreSQL itself:
    tree, which runs nothing (`tests/plan_time.sh` counts the calls); and since
    0.2.7 a `SECURITY DEFINER` function reached through a body the tree does not
    show -- a wrapper the planner folds -- is stopped before it runs.
-   `estimated_rows` is `null` when row-level security hides rows of a table the
-   statement touches from the agent: the statistics are gathered beneath the
-   policy, and the estimate told another tenant's frequent value (34 rows) from
-   an absent one (1). DDL (for agents allowed it) is verified instead by running
+   `estimated_rows` is given only when the agent could read in full every
+   relation the analyzed tree AND the plan touch: `SELECT` on the whole table and
+   no row-level security hiding rows from it. The statistics are gathered beneath
+   the policy and beneath a view, and the estimate told another tenant's frequent
+   value (34 rows) from an absent one (1) -- through the table (0.2.6), through a
+   SQL function the planner inlines after the tree was built, and through a view
+   that isolates tenants without row-level security (both 0.2.8). The agent's SQL
+   never runs in a parallel worker (0.2.8): the backend runs the whole plan, where
+   the gate's hooks see it. DDL (for agents allowed it) is verified instead by running
    it in a subtransaction that is rolled back.
 
 Checks 4 and 5 were found by an LLM proposing through the gate against a
@@ -721,6 +726,13 @@ Said here so nobody learns it the hard way:
 * **`dry_run` is a rollback, not a sandbox.** Sequence values, session advisory
   locks, and anything outside the transaction (`dblink`, untrusted languages)
   are not undone.
+* **A row-level policy that calls a `SECURITY DEFINER` function refuses every
+  proposal on its table.** The common membership helper (`USING (is_member(tenant))`,
+  `SECURITY DEFINER` so it can read the membership table) is in the analyzed tree --
+  the rewriter adds the policy's qual -- so `no_opaque_function` refuses the statement,
+  and since 0.2.7 the function-manager hook would stop it anyway. That is the price of
+  the rule, not an accident: write such a policy over a `security_invoker` helper or a
+  plain subquery on a table the agent may read, or the table is out of the agent's reach.
 * **An opaque user function is refused (0.2.3).** A statement that calls a user
   function which is volatile or `SECURITY DEFINER` is refused at `propose`
   (`no_opaque_function`): its body is not in the analyzed tree, so it could write

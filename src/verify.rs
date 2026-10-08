@@ -111,6 +111,7 @@ pub(crate) fn verify(
     };
     // Everything below runs SQL the agent wrote.
     let _running = state::proposal();
+    keep_out_of_workers();
 
     // 1. PostgreSQL's own parser accepts it, and it is ONE statement.
     let text = match CString::new(sql) {
@@ -197,7 +198,7 @@ pub(crate) fn verify(
     // from, a sublink, a CTE, schema-qualified or not.
     // A user function's body is not in this tree, so it could call set_config or write rows no one
     // counts. If it is volatile or SECURITY DEFINER, no_opaque_function below refuses the statement.
-    let mut hides_rows = false;
+    let mut tree_relations: Vec<pg_sys::Oid> = Vec::new();
     if kind == Kind::Ddl {
         match in_subxact(|| run_statement(&v.statement), |_| false) {
             Ok(()) => v.check(
@@ -329,27 +330,32 @@ pub(crate) fn verify(
                  neither volatile nor SECURITY DEFINER",
             ),
         }
-        // Fail closed: a lookup that failed withholds the estimate, it does not vouch for it.
-        hides_rows = rows_hidden_from_agent(&tree.relations).unwrap_or(true);
+        tree_relations = tree.relations;
     }
 
     // 4. The planner, last: only a statement with nothing opaque left in it gets here, so what
     // the EXPLAIN folds or estimates is a built-in or a vetted user function, run with the
     // agent's own rights.
     if kind != Kind::Ddl {
-        let explain = format!("EXPLAIN (FORMAT JSON) {}", v.statement);
+        // VERBOSE so that every scan names its schema: the estimate is judged on the relations the
+        // PLAN reads, which can be more than the tree's (a SQL function the planner inlines).
+        let explain = format!("EXPLAIN (VERBOSE, FORMAT JSON) {}", v.statement);
         let args = text_args(params);
         match in_subxact(|| explain_plan(&explain, &args), |_| false) {
             Ok(plan) => {
-                let (rows, modifies) = read_plan(&plan);
+                let (rows, modifies, plan_relations) = read_plan(&plan);
                 if modifies && kind == Kind::Read {
                     kind = Kind::Write;
                 }
                 // The estimate comes from statistics gathered over the whole table, beneath
-                // row-level security: an agent that sees none of a value's rows would read how
-                // many another tenant has (measured: 34 against 1 for an absent value). Withheld
-                // whenever a policy hides rows from this role.
-                v.estimated_rows = if hides_rows { None } else { rows };
+                // row-level security and beneath a view: an agent that sees none of a value's rows
+                // would read how many another tenant has (measured: 34 against 1 for an absent
+                // value). So it is given only when the agent could read in full every relation the
+                // tree AND the plan touch -- the plan too, because the planner inlines a SQL
+                // function after the tree was built (0.2.8: 34 through such a helper, 1156 through
+                // two of them joined). Fail closed: a lookup that failed withholds it.
+                let hidden = rows_hidden_from_agent(&tree_relations, &plan_relations).unwrap_or(true);
+                v.estimated_rows = if hidden { None } else { rows };
                 v.check(
                     "resolves",
                     true,
@@ -479,20 +485,60 @@ fn risky_function(funcs: &[pg_sys::Oid]) -> Result<Option<String>, String> {
     Spi::get_one::<String>(&sql).map_err(|e| e.to_string())
 }
 
-/// Whether row-level security hides rows of any relation the statement touches from the current
-/// role. PostgreSQL's own row_security_active() decides it, so a superuser, a BYPASSRLS role and
-/// a table owner without FORCE ROW LEVEL SECURITY see every row and keep the estimate. Err = the
+/// Whether the current role could NOT read in full some relation the statement touches -- in the
+/// analyzed tree (by OID) or in the plan (by schema and name). Not in full means: no SELECT on the
+/// whole table (the agent reads it only through a view, or only some columns), row-level security
+/// active for this role (PostgreSQL's row_security_active(), so a superuser, a BYPASSRLS role and an
+/// owner without FORCE keep the estimate), or a plan relation whose name does not resolve. Err = the
 /// lookup failed; the caller withholds the estimate (fail closed).
-fn rows_hidden_from_agent(relations: &[pg_sys::Oid]) -> Result<bool, String> {
-    if relations.is_empty() {
+fn rows_hidden_from_agent(relations: &[pg_sys::Oid], plan_relations: &[(String, String)]) -> Result<bool, String> {
+    if relations.is_empty() && plan_relations.is_empty() {
         return Ok(false);
     }
-    let ids = relations.iter().map(|o| o.to_u32().to_string()).collect::<Vec<_>>().join(",");
-    let sql = format!(
-        "select exists (select 1 from unnest(array[{ids}]::oid[]) r \
-          where pg_catalog.row_security_active(r))"
-    );
-    Spi::get_one::<bool>(&sql).map(|b| b.unwrap_or(true)).map_err(|e| e.to_string())
+    let ids: Vec<i64> = relations.iter().map(|o| o.to_u32() as i64).collect();
+    let schemas: Vec<String> = plan_relations.iter().map(|(s, _)| s.clone()).collect();
+    let names: Vec<String> = plan_relations.iter().map(|(_, n)| n.clone()).collect();
+    Spi::get_one_with_args::<bool>(
+        "select exists (select 1 from (
+             select r::oid as r from unnest($1::int8[]) r
+             union all
+             select pg_catalog.to_regclass(pg_catalog.format('%I.%I', s, n))::oid
+               from unnest($2::text[], $3::text[]) as p(s, n)
+           ) x
+           where x.r is null
+              or not pg_catalog.has_table_privilege(x.r, 'SELECT')
+              or pg_catalog.row_security_active(x.r))",
+        &[ids.into(), schemas.into(), names.into()],
+    )
+    .map(|b| b.unwrap_or(true))
+    .map_err(|e| e.to_string())
+}
+
+/// Keep the agent's SQL out of parallel workers, for the rest of its transaction. The hook that stops
+/// a SECURITY DEFINER function keys on a counter that lives in this backend; a worker has its own, at
+/// zero. Measured on 0.2.7: a worker of an agent session was refused anyway -- it inherits
+/// agent_gate.agent, so the session hooks refused the function body it parsed and a plan fragment
+/// that read a table -- which held by accident and broke a plain parallel CREATE TABLE AS of an
+/// allow_ddl agent. With no workers the backend runs the whole plan, where the hook sees it, and that
+/// statement goes through. max_parallel_workers is the guarantee (it caps what this backend may
+/// launch, maintenance workers included); the other two keep the plan EXPLAIN shows the plan that
+/// runs. LOCAL: undone when the transaction ends, and the agent cannot SET them back (allowlist).
+fn keep_out_of_workers() {
+    for name in [c"max_parallel_workers", c"max_parallel_workers_per_gather", c"max_parallel_maintenance_workers"] {
+        // elevel 0 on a session source is ERROR: a setting that did not take fails the verb, closed.
+        unsafe {
+            pg_sys::set_config_option(
+                name.as_ptr(),
+                c"0".as_ptr(),
+                pg_sys::GucContext::PGC_USERSET,
+                pg_sys::GucSource::PGC_S_SESSION,
+                pg_sys::GucAction::GUC_ACTION_LOCAL,
+                true,
+                0,
+                false,
+            );
+        }
+    }
 }
 
 /// Parses the (already verified, single) statement again, runs PostgreSQL's analyzer and
@@ -632,15 +678,31 @@ fn run_statement(statement: &str) {
 }
 
 /// (estimated rows the statement touches or returns, whether anything in the
-/// plan modifies data)
-fn read_plan(plan: &Value) -> (Option<f64>, bool) {
+/// plan modifies data, the (schema, relation) of every relation the plan reads or writes)
+fn read_plan(plan: &Value) -> (Option<f64>, bool, Vec<(String, String)>) {
     let top = &plan[0]["Plan"];
     let rows = if top["Node Type"] == "ModifyTable" {
         top["Plans"][0]["Plan Rows"].as_f64()
     } else {
         top["Plan Rows"].as_f64()
     };
-    (rows, modifies(top))
+    let mut relations = Vec::new();
+    plan_relations(top, &mut relations);
+    (rows, modifies(top), relations)
+}
+
+/// Every node that names a relation, sub-plans and init-plans included (they are under "Plans"). A
+/// name without a schema is kept with an empty one: it does not resolve, and the estimate is
+/// withheld rather than guessed.
+fn plan_relations(node: &Value, out: &mut Vec<(String, String)>) {
+    if let Some(name) = node["Relation Name"].as_str() {
+        out.push((node["Schema"].as_str().unwrap_or("").to_string(), name.to_string()));
+    }
+    if let Some(children) = node["Plans"].as_array() {
+        for child in children {
+            plan_relations(child, out);
+        }
+    }
 }
 
 fn modifies(node: &Value) -> bool {

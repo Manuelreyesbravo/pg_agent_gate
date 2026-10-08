@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.2.8 -- unreleased
+
+From an external audit of 0.2.7 (e600647), each item re-measured here before it was changed.
+
+* **`estimated_rows` still told another tenant's frequent value, through two paths (medium).**
+  0.2.6 withheld it when row-level security was active on a relation of the analyzed tree. The
+  planner inlines a SQL function (`STABLE`, `SECURITY INVOKER`, `RETURNS SETOF`) AFTER that tree is
+  built, so its table was not judged: `select * from shop.orders_by_secret('hot-b')` was estimated
+  at 34 against 1 for an absent value, and two such calls joined at 1156. And a view that isolates
+  tenants with a `WHERE` and no row-level security at all gave 34 too: the agent reads the view,
+  the estimate counts the table behind it. Now the estimate is given only when the agent could read
+  in full every relation the tree AND the plan touch (`EXPLAIN (VERBOSE)` names each scan's schema):
+  `SELECT` on the whole table, and no row-level security hiding rows from it. A name that does not
+  resolve, or a lookup that fails, withholds it. A view over a table the agent may read keeps its
+  estimate (checked, so a `null` cannot mean the gate stopped estimating).
+* **The agent's SQL no longer runs in parallel workers.** The function-manager hook keys on a
+  counter that lives in the backend; a worker has its own, at zero. The audit marked this
+  unmeasured; measured here, a worker of an agent session was refused anyway -- it inherits
+  `agent_gate.agent`, so the session hooks refused the function body it parsed and any plan fragment
+  that read a table. No leak, but by accident, and it broke a plain parallel `CREATE TABLE AS` of an
+  `allow_ddl` agent. `verify` now sets `max_parallel_workers` (and the per-gather and maintenance
+  limits, so `EXPLAIN` shows the plan that runs) to 0 for the rest of the agent's transaction: the
+  backend runs the whole plan, the hook stops a `SECURITY DEFINER` function there, and the plain
+  `CREATE TABLE AS` of 200000 rows is kept.
+* **README:** a row-level policy that calls a `SECURITY DEFINER` function (the usual membership
+  helper) refuses every proposal on its table -- it was already so before 0.2.7, now written down as
+  the price of the rule.
+* **`tests/plan_time.sh`**: eleven more checks. Against 0.2.7, the four estimate checks fail (34, 1156,
+  34 -- the sublink one reads 1, and is kept for the rule) and so do the two parallel ones; the
+  controls -- the inlined helper does tell hot from absent as the agent, a parallel worker does run
+  that SELECT outside the gate, a readable view keeps its estimate -- pass on both.
+* **Not changed:** the audit's note that `register_agent` "fails in silence" with a short
+  description. It raises (`CHECK (length(description) >= 10)`); a script that does not stop on
+  errors keeps going with the role unregistered, and `whoami()` says `is_agent: false`.
+
 ## 0.2.7 -- unreleased
 
 The case 0.2.6 measured and left open, closed as a class and not as the one case.
