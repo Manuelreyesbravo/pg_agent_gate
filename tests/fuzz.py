@@ -483,6 +483,32 @@ def main():
         if isinstance(pr, dict) and pr.get("ok") is True:
             max_rows_oracle_fails.append("allow-list accepted a SECURITY DEFINER trigger table -- it must stay refused")
         su.execute("select agent_gate.disallow_write('fuzzer', 'shop.sditems')")
+        # (g) an amplifier on an INHERITANCE CHILD or a RULE refuses a write to the table, and
+        # discover agrees with propose (both go through _unsafe_amplifier).
+        run_schema()
+        su.execute("create table shop.par (id int primary key, t int not null)")
+        su.execute("create table shop.kid (primary key (id)) inherits (shop.par)")
+        su.execute("create function shop.kt() returns trigger language plpgsql as $$ begin return new; end $$")
+        su.execute("create trigger kt before insert on shop.kid for each row execute function shop.kt()")
+        su.execute("create table shop.rlog (x int)")
+        su.execute("create table shop.ruled (id int primary key, t int not null)")
+        su.execute("create rule r as on update to shop.ruled do also insert into shop.rlog values (1)")
+        su.execute("create table shop.plainz (id int primary key, t int not null)")
+        for tbl in ("par", "kid", "rlog", "ruled", "plainz"):
+            su.execute(f"alter table shop.{tbl} owner to {AGENT}")
+        want = {"insert into shop.par values (1,1)": False,     # child kid has a trigger
+                "update shop.ruled set t = t": False,           # has a DO ALSO rule
+                "insert into shop.plainz values (1,1)": True}   # nothing on it
+        for sql, want_ok in want.items():
+            pr = probe.execute("select agent_gate.propose(%s, %s)", (sql, "parity check")).fetchone()[0]
+            if (isinstance(pr, dict) and pr.get("ok") is True) != want_ok:
+                max_rows_oracle_fails.append(f"parity propose {sql!r}: expected ok={want_ok}")
+        disc = probe.execute("select agent_gate.discover(%s)", ("shop",)).fetchone()[0]
+        refused = {r["relation"].split(".")[-1].strip('"')
+                   for r in (disc.get("relations") or []) if r.get("write_refused")}
+        for tbl, should in (("par", True), ("ruled", True), ("plainz", False)):
+            if (tbl in refused) != should:
+                max_rows_oracle_fails.append(f"parity discover shop.{tbl}: write_refused={tbl in refused}, expected {should}")
         run_schema(); baseline = full_fp()
         probe.close()
 

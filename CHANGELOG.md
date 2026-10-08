@@ -18,11 +18,13 @@ Closes the rest of the amplification class 0.2.2 opened, and makes the result us
   safe side -- rows a trigger writes then rolls back in its own EXCEPTION still count), and
   it does not see TRUNCATE (blocked as DDL). The gate's own bookkeeping is excluded.
 * **A per-agent allow-list, so a legitimate trigger is not a wall.** `agent_gate.allow_write
-  (agent, relation)` lets an agent write a table that carries an updated_at or audit trigger
-  (or a cascade): it relaxes `no_amplification` for that table only, never the limit -- the
-  backstop still counts every amplified row. `discover` now reports `write_refused` on each
-  table the agent may not write and why (the cascade, trigger or rule), so the agent does not
-  propose a doomed write; an allow-listed table drops the flag.
+  (agent, relation)` lets an agent write a table that carries an `updated_at` or audit trigger
+  that is NOT `SECURITY DEFINER`: it relaxes `no_amplification` for that one case only, never
+  the limit -- the backstop still counts every amplified row. A cascading foreign key, a rule,
+  or a `SECURITY DEFINER` trigger is NOT allow-listable in 0.2.3 (the recursive closure that
+  makes some cascades safe lands in 0.2.4); `allow_write` records the entry but its result says
+  `still_refused` with the object. `discover` reports `write_refused` on each table the agent
+  may not write and why, through the same function `propose` uses, so the two never disagree.
 * Regression in `tests/fuzz.py` (the amplification teeth also build a volatile writer and a
   SECURITY DEFINER function and assert both refused) runs on every push. Schema change: the
   `allowlist` table and the two functions; the upgrade script creates them and redefines

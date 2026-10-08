@@ -80,10 +80,11 @@ CREATE TABLE agent_gate_internal.bindings (
     PRIMARY KEY (agent, assertion)
 );
 
--- Tables an agent may write even though an amplifying object (a cascading foreign key, a user
--- trigger, a rule) sits on them. A deliberate act by whoever registers the agent -- an updated_at
--- or an audit trigger is fine. It relaxes the propose check, NOT the limit: the commit-time
--- backstop still counts every amplified row against max_rows.
+-- Tables an agent may write even though a user trigger that is NOT SECURITY DEFINER sits on them
+-- (an updated_at, an audit row). A deliberate act by whoever registers the agent. It relaxes the
+-- propose check for that one case only -- a cascading foreign key, a rule, or a SECURITY DEFINER
+-- trigger is never allow-listable in 0.2.3 -- and never the limit: the commit-time backstop still
+-- counts every amplified row against max_rows.
 CREATE TABLE agent_gate_internal.allowlist (
     agent      text NOT NULL REFERENCES agent_gate_internal.agents (name) ON DELETE CASCADE,
     relid      oid  NOT NULL,
@@ -366,11 +367,15 @@ LANGUAGE sql SET search_path = pg_catalog, agent_gate_internal AS $$
     SELECT EXISTS (SELECT 1 FROM gone);
 $$;
 
--- Let an agent write a table that carries an amplifying object (a cascading foreign key, a user
--- trigger, a rule). Relaxes the `no_amplification` propose check for that one table; the commit
--- backstop still counts every amplified row against max_rows, so the limit is not relaxed.
+-- Let an agent write a table that carries a user trigger which is NOT SECURITY DEFINER (an
+-- updated_at, an audit row). Relaxes the `no_amplification` propose check for that one case; the
+-- commit backstop still counts every amplified row against max_rows, so the limit is not relaxed.
+-- A cascading foreign key, a rule, or a SECURITY DEFINER trigger is NEVER allow-listable in 0.2.3:
+-- the entry is recorded, but writes stay refused, and the result says so in `still_refused`.
 CREATE FUNCTION agent_gate.allow_write(p_agent text, p_relation regclass, p_note text DEFAULT NULL)
 RETURNS jsonb LANGUAGE plpgsql SET search_path = pg_catalog, agent_gate_internal AS $$
+DECLARE
+    still text;
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM agent_gate_internal.agents WHERE name = p_agent) THEN
         RAISE EXCEPTION 'pg_agent_gate: no agent named %', p_agent;
@@ -378,8 +383,13 @@ BEGIN
     INSERT INTO agent_gate_internal.allowlist (agent, relid, note)
     VALUES (p_agent, p_relation::oid, p_note)
     ON CONFLICT (agent, relid) DO UPDATE SET note = EXCLUDED.note;
+    -- With this table allowed, is anything on it STILL unsafe? If so, allow_write did not help.
+    still := agent_gate_internal._unsafe_amplifier(p_relation::oid, ARRAY[p_relation::oid]::bigint[]);
     RETURN jsonb_build_object('agent', p_agent, 'relation', p_relation::text, 'note', p_note,
-        'effect', 'this agent may now propose writes to this table despite a trigger, cascade or rule on it; the commit-time backstop still counts every amplified row against max_rows');
+        'still_refused', still,
+        'effect', CASE WHEN still IS NULL
+            THEN 'this agent may now propose writes to this table; the commit backstop still counts every row its trigger moves against max_rows'
+            ELSE 'recorded, but writes to this table are STILL refused: '||still||' cannot be allow-listed -- remove it or restructure the write' END);
 END $$;
 
 CREATE FUNCTION agent_gate.disallow_write(p_agent text, p_relation regclass) RETURNS boolean

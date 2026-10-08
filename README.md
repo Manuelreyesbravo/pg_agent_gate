@@ -681,8 +681,10 @@ Said here so nobody learns it the hard way:
   and a SECURITY DEFINER trigger never is. The commit backstop still counts every
   amplified row against `max_rows` (it over-counts, the safe side, and does not see
   `TRUNCATE`). "What the gate can check" is the honest bound: a non-SECURITY DEFINER
-  trigger can still call a SECURITY DEFINER function in its body, which the gate does
-  not see -- but it runs as the agent and its rows are counted.
+  trigger can still call a SECURITY DEFINER function, or fire a cascade of its own that
+  runs as a table owner outside RLS -- the gate does not see the body. Its rows are
+  counted (so the limit holds) but not tenant-filtered. Allow-listing a trigger is a
+  risk the DBA accepts for that one table; the backstop is the floor under it, not RLS.
 * **A view is checked with its owner's privileges unless it was created with
   `security_invoker`.** An agent granted `SELECT` on such a view reads the
   tables behind it, including ones it has no privilege on at all: measured, a

@@ -24,33 +24,10 @@ CREATE TABLE agent_gate_internal.allowlist (
     PRIMARY KEY (agent, relid)
 );
 
-CREATE FUNCTION agent_gate.allow_write(p_agent text, p_relation regclass, p_note text DEFAULT NULL)
-RETURNS jsonb LANGUAGE plpgsql SET search_path = pg_catalog, agent_gate_internal AS $$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM agent_gate_internal.agents WHERE name = p_agent) THEN
-        RAISE EXCEPTION 'pg_agent_gate: no agent named %', p_agent;
-    END IF;
-    INSERT INTO agent_gate_internal.allowlist (agent, relid, note)
-    VALUES (p_agent, p_relation::oid, p_note)
-    ON CONFLICT (agent, relid) DO UPDATE SET note = EXCLUDED.note;
-    RETURN jsonb_build_object('agent', p_agent, 'relation', p_relation::text, 'note', p_note,
-        'effect', 'this agent may now propose writes to this table despite a trigger, cascade or rule on it; the commit-time backstop still counts every amplified row against max_rows');
-END $$;
-
-CREATE FUNCTION agent_gate.disallow_write(p_agent text, p_relation regclass) RETURNS boolean
-LANGUAGE sql SET search_path = pg_catalog, agent_gate_internal AS $$
-    WITH gone AS (DELETE FROM agent_gate_internal.allowlist
-                   WHERE agent = p_agent AND relid = p_relation::oid RETURNING 1)
-    SELECT EXISTS (SELECT 1 FROM gone);
-$$;
-
-REVOKE EXECUTE ON FUNCTION agent_gate.allow_write(text, regclass, text) FROM PUBLIC;
-REVOKE EXECUTE ON FUNCTION agent_gate.disallow_write(text, regclass) FROM PUBLIC;
-
 -- The single decision shared by propose (verify.rs) and discover, so they never disagree: the
 -- first unsafe amplifier (cascade or rule -- never allow-listable in 0.2.3; a user trigger unless
 -- the target is allowed AND its function is not SECURITY DEFINER) reachable from a write, over
--- inheritance children, or NULL.
+-- inheritance children, or NULL. Created before allow_write, which calls it.
 CREATE FUNCTION agent_gate_internal._unsafe_amplifier(p_target oid, p_allowed bigint[])
 RETURNS text LANGUAGE sql STABLE SET search_path = pg_catalog, agent_gate_internal AS $$
     WITH RECURSIVE d(oid) AS (
@@ -74,6 +51,35 @@ RETURNS text LANGUAGE sql STABLE SET search_path = pg_catalog, agent_gate_intern
          WHERE rw.rulename <> '_RETURN'
     ) s LIMIT 1
 $$;
+
+CREATE FUNCTION agent_gate.allow_write(p_agent text, p_relation regclass, p_note text DEFAULT NULL)
+RETURNS jsonb LANGUAGE plpgsql SET search_path = pg_catalog, agent_gate_internal AS $$
+DECLARE
+    still text;
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM agent_gate_internal.agents WHERE name = p_agent) THEN
+        RAISE EXCEPTION 'pg_agent_gate: no agent named %', p_agent;
+    END IF;
+    INSERT INTO agent_gate_internal.allowlist (agent, relid, note)
+    VALUES (p_agent, p_relation::oid, p_note)
+    ON CONFLICT (agent, relid) DO UPDATE SET note = EXCLUDED.note;
+    still := agent_gate_internal._unsafe_amplifier(p_relation::oid, ARRAY[p_relation::oid]::bigint[]);
+    RETURN jsonb_build_object('agent', p_agent, 'relation', p_relation::text, 'note', p_note,
+        'still_refused', still,
+        'effect', CASE WHEN still IS NULL
+            THEN 'this agent may now propose writes to this table; the commit backstop still counts every row its trigger moves against max_rows'
+            ELSE 'recorded, but writes to this table are STILL refused: '||still||' cannot be allow-listed -- remove it or restructure the write' END);
+END $$;
+
+CREATE FUNCTION agent_gate.disallow_write(p_agent text, p_relation regclass) RETURNS boolean
+LANGUAGE sql SET search_path = pg_catalog, agent_gate_internal AS $$
+    WITH gone AS (DELETE FROM agent_gate_internal.allowlist
+                   WHERE agent = p_agent AND relid = p_relation::oid RETURNING 1)
+    SELECT EXISTS (SELECT 1 FROM gone);
+$$;
+
+REVOKE EXECUTE ON FUNCTION agent_gate.allow_write(text, regclass, text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION agent_gate.disallow_write(text, regclass) FROM PUBLIC;
 
 -- _agent now also reports the allow-list (DISCOVER_SQL's third parameter and config() read it).
 CREATE OR REPLACE FUNCTION agent_gate_internal._agent(p_name text) RETURNS jsonb
