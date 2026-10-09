@@ -184,6 +184,38 @@ pub(crate) fn startup_parameter_not_settable() -> Option<String> {
 
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
+    // A CLIENT MAY NOT SET agent_gate.* AT CONNECTION START (0.2.12). Loaded through
+    // session_preload_libraries -- the mode register_agent configures when the library is not
+    // preloaded -- the gate's settings do not exist yet when the startup packet is read: a client's
+    // `-c agent_gate.agent=` becomes a placeholder whose source (PGC_S_CLIENT) outranks the value
+    // the registrar put on the role, and the definition below cannot adopt it. The session started
+    // with no agent, and every statement ran ungated and unrecorded (external audit of 0.2.8,
+    // GATE-01). Preloaded at server start the same attempt is a FATAL already; here it is made one.
+    unsafe {
+        if !pg_sys::process_shared_preload_libraries_in_progress {
+            let client = pg_sys::GucSource::PGC_S_CLIENT;
+            let mut count: std::ffi::c_int = 0;
+            let vars = pg_sys::get_guc_variables(&mut count);
+            if !vars.is_null() {
+                for i in 0..count.max(0) as usize {
+                    let g = *vars.add(i);
+                    if g.is_null() || (*g).name.is_null() {
+                        continue;
+                    }
+                    let name = std::ffi::CStr::from_ptr((*g).name).to_string_lossy().to_lowercase();
+                    if name.starts_with("agent_gate.") && ((*g).source == client || (*g).reset_source == client) {
+                        pgrx::pg_sys::panic::ErrorReport::new(
+                            pgrx::pg_sys::errcodes::PgSqlErrorCode::ERRCODE_INSUFFICIENT_PRIVILEGE,
+                            format!("pg_agent_gate: the client set {name} when the connection started"),
+                            "pg_agent_gate",
+                        )
+                        .set_detail("The gate's settings come from the role and the server, never from the client: a client value would take a session out from behind the gate.")
+                        .report(pgrx::pg_sys::elog::PgLogLevel::FATAL);
+                    }
+                }
+            }
+        }
+    }
     GucRegistry::define_string_guc(
         c"agent_gate.settable",
         c"Extra session parameters an agent session may change, comma separated.",

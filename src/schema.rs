@@ -70,6 +70,14 @@ CREATE TABLE agent_gate_internal.executions (
     started_at    timestamptz NOT NULL,
     CONSTRAINT a_refusal_or_abort_says_why CHECK ((outcome IN ('aborted', 'refused')) = (reason IS NOT NULL))
 );
+
+-- ONE KEPT COMMIT PER PROPOSAL, as a constraint and not only as a read (0.2.12). _load_proposal
+-- reads whether a kept commit exists after locking the row; under REPEATABLE READ that read used
+-- an old snapshot and four sessions each kept the same change (tests/isolation.sh). The verbs now
+-- refuse anything but READ COMMITTED, and this index makes a second kept commit fail -- and with
+-- it, the change it would have kept, which is in the same transaction.
+CREATE UNIQUE INDEX executions_one_kept_commit
+    ON agent_gate_internal.executions (proposal) WHERE mode = 'commit' AND outcome = 'kept';
 CREATE INDEX ON agent_gate_internal.executions (proposal);
 
 CREATE TABLE agent_gate_internal.bindings (
@@ -93,6 +101,9 @@ CREATE TABLE agent_gate_internal.allowlist (
     allowed_by name NOT NULL DEFAULT session_user,
     PRIMARY KEY (agent, relid)
 );
+-- Dumped with the database (0.2.12): it was left out, and a restore lost every allow-list entry --
+-- failing closed, but silently (external audit of 0.2.8, GATE-14).
+SELECT pg_catalog.pg_extension_config_dump('agent_gate_internal.allowlist', '');
 "#,
     name = "record",
     bootstrap
@@ -330,6 +341,26 @@ BEGIN
     IF is_super THEN
         RAISE EXCEPTION 'pg_agent_gate: % is a superuser, and a superuser can unset agent_gate.agent', role_name
             USING HINT = 'An agent role that can leave the gate is not behind it. Use a role without SUPERUSER.';
+    END IF;
+    -- Nor a role that reaches past the gate another way (0.2.12; external audit of 0.2.8, GATE-10):
+    -- REPLICATION streams the WAL -- every table, in plain text -- over a protocol no hook sees;
+    -- BYPASSRLS ignores the policies the gate's tenant isolation stands on; and membership, direct
+    -- or through other roles, in a superuser or in such a role lets SET ROLE take the session out.
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE oid = p_role AND (rolreplication OR rolbypassrls)) THEN
+        RAISE EXCEPTION 'pg_agent_gate: % has REPLICATION or BYPASSRLS, which reach past the gate', role_name
+            USING HINT = 'Use a role without REPLICATION and without BYPASSRLS.';
+    END IF;
+    IF EXISTS (
+        WITH RECURSIVE up(r) AS (
+            SELECT m.roleid FROM pg_auth_members m WHERE m.member = p_role
+            UNION
+            SELECT m.roleid FROM pg_auth_members m JOIN up ON m.member = up.r)
+        SELECT 1 FROM up JOIN pg_roles r ON r.oid = up.r
+         WHERE r.rolsuper OR r.rolreplication OR r.rolbypassrls
+            OR r.rolname IN ('pg_write_all_data', 'pg_execute_server_program', 'pg_write_server_files'))
+    THEN
+        RAISE EXCEPTION 'pg_agent_gate: % is a member, directly or through other roles, of a superuser or of a role that reaches past the gate', role_name
+            USING HINT = 'An agent role must not be able to SET ROLE out from behind the gate. Revoke those memberships.';
     END IF;
     INSERT INTO agent_gate_internal.agents (name, role, max_rows, allow_ddl, description)
     VALUES (p_name, role_name, p_max_rows, p_allow_ddl, p_description);

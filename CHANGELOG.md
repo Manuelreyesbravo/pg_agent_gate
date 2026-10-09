@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.2.12 -- 2026-10-08
+
+From a third external audit (of 0.2.8), every finding measured again on 0.2.11 before it was
+changed: each tooth below was red on 0.2.11 with its control green (`tests/audit3.sh`,
+`tests/isolation.sh`, `tests/session_preload.sh`, in `make verify`).
+
+Behavior changes an operator will notice:
+
+* **The verbs run only under READ COMMITTED** (GATE-04/05). Under REPEATABLE READ or
+  SERIALIZABLE the gate read the proposal and the record from the transaction's first snapshot:
+  four sessions each committed the same proposal and each kept it. A verb called at another level
+  is now refused, and one kept commit per proposal is also a constraint of the catalog (a unique
+  partial index on `executions(proposal)`). The upgrade refuses, naming them, if an installation
+  already holds a proposal kept twice.
+* **An `allow_ddl` agent's DDL is an allow-list** (GATE-07): create, alter, rename, drop, comment,
+  grant/revoke, views, indexes, rules and the like. Every other utility -- what the old denylist
+  did not name -- is refused.
+* **A session loaded through `session_preload_libraries` ends (FATAL) if the client set any
+  `agent_gate.*` parameter** (GATE-01). `PGOPTIONS='-c agent_gate.agent='` reached the library
+  before the role's setting and left the session outside the gate.
+* **Only the verbs answer the fast-path protocol** in an agent session (GATE-02). `PQfn` skips the
+  parser; any other function reached that way -- `lo_import`, `pg_read_file` with a grant -- is
+  refused by the object-access hook before it runs.
+* **Two-phase commit is refused** in an agent session (GATE-12): `PREPARE TRANSACTION` would carry
+  the record past the session that wrote it.
+* **A commit or dry run of a proposal that is not the agent's is not recorded** (GATE-06). It
+  answers "this agent has no proposal with that id", the same as an unknown id, so an agent cannot
+  learn which ids exist, and writes a `LOG` line instead of a row in another agent's record.
+
+And without visible change:
+
+* **The gate's own SQL runs under `search_path = pg_catalog, pg_temp`** (GATE-03), set in a GUC
+  nest level around every internal statement and undone after it, so the agent's path or a
+  temporary table of the agent cannot answer for a catalog the gate reads.
+* **`register_agent` refuses roles that can leave the gate by other means** (GATE-10): `REPLICATION`,
+  `BYPASSRLS`, and membership -- direct or inherited -- in a superuser, in such a role, or in
+  `pg_write_all_data`, `pg_execute_server_program` or `pg_write_server_files`.
+* **The allow-list travels with `pg_dump`** (GATE-14): it is now an extension configuration table.
+
+`make verify`: 292 checks on PostgreSQL 18.6 and 19beta2, 0 failed; `make fuzz` clean.
+
 ## 0.2.11 -- 2026-10-08
 
 Measured on a real agent: the tree of the author's own system, which runs every one of its

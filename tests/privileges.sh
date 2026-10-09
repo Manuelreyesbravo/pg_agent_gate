@@ -165,13 +165,13 @@ check attack "a role cannot run a bound assertion on its own" "assertions are ru
     "$(as "$STRANGER" -c "select agent_gate_internal._run_assertion('anything')")"
 
 # ---------------------------------------- a proposal runs only for its agent --
-check attack "another agent cannot dry-run it" "the proposal belongs to billing" \
+check attack "another agent cannot dry-run it" "this agent has no proposal with that id" \
     "$(as "$SUPPORT" -c "select agent_gate.dry_run(${p:-0})")"
-check attack "another agent cannot commit it" "the proposal belongs to billing" \
+check attack "another agent cannot commit it" "this agent has no proposal with that id" \
     "$(as "$SUPPORT" -c "select agent_gate.commit(${p:-0})")"
-check attack "a role with MORE privileges cannot commit it" "the proposal belongs to billing" \
+check attack "a role with MORE privileges cannot commit it" "this agent has no proposal with that id" \
     "$(as "$APP" -c "select agent_gate.commit(${p:-0})")"
-check attack "a role with no privileges cannot commit it" "the proposal belongs to billing" \
+check attack "a role with no privileges cannot commit it" "this agent has no proposal with that id" \
     "$(as "$STRANGER" -c "select agent_gate.commit(${p:-0})")"
 check_absent attack "another agent's acts() does not show it" "$MARK" \
     "$(as "$SUPPORT" -c "select agent_gate.acts(500)")"

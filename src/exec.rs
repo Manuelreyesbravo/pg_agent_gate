@@ -186,7 +186,7 @@ pub(crate) fn get_one_prepared<T: FromDatum + IntoDatum>(
     types: &[PgOid],
     args: &[DatumWithOid],
 ) -> Result<Option<T>, String> {
-    Spi::connect(|client| {
+    with_gate_search_path(|| Spi::connect(|client| {
         let plan = match PLANS.with(|p| p.borrow_mut().remove(sql)) {
             Some(plan) => plan,
             // prepare_mut, not prepare: pgrx runs a non-mutating plan READ-ONLY, on the snapshot of
@@ -203,5 +203,31 @@ pub(crate) fn get_one_prepared<T: FromDatum + IntoDatum>(
             .map_err(|e| e.to_string());
         PLANS.with(|p| p.borrow_mut().insert(sql, plan));
         result
-    })
+    }))
+}
+
+/// Runs `f` -- the gate's own fixed SQL, never the agent's -- with `search_path = pg_catalog, pg_temp`,
+/// restored when `f` returns, the way a function's SET clause works (a GUC nest level; an error that
+/// unwinds through here is undone by the (sub)transaction abort that follows it). Unqualified names
+/// in the gate's SQL used to resolve through the CALLER's path while the TRUSTED window was open: a
+/// function public.obj_description(oid, text) planted by another principal beat
+/// pg_catalog.obj_description(oid, name) and ran inside discover(), un-gated, able to forge the
+/// record (external audit of 0.2.8, GATE-03). pg_temp is named last, so it cannot answer first.
+pub(crate) fn with_gate_search_path<R>(f: impl FnOnce() -> R) -> R {
+    unsafe {
+        let nest = pg_sys::NewGUCNestLevel();
+        pg_sys::set_config_option(
+            c"search_path".as_ptr(),
+            c"pg_catalog, pg_temp".as_ptr(),
+            pg_sys::GucContext::PGC_USERSET,
+            pg_sys::GucSource::PGC_S_SESSION,
+            pg_sys::GucAction::GUC_ACTION_SAVE,
+            true,
+            0,
+            false,
+        );
+        let r = f();
+        pg_sys::AtEOXact_GUC(true, nest);
+        r
+    }
 }

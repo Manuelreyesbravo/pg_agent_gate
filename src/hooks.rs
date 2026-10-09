@@ -47,6 +47,7 @@ static mut PREV_POST_PARSE: pg_sys::post_parse_analyze_hook_type = None;
 static mut PREV_PROCESS_UTILITY: pg_sys::ProcessUtility_hook_type = None;
 static mut PREV_EXECUTOR_START: pg_sys::ExecutorStart_hook_type = None;
 static mut PREV_FMGR: pg_sys::fmgr_hook_type = None;
+static mut PREV_OBJECT_ACCESS: pg_sys::object_access_hook_type = None;
 static mut INSTALLED: bool = false;
 
 pub(crate) fn installed() -> bool {
@@ -65,6 +66,8 @@ pub(crate) unsafe fn install() {
     pg_sys::ExecutorStart_hook = Some(executor_start);
     PREV_FMGR = pg_sys::fmgr_hook;
     pg_sys::fmgr_hook = Some(definer_guard);
+    PREV_OBJECT_ACCESS = pg_sys::object_access_hook;
+    pg_sys::object_access_hook = Some(object_access);
     INSTALLED = true;
 }
 
@@ -311,7 +314,22 @@ unsafe fn utility_allowed(stmt: *mut pg_sys::Node) -> Result<(), String> {
         return Err(SHAPE.into());
     }
     match (*stmt).type_ {
-        pg_sys::NodeTag::T_TransactionStmt | pg_sys::NodeTag::T_VariableShowStmt => Ok(()),
+        pg_sys::NodeTag::T_VariableShowStmt => Ok(()),
+        pg_sys::NodeTag::T_TransactionStmt => {
+            // Not two-phase commit (0.2.12): a prepared transaction outlives the session, and when
+            // ROLLBACK PREPARED later takes the agent's record with it, no callback of this backend
+            // is there to write down what was lost (external audit of 0.2.8, GATE-12).
+            let t = &*(stmt as *mut pg_sys::TransactionStmt);
+            match t.kind {
+                pg_sys::TransactionStmtKind::TRANS_STMT_PREPARE
+                | pg_sys::TransactionStmtKind::TRANS_STMT_COMMIT_PREPARED
+                | pg_sys::TransactionStmtKind::TRANS_STMT_ROLLBACK_PREPARED => Err(
+                    "two-phase commit is not available to an agent session: a prepared transaction outlives it"
+                        .into(),
+                ),
+                _ => Ok(()),
+            }
+        }
         pg_sys::NodeTag::T_VariableSetStmt => {
             let v = &*(stmt as *mut pg_sys::VariableSetStmt);
             let name = if v.name.is_null() {
@@ -457,4 +475,61 @@ unsafe fn simple_argument(node: *mut pg_sys::Node) -> Result<(), String> {
         }
         _ => Err(ARGS.into()),
     }
+}
+
+/// FAST PATH (0.2.12). A fast-path function call (libpq's PQfn) reaches no parser and no executor,
+/// so none of the gate's other hooks saw it: an agent called set_config() through it and moved the
+/// tenant its row-level policies read, and a role that could SET ROLE to a superuser cleared its own
+/// agent mark and left the gate (external audit of 0.2.8, GATE-02). The function manager invokes
+/// this hook for a fast-path call (tcop/fastpath.c), with no client query running. In an agent
+/// session, outside the gate's own
+/// work, only the verbs pass. The executor invokes the same hook for every function of a query; a
+/// query in an agent session is already a verb call that post_parse admitted, and an implicit cast
+/// of its arguments must not be refused, so only fast path is judged here.
+#[pg_guard]
+unsafe extern "C-unwind" fn object_access(
+    access: pg_sys::ObjectAccessType::Type,
+    class_id: pg_sys::Oid,
+    object_id: pg_sys::Oid,
+    sub_id: std::ffi::c_int,
+    arg: *mut std::ffi::c_void,
+) {
+    if access == pg_sys::ObjectAccessType::OAT_FUNCTION_EXECUTE && fastpath_call() && must_judge() {
+        let (schema, name) = function_identity(object_id);
+        if !(schema == "agent_gate" && VERBS.contains(&name.as_str())) {
+            refuse(
+                &crate::current_agent().unwrap_or_default(),
+                format!("a fast-path function call reached {schema}.{name}(), and an agent session calls only the gate's verbs"),
+            );
+        }
+    }
+    if let Some(prev) = PREV_OBJECT_ACCESS {
+        prev(access, class_id, object_id, sub_id, arg);
+    }
+}
+
+/// A fast-path call: no client query is running (PostgresMain leaves debug_query_string NULL for a
+/// function-call message, and sets it for every query, simple or extended), or the backend reports
+/// STATE_FASTPATH. Either suffices, so the answer does not depend on track_activities.
+unsafe fn fastpath_call() -> bool {
+    if pg_sys::debug_query_string.is_null() {
+        return true;
+    }
+    let be = pg_sys::MyBEEntry;
+    !be.is_null() && (*be).st_state == pg_sys::BackendState::STATE_FASTPATH
+}
+
+/// (schema, name) of a function, from the syscache.
+unsafe fn function_identity(oid: pg_sys::Oid) -> (String, String) {
+    let tup = pg_sys::SearchSysCache1(pg_sys::SysCacheIdentifier::PROCOID as _, pg_sys::Datum::from(oid));
+    if tup.is_null() {
+        return ("?".into(), "?".into());
+    }
+    let form = pg_sys::heap_tuple_get_struct::<pg_sys::FormData_pg_proc>(tup);
+    let nsp = (*form).pronamespace;
+    let name = CStr::from_ptr((*form).proname.data.as_ptr()).to_string_lossy().into_owned();
+    pg_sys::ReleaseSysCache(tup);
+    let schema = pg_sys::get_namespace_name(nsp);
+    let schema = if schema.is_null() { "?".into() } else { CStr::from_ptr(schema).to_string_lossy().into_owned() };
+    (schema, name)
 }

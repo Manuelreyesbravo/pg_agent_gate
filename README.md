@@ -111,20 +111,27 @@ make clean-machine                           # the same, in a fresh container th
 
 | suite | what it attacks | checks |
 |---|---|---|
-| `adversarial.sh` | every channel a session can type, and what can be slipped past `propose` | 45 |
+| `adversarial.sh` | every channel a session can type, and what can be slipped past `propose` | 59 |
 | `hostile.sh` | garbage into the verbs, the record rewritten, the world moved between propose and commit | 37 |
 | `privileges.sh` | the privilege boundary between agents, roles and the record | 31 |
 | `rls_isolation.sh` | moving the context a row-level policy reads: `SET`, startup parameters, `set_config` | 22 |
 | `dump_restore.sh` | the record across `pg_dump` and restore | 10 |
-| `upgrade.sh` | an installation of the oldest schema, upgraded | 9 |
-| pgrx unit tests | the verbs, from inside the server | 10 |
+| `upgrade.sh` | an installation of the oldest schema, upgraded | 13 |
+| `flushes.sh` | the WAL flushes each act pays against its durability | 8 |
+| `plan_time.sh` | what runs while the gate verifies and plans | 43 |
+| `pg_temp.sh` | a temporary catalog of the agent hiding what a write sets off | 17 |
+| `rollback.sh` | what a rollback takes from the record | 12 |
+| `audit3.sh` | the third audit: fast-path, the gate's path, foreign proposals, DDL, roles, 2PC, dump | 18 |
+| `isolation.sh` | one proposal committed twice under REPEATABLE READ / SERIALIZABLE | 5 |
+| `session_preload.sh` | a client parameter taking a per-session load out from behind the gate | 4 |
+| pgrx unit tests | the verbs, from inside the server | 13 |
 
-On a fresh Debian container receiving only what git has committed, with
-PostgreSQL 18.6 and with 19beta4 from PGDG: **`verified: 164 checks passed, 0
-failed`** on both (and on 19beta2, where it was developed). CI runs the same
+On PostgreSQL 18.6 and 19beta2: **`verified: 292 checks passed, 0 failed`** on
+both (0.2.12). The fresh Debian container receiving only what git has committed
+runs the same suites, with 18 and 19beta4 from PGDG. CI runs the same
 container for 18 and 19 on every push. `VERIFY_DRIVERS=1` adds real pgjdbc and node-pg sessions.
 
-Those 164 are the hand-written suites above. The amplification class that `0.2.2` and `0.2.3`
+Those 292 are the hand-written suites above. The amplification class that `0.2.2` and `0.2.3`
 closed -- a writing CTE, a cascading foreign key, a trigger, a rule, an opaque (volatile or
 `SECURITY DEFINER`) function, and the commit-time row-count backstop and per-agent allow-list
 that back them -- is guarded by **`make fuzz`**, not by `make verify`. Its teeth build each of
@@ -396,7 +403,11 @@ SELECT agent_gate.bind_assertion('billing', 'no_customer_without_plan');
 `shared_preload_libraries`, it also sets `session_preload_libraries` on that
 role, so the gate is loaded before the agent's first statement. It refuses
 superuser roles: a superuser can unset a superuser-only setting, and an agent
-that can leave the gate is not behind it. It takes effect on the role's
+that can leave the gate is not behind it. For the same reason it refuses
+`REPLICATION` and `BYPASSRLS` roles, and members (direct or inherited) of a
+superuser, of such a role, or of `pg_write_all_data`, `pg_execute_server_program`
+or `pg_write_server_files`. A session loaded this way ends (FATAL) if its client
+set any `agent_gate.*` parameter at startup. It takes effect on the role's
 **next** connection.
 
 ## For a client that only speaks MCP: a shim with no power
@@ -738,9 +749,15 @@ Said here so nobody learns it the hard way:
   a driver configured with a default schema will be refused: pgjdbc's connection
   code sends `currentSchema` as the startup parameter `search_path` (read in
   the driver, not measured here). Set the agent's schema on its role instead.
-* **The fast-path function-call protocol** (`PQfn`) skips the parser. A
-  function reached that way that runs no SQL -- large objects -- is not
-  stopped. Revoke `EXECUTE` on those from agent roles.
+* **The fast-path function-call protocol** (`PQfn`) skips the parser. Since
+  0.2.12 an agent session answers it only for the verbs: any other function
+  reached that way -- large objects, `pg_read_file` -- is refused by the
+  object-access hook before it runs.
+* **The verbs run only under READ COMMITTED (0.2.12).** At a stricter level the
+  gate would read the proposal and the record from an old snapshot; measured on
+  0.2.11, four REPEATABLE READ sessions each kept the same proposal. A verb
+  called at another level is refused. Two-phase commit (`PREPARE TRANSACTION`)
+  is refused in an agent session.
 * **With `attempt_durability = fast`, a crash can lose records of attempts**
   that changed nothing. Never of changes.
 * **`dry_run` is a rollback, not a sandbox.** Sequence values, session advisory

@@ -76,13 +76,15 @@ struct Config {
 /// transaction id, which a write needs anyway.
 fn call_internal<T: FromDatum + IntoDatum>(query: &str, args: &[DatumWithOid]) -> Option<T> {
     let _gate = state::trusted();
-    Spi::connect_mut(|client| {
-        client
-            .update(query, Some(1), args)
-            .expect("pg_agent_gate: internal call failed")
-            .first()
-            .get::<T>(1)
-            .expect("pg_agent_gate: internal call returned an unexpected type")
+    crate::exec::with_gate_search_path(|| {
+        Spi::connect_mut(|client| {
+            client
+                .update(query, Some(1), args)
+                .expect("pg_agent_gate: internal call failed")
+                .first()
+                .get::<T>(1)
+                .expect("pg_agent_gate: internal call returned an unexpected type")
+        })
     })
 }
 
@@ -91,14 +93,14 @@ fn call_internal<T: FromDatum + IntoDatum>(query: &str, args: &[DatumWithOid]) -
 /// VOLATILE plpgsql, and read with a fresh snapshot inside.
 fn read_internal<T: FromDatum + IntoDatum>(query: &str, args: &[DatumWithOid]) -> Option<T> {
     let _gate = state::trusted();
-    Spi::connect(|client| {
+    crate::exec::with_gate_search_path(|| Spi::connect(|client| {
         client
             .select(query, Some(1), args)
             .expect("pg_agent_gate: internal read failed")
             .first()
             .get::<T>(1)
             .expect("pg_agent_gate: internal read returned an unexpected type")
-    })
+    }))
 }
 
 fn config(who: &Identity) -> Config {
@@ -141,6 +143,28 @@ fn not_from_inside() {
 /// very transaction id the question is about.
 fn begin_verb() {
     not_from_inside();
+    // ONLY UNDER READ COMMITTED. Under REPEATABLE READ or SERIALIZABLE every statement of the
+    // transaction reads from the snapshot of its first one: the gate's check that a proposal was
+    // not committed already, and the agent's own configuration (max_rows, allow_ddl, bindings),
+    // would be read as they were when the agent began -- not as other sessions have since left
+    // them. Measured (external audit of 0.2.8, GATE-04/05; tests/isolation.sh): four sessions that
+    // opened REPEATABLE READ before any commit each committed the same charge, and a max_rows
+    // lowered by the DBA did not reach an open transaction. An agent controls its connections and
+    // their isolation level, so the gate refuses rather than trusting it.
+    let level = unsafe { pg_sys::XactIsoLevel };
+    if level != pg_sys::XACT_READ_COMMITTED as i32 {
+        let name = match level as u32 {
+            pg_sys::XACT_REPEATABLE_READ => "REPEATABLE READ",
+            pg_sys::XACT_SERIALIZABLE => "SERIALIZABLE",
+            pg_sys::XACT_READ_UNCOMMITTED => "READ UNCOMMITTED",
+            _ => "another isolation level",
+        };
+        error!(
+            "pg_agent_gate: the verbs run only under READ COMMITTED, and this transaction is {name}: \
+             under it the gate would read its own record and this agent's configuration from a \
+             snapshot older than other sessions' commits"
+        );
+    }
     if !state::txn_seen() {
         let already_wrote = unsafe { pg_sys::GetTopTransactionIdIfAny() } != pg_sys::TransactionId::INVALID;
         state::mark_txn_seen(already_wrote);
@@ -462,15 +486,33 @@ fn execute(proposal: i64, mode: Mode) -> Value {
     // (tests/hostile.sh). The locking path goes through read-write SPI because
     // a row lock needs a transaction id, which a commit is about to spend
     // anyway; reads keep using read-only SPI so they still spend none.
+    //
+    // OWNERSHIP FIRST, WITHOUT A LOCK (0.2.12). The lock used to come first and the owner check after:
+    // another agent could hold a proposal's row lock from an open transaction and block its owner,
+    // and every refused attempt was recorded as an execution of the owner's proposal -- rows in
+    // someone else's record -- and named the owner (external audit of 0.2.8, GATE-06). A proposal
+    // that does not exist and one that belongs to another agent now get the same answer, and only
+    // the server log tells them apart.
+    let peek: Option<JsonB> =
+        read_internal::<JsonB>("select agent_gate_internal._load_proposal($1)", &[proposal.into()]).filter(|j| !j.0.is_null());
+    let owner = peek.as_ref().and_then(|j| j.0["agent"].as_str().map(str::to_string));
+    if owner.as_deref() != Some(who.agent.as_str()) {
+        log!(
+            "pg_agent_gate: agent={} asked for proposal {} which {}",
+            who.agent,
+            proposal,
+            if owner.is_some() { "belongs to another agent" } else { "does not exist" }
+        );
+        return json!({ "proposal": proposal, "mode": mode.as_str(), "outcome": "refused", "reason": "this agent has no proposal with that id" });
+    }
     let loaded: Option<JsonB> = if mode == Mode::Commit {
         call_internal("select agent_gate_internal._load_proposal($1, true)", &[proposal.into()])
     } else {
-        read_internal("select agent_gate_internal._load_proposal($1)", &[proposal.into()])
+        peek
     };
     let Some(JsonB(p)) = loaded.filter(|j| !j.0.is_null()) else {
-        // Nothing to attach a record to: said to the caller and to the log.
         log!("pg_agent_gate: agent={} asked for proposal {} which does not exist", who.agent, proposal);
-        return json!({ "proposal": proposal, "mode": mode.as_str(), "outcome": "refused", "reason": "no proposal with that id" });
+        return json!({ "proposal": proposal, "mode": mode.as_str(), "outcome": "refused", "reason": "this agent has no proposal with that id" });
     };
 
     if p["agent"].as_str() != Some(who.agent.as_str()) {

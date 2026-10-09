@@ -167,7 +167,21 @@ pub(crate) fn verify(
             );
             return v;
         }
-        _ => Kind::Ddl,
+        // DDL IS AN ALLOWLIST (0.2.12): statements that change the schema, and nothing else. Every
+        // other utility used to fall into "ddl" and run for an allow_ddl agent with no row limit: a DO
+        // block deleted 50 rows under max_rows 5, a SET moved the tenant a row-level policy reads, SET
+        // ROLE changed who was acting (external audit of 0.2.8, GATE-07). TRUNCATE empties a table
+        // without counting a row, LOCK holds others, LISTEN/NOTIFY/LOAD/COPY reach outside: none of
+        // them is a schema change, and what is not named here is refused.
+        t if is_schema_change(t) => Kind::Ddl,
+        other => {
+            v.check(
+                "kind_allowed",
+                false,
+                format!("{other:?} is not a change to the schema: an agent proposes reads, writes and -- if allowed -- DDL, nothing else"),
+            );
+            return v;
+        }
     };
     if kind == Kind::Ddl && !allow_ddl {
         v.kind = Some(kind);
@@ -721,4 +735,42 @@ fn plan_relations(node: &Value, out: &mut Vec<(String, String)>) {
 fn modifies(node: &Value) -> bool {
     node["Node Type"] == "ModifyTable"
         || node["Plans"].as_array().is_some_and(|children| children.iter().any(modifies))
+}
+
+/// The statements an allow_ddl agent may propose: they change the schema. An allowlist, so a
+/// statement PostgreSQL adds later is refused until someone decides it belongs here.
+fn is_schema_change(tag: pg_sys::NodeTag) -> bool {
+    use pg_sys::NodeTag::*;
+    matches!(
+        tag,
+        T_CreateStmt
+            | T_CreateTableAsStmt
+            | T_CreateSchemaStmt
+            | T_CreateSeqStmt
+            | T_CreateFunctionStmt
+            | T_CreateTrigStmt
+            | T_CreatePolicyStmt
+            | T_CreateDomainStmt
+            | T_CreateEnumStmt
+            | T_CreateRangeStmt
+            | T_CreateStatsStmt
+            | T_CompositeTypeStmt
+            | T_DefineStmt
+            | T_ViewStmt
+            | T_IndexStmt
+            | T_RuleStmt
+            | T_AlterTableStmt
+            | T_AlterSeqStmt
+            | T_AlterFunctionStmt
+            | T_AlterEnumStmt
+            | T_AlterDomainStmt
+            | T_AlterPolicyStmt
+            | T_AlterOwnerStmt
+            | T_AlterObjectSchemaStmt
+            | T_AlterStatsStmt
+            | T_RenameStmt
+            | T_DropStmt
+            | T_CommentStmt
+            | T_GrantStmt
+    )
 }
