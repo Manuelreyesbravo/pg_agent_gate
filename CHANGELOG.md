@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.13 -- 2026-10-08
+
+* **Metadata only.** The PGXN description is two sentences now; the longer
+  explanation it carried is in this README, and the per-release history in this changelog. No code changed: the upgrade
+  script 0.2.12 -> 0.2.13 changes no object.
+
 ## 0.2.12 -- 2026-10-08
 
 From a third external audit (of 0.2.8), every finding measured again on 0.2.11 before it was

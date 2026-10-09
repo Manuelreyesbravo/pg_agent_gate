@@ -1,0 +1,6 @@
+-- 0.2.12 -> 0.2.13
+--
+-- Metadata only: the PGXN description was shortened to two sentences, and the longer
+-- explanation it carried lives in README.md and CHANGELOG.md. No object of the extension
+-- changes; this script exists so that the version the catalog reports is the version
+-- that was installed.
