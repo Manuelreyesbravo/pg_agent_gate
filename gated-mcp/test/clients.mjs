@@ -12,7 +12,7 @@
  * Needs gated-mcp running AS AN AGENT ROLE (GATED_MCP_URL) and a superuser
  * connection to the same database (GATE_SUPERUSER_URL): what changed is checked
  * from OUTSIDE the gate, not from what the gate says it did. The database holds
- * clientes(id int primary key, plan text not null) with rows (1, 'free') and
+ * customers(id int primary key, plan text not null) with rows (1, 'free') and
  * (2, 'pro'), SELECT and UPDATE granted to the agent role.
  *
  * One `ok` / `FAIL` line per step.
@@ -80,7 +80,7 @@ function body(result) {
 async function main() {
   const intent = `upgrade customer 1 through the ${era} client`;
   // Setup from outside the gate, so every run starts from the same world.
-  await su`update clientes set plan = 'free' where id = 1`;
+  await su`update customers set plan = 'free' where id = 1`;
 
   const errors = [];
   let client;
@@ -101,10 +101,10 @@ async function main() {
   const who = body(await call("whoami"));
   step("whoami says the connection is an agent behind an enforced gate", who?.is_agent === true && who?.enforced === true, who);
 
-  const disc = await call("discover", { filter: "clientes" });
-  step("discover shows the table the agent was granted", JSON.stringify(body(disc)).includes("clientes"), body(disc));
+  const disc = await call("discover", { filter: "customers" });
+  step("discover shows the table the agent was granted", JSON.stringify(body(disc)).includes("customers"), body(disc));
 
-  const prop = body(await call("propose", { sql: "update clientes set plan = 'pro' where id = 1", intent }));
+  const prop = body(await call("propose", { sql: "update customers set plan = 'pro' where id = 1", intent }));
   step("a correct proposal verifies", prop?.ok === true && Number.isInteger(prop?.proposal), prop);
 
   const dry = body(await call("dry_run", { proposal: prop?.proposal }));
@@ -113,7 +113,7 @@ async function main() {
   const kept = body(await call("commit", { proposal: prop?.proposal }));
   step("commit keeps it", kept?.outcome === "kept", kept);
 
-  const wrong = body(await call("propose", { sql: "update clientes set plann = 'pro' where id = 2", intent: "a column that does not exist" }));
+  const wrong = body(await call("propose", { sql: "update customers set plann = 'pro' where id = 2", intent: "a column that does not exist" }));
   step("a false proposal is refused by the gate, through the client", wrong?.ok === false, wrong);
 
   const refused = body(await call("commit", { proposal: wrong?.proposal }));
@@ -124,14 +124,14 @@ async function main() {
 
   let notAVerb;
   try {
-    const r = await call("sql", { query: "delete from clientes" });
+    const r = await call("sql", { query: "delete from customers" });
     notAVerb = r?.isError === true;
   } catch {
     notAVerb = true;
   }
   step("a tool that is not a verb does not exist", notAVerb);
 
-  const world = await su`select id, plan from clientes order by id`;
+  const world = await su`select id, plan from customers order by id`;
   step(
     "from outside the gate, only the committed change happened",
     JSON.stringify(world.map((r) => [r.id, r.plan])) === JSON.stringify([[1, "pro"], [2, "pro"]]),

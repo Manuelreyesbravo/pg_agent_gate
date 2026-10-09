@@ -56,10 +56,10 @@ su -d "$ORIGIN" -v agent_role="$AGENT_ROLE" >/dev/null <<'SQL'
 CREATE EXTENSION pg_agent_gate;
 CREATE EXTENSION pg_living_assertions;
 
-CREATE TABLE clientes (id int PRIMARY KEY, plan text NOT NULL);
-INSERT INTO clientes VALUES (1, 'free'), (2, 'pro'), (3, 'free');
+CREATE TABLE customers (id int PRIMARY KEY, plan text NOT NULL);
+INSERT INTO customers VALUES (1, 'free'), (2, 'pro'), (3, 'free');
 GRANT USAGE ON SCHEMA public TO :"agent_role";
-GRANT SELECT, UPDATE ON clientes TO :"agent_role";
+GRANT SELECT, UPDATE ON customers TO :"agent_role";
 
 SELECT agent_gate.register_agent('billing', :'agent_role',
     'answers billing questions and upgrades plans', p_max_rows => 5);
@@ -68,20 +68,20 @@ SELECT agent_gate.register_agent('billing', :'agent_role',
 -- gate's own tables and still be enforced afterwards.
 SELECT living_assertions.declare('every_customer_has_a_plan',
     'a kept write may never leave a customer without a plan',
-    'select not exists (select 1 from public.clientes where plan = '''') as holds');
+    'select not exists (select 1 from public.customers where plan = '''') as holds');
 SELECT agent_gate.bind_assertion('billing', 'every_customer_has_a_plan');
 SQL
 
 # A history with every outcome that has to survive: a read, a dry run, a kept
 # write, a refusal because it was already kept, and a refusal because the
 # proposal never verified. A dump test over an empty record proves nothing.
-read=$(proposal_id "$(agent -d "$ORIGIN" -c "select agent_gate.propose('select id, plan from clientes order by id', 'list the customers')")")
+read=$(proposal_id "$(agent -d "$ORIGIN" -c "select agent_gate.propose('select id, plan from customers order by id', 'list the customers')")")
 agent -d "$ORIGIN" -c "select agent_gate.commit($read)" >/dev/null
-write=$(proposal_id "$(agent -d "$ORIGIN" -c "select agent_gate.propose('update clientes set plan = ''pro'' where id = 1', 'upgrade customer 1')")")
+write=$(proposal_id "$(agent -d "$ORIGIN" -c "select agent_gate.propose('update customers set plan = ''pro'' where id = 1', 'upgrade customer 1')")")
 agent -d "$ORIGIN" -c "select agent_gate.dry_run($write)" >/dev/null
 agent -d "$ORIGIN" -c "select agent_gate.commit($write)" >/dev/null
 agent -d "$ORIGIN" -c "select agent_gate.commit($write)" >/dev/null
-false_one=$(proposal_id "$(agent -d "$ORIGIN" -c "select agent_gate.propose('update clientes set plann = 1 where id = 2', 'a column that does not exist')")")
+false_one=$(proposal_id "$(agent -d "$ORIGIN" -c "select agent_gate.propose('update customers set plann = 1 where id = 2', 'a column that does not exist')")")
 agent -d "$ORIGIN" -c "select agent_gate.commit($false_one)" >/dev/null
 
 Q_AGENTS="select coalesce(string_agg(concat_ws(':', name, role, max_rows, allow_ddl, description, registered_at), ',' order by name), '') from agent_gate_internal.agents"
@@ -138,12 +138,12 @@ compare "acts() tells the agent the same history" "$ACTS_BEFORE" "$(agent -d "$T
 
 contains "the agent is still behind the gate in the restored database" \
     "it proposes, it does not execute" \
-    "$(agent -d "$TARGET" -c "select count(*) from clientes")"
+    "$(agent -d "$TARGET" -c "select count(*) from customers")"
 
 contains "the record is still append-only" "append-only" \
     "$(value -d "$TARGET" -c "update agent_gate_internal.executions set reason = 'rewritten' where id = (select min(id) from agent_gate_internal.executions)" 2>&1 || true)"
 
-after=$(proposal_id "$(agent -d "$TARGET" -c "select agent_gate.propose('update clientes set plan = ''pro'' where id = 3', 'upgrade customer 3 after the restore')")")
+after=$(proposal_id "$(agent -d "$TARGET" -c "select agent_gate.propose('update customers set plan = ''pro'' where id = 3', 'upgrade customer 3 after the restore')")")
 if [ -n "$after" ] && [ "$after" -gt "$MAX_PROPOSAL_BEFORE" ]; then
     echo "  ok   new proposals continue after the restored ones ($after > $MAX_PROPOSAL_BEFORE)"
 else

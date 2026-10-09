@@ -61,7 +61,7 @@ proposal_id() { sed -nE 's/.*"proposal": ([0-9]+).*/\1/p' <<<"$1" | head -1; }
 # all -- and a test that can only build the new one proves nothing about an
 # upgrade.
 if [ ! -d "$EXTDIR" ]; then
-    echo "  !! falta el paquete en $EXTDIR: corre PG_CONFIG=$PG_CONFIG tests/cluster.sh package" >&2
+    echo "  !! the package is missing from $EXTDIR: run PG_CONFIG=$PG_CONFIG tests/cluster.sh package" >&2
     exit 2
 fi
 cp "$ROOT/tests/fixtures/pg_agent_gate--0.1.0.sql" "$EXTDIR/"
@@ -71,21 +71,21 @@ expect "it starts on the old version" "0.1.0" \
     "$(su -c "select extversion from pg_extension where extname = 'pg_agent_gate'")"
 
 # History, so the upgrade has something it could lose.
-su -c "create table libro (id int primary key, texto text not null)" >/dev/null
-su -c "insert into libro values (1, 'uno'), (2, 'dos')" >/dev/null
+su -c "create table book (id int primary key, body text not null)" >/dev/null
+su -c "insert into book values (1, 'one'), (2, 'two')" >/dev/null
 su -c "grant usage on schema public to $AGENT" >/dev/null
-su -c "grant select, update on libro to $AGENT" >/dev/null
-su -c "select agent_gate.register_agent('viejo', '$AGENT', 'an agent registered before the upgrade')" >/dev/null
-antes=$(agent -c "select agent_gate.propose(\$s\$update libro set texto = 'antes' where id = 1\$s\$, \$i\$proposed before the upgrade\$i\$)")
-agent -c "select agent_gate.commit($(proposal_id "$antes"))" >/dev/null
-HISTORIA=$(su -c "select count(*) || ':' || coalesce(md5(string_agg(id || intent, '|' order by id)), '') from agent_gate_internal.proposals")
+su -c "grant select, update on book to $AGENT" >/dev/null
+su -c "select agent_gate.register_agent('old', '$AGENT', 'an agent registered before the upgrade')" >/dev/null
+before=$(agent -c "select agent_gate.propose(\$s\$update book set body = 'before' where id = 1\$s\$, \$i\$proposed before the upgrade\$i\$)")
+agent -c "select agent_gate.commit($(proposal_id "$before"))" >/dev/null
+HISTORY=$(su -c "select count(*) || ':' || coalesce(md5(string_agg(id || intent, '|' order by id)), '') from agent_gate_internal.proposals")
 
 # ------------------------------------------------------------- the upgrade --
-salida=$(su -c "alter extension pg_agent_gate update")
+output=$(su -c "alter extension pg_agent_gate update")
 # The target is whatever this build IS, read from Cargo.toml: a constant here said "0.2.0"
 # and failed the day the version moved, with the upgrade itself working.
-NUEVA=$(sed -nE 's/^version = "([^"]+)"/\1/p' "$ROOT/Cargo.toml" | head -1)
-expect "ALTER EXTENSION UPDATE reaches the new version" "$NUEVA" \
+NEW_VERSION=$(sed -nE 's/^version = "([^"]+)"/\1/p' "$ROOT/Cargo.toml" | head -1)
+expect "ALTER EXTENSION UPDATE reaches the new version" "$NEW_VERSION" \
     "$(su -c "select extversion from pg_extension where extname = 'pg_agent_gate'")"
 
 expect "the TRUNCATE triggers are there afterwards" "executions_no_truncate, proposals_no_truncate" \
@@ -95,15 +95,15 @@ expect "_load_proposal takes the lock argument" "boolean" \
 expect "and the one-argument shape is gone" "1" \
     "$(su -c "select count(*) from pg_proc where proname = '_load_proposal'")"
 
-expect "the record from before the upgrade is intact" "$HISTORIA" \
+expect "the record from before the upgrade is intact" "$HISTORY" \
     "$(su -c "select count(*) || ':' || coalesce(md5(string_agg(id || intent, '|' order by id)), '') from agent_gate_internal.proposals")"
 
 # The effect, which is the point: an agent registered BEFORE the upgrade keeps
 # working, and TRUNCATE no longer empties the history.
-despues=$(agent -c "select agent_gate.propose(\$s\$update libro set texto = 'despues' where id = 2\$s\$, \$i\$proposed after the upgrade\$i\$)")
+after=$(agent -c "select agent_gate.propose(\$s\$update book set body = 'after' where id = 2\$s\$, \$i\$proposed after the upgrade\$i\$)")
 expect "an agent from before the upgrade still commits" '"outcome": "kept"' \
-    "$(agent -c "select agent_gate.commit($(proposal_id "$despues"))")"
-expect "and the change is really there" "despues" "$(su -c 'select texto from libro where id = 2')"
+    "$(agent -c "select agent_gate.commit($(proposal_id "$after"))")"
+expect "and the change is really there" "after" "$(su -c 'select body from book where id = 2')"
 
 # The upgraded surface must BE the fresh one, not resemble it: every function of the gate's
 # schema -- name, arguments, result, strictness, volatility -- compared with a CREATE EXTENSION of
@@ -151,11 +151,11 @@ fi
 
 # And the verb this version adds works for an agent registered before it existed.
 expect "an agent from before the upgrade can use propose_and_commit" '"outcome": "kept"' \
-    "$(agent -c "select agent_gate.propose_and_commit(\$s\$update libro set texto = 'una llamada' where id = 1\$s\$, \$i\$one call after the upgrade\$i\$)")"
-expect "and that change is really there" "una llamada" "$(su -c 'select texto from libro where id = 1')"
+    "$(agent -c "select agent_gate.propose_and_commit(\$s\$update book set body = 'one call' where id = 1\$s\$, \$i\$one call after the upgrade\$i\$)")"
+expect "and that change is really there" "one call" "$(su -c 'select body from book where id = 1')"
 
 su -c "truncate agent_gate_internal.executions, agent_gate_internal.proposals" >/dev/null
-expect "TRUNCATE no longer empties the record" "$HISTORIA" \
+expect "TRUNCATE no longer empties the record" "$HISTORY" \
     "$(su -c "select count(*) || ':' || coalesce(md5(string_agg(id || intent, '|' order by id)), '') from agent_gate_internal.proposals where intent = 'proposed before the upgrade'")"
 
 if [ "$failures" -ne 0 ]; then

@@ -183,11 +183,11 @@ discover  ->  propose  ->  dry_run  ->  commit
 
 ```sql
 -- what may I touch? derived from the live catalog and MY privileges
-SELECT agent_gate.discover('clientes');
+SELECT agent_gate.discover('customers');
 
 -- propose one statement: nothing runs
 SELECT agent_gate.propose(
-  'update clientes set plan = ''pro'' where id = $1::int',
+  'update customers set plan = ''pro'' where id = $1::int',
   'upgrade the customer who asked for it',
   ARRAY['1']);
 --  {"proposal": 42, "ok": true, "kind": "write", "estimated_rows": 1,
@@ -211,7 +211,7 @@ SELECT agent_gate.commit(42);
 Anything else, from that session:
 
 ```
-=> delete from clientes where id > 0;
+=> delete from customers where id > 0;
 ERROR:  pg_agent_gate: this session belongs to agent "billing": it proposes, it does not execute
 DETAIL:  DELETE does not reach the database from an agent session
 HINT:  Call agent_gate.propose(sql, intent), then agent_gate.dry_run(proposal) or agent_gate.commit(proposal) -- or agent_gate.propose_and_commit(sql, intent) for both in one call.
@@ -390,7 +390,7 @@ CREATE EXTENSION pg_agent_gate;
 
 CREATE ROLE billing_agent LOGIN;               -- never a superuser
 GRANT USAGE ON SCHEMA public TO billing_agent;
-GRANT SELECT, UPDATE ON clientes TO billing_agent;
+GRANT SELECT, UPDATE ON customers TO billing_agent;
 
 SELECT agent_gate.register_agent(
   'billing', 'billing_agent', 'answers billing questions and upgrades plans',

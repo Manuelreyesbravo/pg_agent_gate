@@ -48,10 +48,10 @@ Out()  { sed 's/^/  < /'; }
 # before registration this role behaves exactly like any other.
 reset_world() {
     su "$DB" "
-      drop table if exists clientes;
-      create table clientes (id int primary key, plan text not null, email text);
-      alter table clientes owner to $AGENT;
-      insert into clientes values (1,'free','ana@one.example'), (2,'pro','bruno@one.example'), (3,'free','iris@one.example');" >/dev/null
+      drop table if exists customers;
+      create table customers (id int primary key, plan text not null, email text);
+      alter table customers owner to $AGENT;
+      insert into customers values (1,'free','ana@one.example'), (2,'pro','bruno@one.example'), (3,'free','iris@one.example');" >/dev/null
 }
 su postgres "create role $AGENT login" >/dev/null
 su postgres "create database $DB owner $AGENT" >/dev/null
@@ -61,13 +61,13 @@ reset_world
 
 say "THE PIECE YOU HAVE TODAY -- a server that holds a connection and runs what the model sends"
 note "the same role, not yet an agent: this is what an ordinary PostgreSQL MCP server does with it"
-In  "update clientes set plan = 'pro' where id = 1"
-agent "update clientes set plan = 'pro' where id = 1" | Out
+In  "update customers set plan = 'pro' where id = 1"
+agent "update customers set plan = 'pro' where id = 1" | Out
 note "a row count, and it already ran -- no review, no proof of what it touched"
-In  "drop table clientes          -- if the model sends this, the server runs it"
-agent "drop table clientes" | Out
-printf '  \033[31m(superuser) clientes: %s -- the only safety was the server'\''s own code\033[0m\n' \
-    "$([ -n "$(su "$DB" "select to_regclass('clientes')")" ] && echo present || echo 'TABLE GONE, irreversibly')"
+In  "drop table customers          -- if the model sends this, the server runs it"
+agent "drop table customers" | Out
+printf '  \033[31m(superuser) customers: %s -- the only safety was the server'\''s own code\033[0m\n' \
+    "$([ -n "$(su "$DB" "select to_regclass('customers')")" ] && echo present || echo 'TABLE GONE, irreversibly')"
 
 
 reset_world
@@ -77,12 +77,12 @@ say "THE PIECE WE PUT IN ITS PLACE -- the gate, inside the engine, under the rol
 note "no tool runs SQL. the agent can only discover / propose / dry_run / commit, and what comes"
 note "back is FAR MORE than a result: the catalog it may touch, every check, the exact before/after"
 
-In "discover('clientes')"
-agent "select agent_gate.discover('clientes')" | pretty | head -30 | Out
+In "discover('customers')"
+agent "select agent_gate.discover('customers')" | pretty | head -30 | Out
 note "the schema it is allowed to see -- columns, types, keys, a fingerprint -- not a query of its own"
 
-In "propose('update clientes set plan = \$1 where id = 1', 'move a customer to the pro plan', {pro})"
-PROP=$(agent "select agent_gate.propose('update clientes set plan = \$1 where id = 1', 'move a customer to the pro plan', array['pro'])")
+In "propose('update customers set plan = \$1 where id = 1', 'move a customer to the pro plan', {pro})"
+PROP=$(agent "select agent_gate.propose('update customers set plan = \$1 where id = 1', 'move a customer to the pro plan', array['pro'])")
 echo "$PROP" | pretty | Out
 ID=$(echo "$PROP" | sed -nE 's/.*"proposal": ?([0-9]+).*/\1/p' | head -1)
 note "every guard, each with its verdict -- the database checked it against itself, nothing ran"
@@ -91,12 +91,12 @@ In "dry_run($ID)"
 agent "select agent_gate.dry_run($ID)" | pretty | Out
 note "the exact before and after, and whether bound assertions still hold -- and nothing was kept"
 
-In "propose('drop table clientes', 'clean up')   -- the same statement that destroyed the table above"
-agent "select agent_gate.propose('drop table clientes', 'clean up')" | pretty | Out
+In "propose('drop table customers', 'clean up')   -- the same statement that destroyed the table above"
+agent "select agent_gate.propose('drop table customers', 'clean up')" | pretty | Out
 note "refused here, with the reason -- it never reached the table"
 
 In "commit($ID)   -- keep the one that verified"
 agent "select agent_gate.commit($ID)" | pretty | Out
-printf '  \033[32m(superuser) clientes is still here; id 1 is now %s; nothing else changed\033[0m\n' \
-    "$(su "$DB" "select plan from clientes where id = 1")"
+printf '  \033[32m(superuser) customers is still here; id 1 is now %s; nothing else changed\033[0m\n' \
+    "$(su "$DB" "select plan from customers where id = 1")"
 echo

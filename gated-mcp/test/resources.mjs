@@ -15,7 +15,7 @@
  *     from a superuser connection outside the gate.
  *
  * Needs GATED_MCP_URL (gated-mcp running as the agent role) and GATE_SUPERUSER_URL.
- * The database holds clientes (granted) and secretos (not granted).
+ * The database holds customers (granted) and secrets (not granted).
  * One `ok` / `FAIL` line per case.
  */
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
@@ -87,12 +87,12 @@ async function main() {
   check("the identity resource says the connection is an agent behind the gate",
     json(who.value?.contents)?.is_agent === true && json(who.value?.contents)?.enforced === true, who.value ?? who);
 
-  const rel = await errorOf(client.readResource({ uri: "agent-gate://relation/public/clientes" }));
+  const rel = await errorOf(client.readResource({ uri: "agent-gate://relation/public/customers" }));
   check("a granted relation reads with its columns", JSON.stringify(json(rel.value?.contents) ?? "").includes("plan"), rel.value ?? rel);
 
-  const secret = await errorOf(client.readResource({ uri: "agent-gate://relation/public/secretos" }));
+  const secret = await errorOf(client.readResource({ uri: "agent-gate://relation/public/secrets" }));
   check("NO POWER OF ITS OWN: a relation without a GRANT answers -32602, not its content",
-    secret.code === -32602 && !JSON.stringify(secret).includes("clave"), secret);
+    secret.code === -32602 && !JSON.stringify(secret).includes("passphrase"), secret);
 
   const unknown = await errorOf(client.readResource({ uri: "agent-gate://nothing-here" }));
   check("an unknown resource answers -32602", unknown.code === -32602, unknown);

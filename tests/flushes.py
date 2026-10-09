@@ -29,8 +29,8 @@ SUPERUSER, AGENT = os.environ["SUPERUSER"], os.environ["FLUSH_AGENT_ROLE"]
 N = int(os.environ.get("FLUSH_ACTS", "50"))
 TOLERANCE = 0.1
 
-READ = "select n from flujo where id = $1::int"
-WRITE = "update flujo set n = n + 1 where id = $1::int"
+READ = "select n from flow where id = $1::int"
+WRITE = "update flow set n = n + 1 where id = $1::int"
 FSYNCS = ("select coalesce(sum(fsyncs), 0)::bigint from pg_stat_io "
           "where backend_type = 'client backend' and object = 'wal'")
 

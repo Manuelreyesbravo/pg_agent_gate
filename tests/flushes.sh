@@ -26,10 +26,10 @@ claim_database "$FLUSH_DB"
 
 "$BIN/psql" -X -U "$SUPERUSER" -d "$FLUSH_DB" -v ON_ERROR_STOP=1 -q -v agent="$FLUSH_AGENT_ROLE" >/dev/null <<'SQL'
 CREATE EXTENSION pg_agent_gate;
-CREATE TABLE flujo (id int PRIMARY KEY, n int NOT NULL);
-INSERT INTO flujo SELECT g, 0 FROM generate_series(1, 10) g;
+CREATE TABLE flow (id int PRIMARY KEY, n int NOT NULL);
+INSERT INTO flow SELECT g, 0 FROM generate_series(1, 10) g;
 GRANT USAGE ON SCHEMA public TO :"agent";
-GRANT SELECT, UPDATE ON flujo TO :"agent";
+GRANT SELECT, UPDATE ON flow TO :"agent";
 SELECT agent_gate.register_agent('flushes', :'agent', 'counts the WAL flushes an act pays', p_max_rows => 5);
 SQL
 

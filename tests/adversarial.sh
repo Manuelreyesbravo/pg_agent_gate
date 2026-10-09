@@ -59,20 +59,20 @@ claim_database "$DB"
     -v agent="$AGENT" -v other="$OTHER" >/dev/null <<SQL
 CREATE EXTENSION pg_agent_gate;
 
-CREATE TABLE clientes (id int PRIMARY KEY, plan text NOT NULL);
-INSERT INTO clientes VALUES (1, 'free'), (2, 'pro'), (3, 'free');
+CREATE TABLE customers (id int PRIMARY KEY, plan text NOT NULL);
+INSERT INTO customers VALUES (1, 'free'), (2, 'pro'), (3, 'free');
 
-CREATE TABLE secretos (clave text);
-INSERT INTO secretos VALUES ('$SECRET');
-REVOKE ALL ON secretos FROM PUBLIC;
+CREATE TABLE secrets (passphrase text);
+INSERT INTO secrets VALUES ('$SECRET');
+REVOKE ALL ON secrets FROM PUBLIC;
 
 -- A procedure the agent may EXECUTE: CALL is its own statement kind, and a gate
 -- that forgets it would let an agent run whatever somebody left callable.
 CREATE PROCEDURE agent_gate_adv_proc() LANGUAGE sql AS
-    \$\$ UPDATE clientes SET plan = 'called' WHERE id = 1 \$\$;
+    \$\$ UPDATE customers SET plan = 'called' WHERE id = 1 \$\$;
 
 GRANT USAGE ON SCHEMA public TO :"agent", :"other";
-GRANT SELECT, UPDATE ON clientes TO :"agent";
+GRANT SELECT, UPDATE ON customers TO :"agent";
 GRANT EXECUTE ON PROCEDURE agent_gate_adv_proc() TO :"agent";
 
 -- max_rows 2 of 3 customers on purpose: a write that touches everything has to
@@ -90,7 +90,7 @@ proposal_id() { sed -nE 's/.*"proposal": ([0-9]+).*/\1/p' <<<"$1" | head -1; }
 # The world, in one line: what every customer's plan is, how many objects the
 # attacks try to create exist, and how many secrets are there. If an attack got
 # through anywhere, this string changes.
-WORLD="select (select string_agg(id || '=' || plan, ',' order by id) from clientes) || ' | objetos=' || (select count(*) from pg_class where relname like 'agent!_gate!_adv!_%' escape '!') || ' | secretos=' || (select count(*) from secretos)"
+WORLD="select (select string_agg(id || '=' || plan, ',' order by id) from customers) || ' | objects=' || (select count(*) from pg_class where relname like 'agent!_gate!_adv!_%' escape '!') || ' | secrets=' || (select count(*) from secrets)"
 world() { "$BIN/psql" -X -U "$SUPERUSER" -d "$DB" -tAc "$WORLD"; }
 
 failures=0
@@ -157,28 +157,28 @@ fi
 # judged by what the world looks like afterwards.
 
 attack session "two statements in one simple query" "" \
-    agent -c "select agent_gate.whoami(); update clientes set plan = 'hacked' where id = 1"
+    agent -c "select agent_gate.whoami(); update customers set plan = 'hacked' where id = 1"
 
 attack session "PREPARE and EXECUTE, a plan that is not parsed again" "" \
-    agent -c "prepare p as update clientes set plan = 'hacked' where id = 1" -c "execute p"
+    agent -c "prepare p as update customers set plan = 'hacked' where id = 1" -c "execute p"
 
 attack session "a cursor over a table it was never granted" "$SECRET" \
-    agent -c "begin" -c "declare c cursor for select clave from secretos" -c "fetch all from c"
+    agent -c "begin" -c "declare c cursor for select passphrase from secrets" -c "fetch all from c"
 
 attack session "COPY TO PROGRAM" "" \
-    agent -c "copy clientes to program 'touch $MARKER'"
+    agent -c "copy customers to program 'touch $MARKER'"
 
 attack session "COPY FROM PROGRAM" "" \
-    agent -c "copy clientes from program 'echo 9,hacked'"
+    agent -c "copy customers from program 'echo 9,hacked'"
 
 attack session "an anonymous DO block" "" \
-    agent -c "do \$x\$ begin update clientes set plan = 'hacked'; end \$x\$"
+    agent -c "do \$x\$ begin update customers set plan = 'hacked'; end \$x\$"
 
 attack session "CALL of a procedure it may execute" "" \
     agent -c "call agent_gate_adv_proc()"
 
 attack session "EXPLAIN ANALYZE, which executes" "" \
-    agent -c "explain analyze update clientes set plan = 'hacked' where id = 1"
+    agent -c "explain analyze update customers set plan = 'hacked' where id = 1"
 
 attack session "CREATE TABLE" "" agent -c "create table agent_gate_adv_t (x int)"
 
@@ -186,10 +186,10 @@ attack session "CREATE FUNCTION" "" \
     agent -c "create function agent_gate_adv_f() returns int language sql as 'select 1'"
 
 attack session "SELECT INTO a new table" "" \
-    agent -c "select * into agent_gate_adv_into from clientes"
+    agent -c "select * into agent_gate_adv_into from customers"
 
 attack session "a SELECT whose CTE writes" "" \
-    agent -c "with x as (update clientes set plan = 'hacked' where id = 1 returning 1) select agent_gate.whoami()"
+    agent -c "with x as (update customers set plan = 'hacked' where id = 1 returning 1) select agent_gate.whoami()"
 
 attack session "a verb argument that calls a function" "" \
     agent -c "select agent_gate.propose(pg_read_file('/etc/hostname'), 'read a file through an argument')"
@@ -198,21 +198,21 @@ attack session "the one-call verb with an argument that calls a function" "" \
     agent -c "select agent_gate.propose_and_commit(pg_read_file('/etc/hostname'), 'read a file through an argument')"
 
 attack session "a subselect of what it was not granted" "$SECRET" \
-    agent -c "select (select string_agg(clave, ',') from secretos)"
+    agent -c "select (select string_agg(passphrase, ',') from secrets)"
 
 attack session "SET ROLE to the owner" "" \
-    agent -c "set role $SUPERUSER" -c "update clientes set plan = 'hacked' where id = 1"
+    agent -c "set role $SUPERUSER" -c "update customers set plan = 'hacked' where id = 1"
 
 attack session "SET SESSION AUTHORIZATION" "" \
-    agent -c "set session authorization $SUPERUSER" -c "update clientes set plan = 'hacked' where id = 1"
+    agent -c "set session authorization $SUPERUSER" -c "update customers set plan = 'hacked' where id = 1"
 
 attack session "RESET ALL and then raw SQL" "" \
-    agent -c "reset all" -c "update clientes set plan = 'hacked' where id = 1"
+    agent -c "reset all" -c "update customers set plan = 'hacked' where id = 1"
 
 attack session "DISCARD ALL and then raw SQL" "" \
-    agent -c "discard all" -c "update clientes set plan = 'hacked' where id = 1"
+    agent -c "discard all" -c "update customers set plan = 'hacked' where id = 1"
 
-attack session "VACUUM and CHECKPOINT" "" agent -c "vacuum clientes" -c "checkpoint"
+attack session "VACUUM and CHECKPOINT" "" agent -c "vacuum customers" -c "checkpoint"
 
 attack session "LISTEN and NOTIFY" "" agent -c "listen adv" -c "notify adv, 'x'"
 
@@ -255,47 +255,47 @@ attack_both() {  # <what> <sql> <intent>
 }
 
 attack_both "two statements in one proposal" \
-    "select 1; update clientes set plan = 'hacked' where id = 1" "two at once"
+    "select 1; update customers set plan = 'hacked' where id = 1" "two at once"
 
 attack_both "a second statement hidden after a comment" \
     "select 1; -- looks like the end
-update clientes set plan = 'hacked' where id = 2" "hidden after a comment"
+update customers set plan = 'hacked' where id = 2" "hidden after a comment"
 
 attack_both "DDL from an agent that was not allowed DDL" \
     "create table agent_gate_adv_ddl (x int)" "make myself a table"
 
 attack_both "COPY TO PROGRAM as a proposal" \
-    "copy clientes to program 'touch $MARKER'" "reach the shell"
+    "copy customers to program 'touch $MARKER'" "reach the shell"
 
 attack_both "SELECT INTO as a proposal" \
-    "select * into agent_gate_adv_into from clientes" "copy the table"
+    "select * into agent_gate_adv_into from customers" "copy the table"
 
 attack_both "SELECT FOR UPDATE beyond max_rows" \
-    "select * from clientes for update" "lock every row"
+    "select * from customers for update" "lock every row"
 
 attack_both "a write that touches more rows than max_rows" \
-    "update clientes set plan = 'hacked'" "upgrade everyone"
+    "update customers set plan = 'hacked'" "upgrade everyone"
 
 # The same write hidden in a CTE, under a statement that returns ONE row. max_rows counted
 # the rows of the outer statement, so this touched all three customers under a limit of
 # two (found by the cycle harness of yggdrasil, 2026-10-06). Two shapes of it.
 attack_both "a CTE that writes, under a SELECT that returns one row" \
-    "with d as (update clientes set plan = 'hacked' returning 1) select count(*) from d" \
+    "with d as (update customers set plan = 'hacked' returning 1) select count(*) from d" \
     "upgrade everyone, counted as one row"
 attack_both "a CTE that writes, under a SELECT that does not even read it" \
-    "with d as (update clientes set plan = 'hacked' returning 1) select 1" \
+    "with d as (update customers set plan = 'hacked' returning 1) select 1" \
     "upgrade everyone, counted as one row"
 
 # A verification is a statement about the database at a moment. The TTL is SUSET,
 # so only the owner can shorten it -- which is what makes this testable at all.
 su -c "alter role $AGENT set agent_gate.proposal_ttl_seconds = 1" >/dev/null
-stale=$(agent -c "select agent_gate.propose(\$s\$update clientes set plan = 'hacked' where id = 3\$s\$, \$i\$let me go stale\$i\$)")
+stale=$(agent -c "select agent_gate.propose(\$s\$update customers set plan = 'hacked' where id = 3\$s\$, \$i\$let me go stale\$i\$)")
 sleep 2
 attack proposal "a verification older than its TTL" "" \
     agent -c "select agent_gate.commit($(proposal_id "$stale"))"
 su -c "alter role $AGENT reset agent_gate.proposal_ttl_seconds" >/dev/null
 
-mine=$(agent -c "select agent_gate.propose(\$s\$update clientes set plan = 'hacked' where id = 2\$s\$, \$i\$mine, not yours\$i\$)")
+mine=$(agent -c "select agent_gate.propose(\$s\$update customers set plan = 'hacked' where id = 2\$s\$, \$i\$mine, not yours\$i\$)")
 attack proposal "another agent commits a proposal that is not its own" "" \
     other -c "select agent_gate.commit($(proposal_id "$mine"))"
 
@@ -306,27 +306,27 @@ attack proposal "another agent commits a proposal that is not its own" "" \
 
 expect control "whoami says the session is behind the gate" '"is_agent": true' \
     "$(agent -c 'select agent_gate.whoami()')"
-expect control "discover shows what the agent was granted" "clientes" \
+expect control "discover shows what the agent was granted" "customers" \
     "$(agent -c "select agent_gate.discover('', 500)")"
 
-read_p=$(agent -c "select agent_gate.propose(\$s\$select id, plan from clientes order by id\$s\$, \$i\$list the customers\$i\$)")
+read_p=$(agent -c "select agent_gate.propose(\$s\$select id, plan from customers order by id\$s\$, \$i\$list the customers\$i\$)")
 expect control "a legitimate read verifies" '"ok": true' "$read_p"
 expect control "and committing it returns rows" '"outcome": "read"' \
     "$(agent -c "select agent_gate.commit($(proposal_id "$read_p"))")"
 
-write_p=$(agent -c "select agent_gate.propose(\$s\$update clientes set plan = 'upgraded' where id = 1\$s\$, \$i\$upgrade customer 1\$i\$)")
+write_p=$(agent -c "select agent_gate.propose(\$s\$update customers set plan = 'upgraded' where id = 1\$s\$, \$i\$upgrade customer 1\$i\$)")
 expect control "a legitimate write verifies" '"ok": true' "$write_p"
 write_id=$(proposal_id "$write_p")
 
 expect control "dry_run shows before and after" '"before"' \
     "$(agent -c "select agent_gate.dry_run(${write_id:-0})")"
 expect control "and a dry run keeps nothing" "free" \
-    "$(su -c 'select plan from clientes where id = 1')"
+    "$(su -c 'select plan from customers where id = 1')"
 
 expect control "commit keeps the change" '"outcome": "kept"' \
     "$(agent -c "select agent_gate.commit(${write_id:-0})")"
 expect control "and the world really changed" "upgraded" \
-    "$(su -c 'select plan from clientes where id = 1')"
+    "$(su -c 'select plan from customers where id = 1')"
 
 expect control "committing the same proposal twice is refused" "already committed" \
     "$(agent -c "select agent_gate.commit(${write_id:-0})")"
@@ -336,11 +336,11 @@ expect control "acts tells the agent its own history" "upgrade customer 1" \
 # The one-call verb, from a real agent session: a read returns rows, a write is kept and the
 # world really changes, and both land in the agent's history.
 expect control "a read in one call returns rows" '"outcome": "read"' \
-    "$(one_call "select id, plan from clientes order by id" "list the customers in one call")"
+    "$(one_call "select id, plan from customers order by id" "list the customers in one call")"
 expect control "a write in one call is kept" '"outcome": "kept"' \
-    "$(one_call "update clientes set plan = 'one call' where id = 3" "upgrade customer 3 in one call")"
+    "$(one_call "update customers set plan = 'one call' where id = 3" "upgrade customer 3 in one call")"
 expect control "and the world really changed" "one call" \
-    "$(su -c 'select plan from clientes where id = 3')"
+    "$(su -c 'select plan from customers where id = 3')"
 expect control "acts shows the one-call act" "upgrade customer 3 in one call" \
     "$(agent -c 'select agent_gate.acts(500)')"
 

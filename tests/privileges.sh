@@ -62,18 +62,18 @@ claim_database "$DB"
     -v billing="$BILLING" -v support="$SUPPORT" -v app="$APP" -v stranger="$STRANGER" >/dev/null <<'SQL'
 CREATE EXTENSION pg_agent_gate;
 
-CREATE TABLE clientes (id int PRIMARY KEY, plan text NOT NULL);
-INSERT INTO clientes VALUES (1, 'free'), (2, 'pro'), (3, 'free');
-CREATE TABLE secretos (clave text);
-INSERT INTO secretos VALUES ('the-bank-key');
-REVOKE ALL ON secretos FROM PUBLIC;
+CREATE TABLE customers (id int PRIMARY KEY, plan text NOT NULL);
+INSERT INTO customers VALUES (1, 'free'), (2, 'pro'), (3, 'free');
+CREATE TABLE secrets (passphrase text);
+INSERT INTO secrets VALUES ('the-bank-key');
+REVOKE ALL ON secrets FROM PUBLIC;
 
 GRANT USAGE ON SCHEMA public TO :"billing", :"support", :"app", :"stranger";
-GRANT SELECT, UPDATE ON clientes TO :"billing";
-GRANT SELECT ON clientes TO :"support";
--- The app role holds MORE than billing: it may update clientes and read secretos.
+GRANT SELECT, UPDATE ON customers TO :"billing";
+GRANT SELECT ON customers TO :"support";
+-- The app role holds MORE than billing: it may update customers and read secrets.
 -- Privileges are not what lets somebody run a proposal, ownership of it is.
-GRANT SELECT, UPDATE, DELETE ON clientes, secretos TO :"app";
+GRANT SELECT, UPDATE, DELETE ON customers, secrets TO :"app";
 SQL
 
 failures=0
@@ -110,17 +110,17 @@ check legit "the superuser registers an agent" "enforced_by" \
 check legit "and a second one" "enforced_by" \
     "$(as "$SUPERUSER" -c "select agent_gate.register_agent('support', '$SUPPORT', 'answers support questions, reads customers')")"
 
-q=$(proposal_id "$(as "$BILLING" -c "select agent_gate.propose('update clientes set plan = ''pro'' where id = 3', 'upgrade customer 3')")")
+q=$(proposal_id "$(as "$BILLING" -c "select agent_gate.propose('update customers set plan = ''pro'' where id = 3', 'upgrade customer 3')")")
 check legit "an agent commits its own write on what it was granted" '"outcome": "kept"' \
     "$(as "$BILLING" -c "select agent_gate.commit(${q:-0})")"
-r=$(proposal_id "$(as "$BILLING" -c "select agent_gate.propose('select id, plan from clientes order by id', 'list the customers')")")
+r=$(proposal_id "$(as "$BILLING" -c "select agent_gate.propose('select id, plan from customers order by id', 'list the customers')")")
 check legit "an agent reads what it was granted" '"outcome": "read"' \
     "$(as "$BILLING" -c "select agent_gate.commit(${r:-0})")"
-check legit "discover shows an agent what it was granted" "clientes" \
+check legit "discover shows an agent what it was granted" "customers" \
     "$(as "$BILLING" -c "select agent_gate.discover('', 500)")"
 
 # The proposal every attack below goes after. It stays uncommitted until the end.
-p=$(proposal_id "$(as "$BILLING" -c "select agent_gate.propose('update clientes set plan = ''free'' where id = 2', '$MARK')")")
+p=$(proposal_id "$(as "$BILLING" -c "select agent_gate.propose('update customers set plan = ''free'' where id = 2', '$MARK')")")
 check legit "an agent sees its own history" "$MARK" "$(as "$BILLING" -c "select agent_gate.acts(500)")"
 
 # -------------------------------------------------- nobody wears the mark --
@@ -134,16 +134,16 @@ check attack "a superuser role cannot be registered as an agent" "is a superuser
     "$(as "$SUPERUSER" -c "select agent_gate.register_agent('root', '$SUPERUSER', 'a superuser pretending to be behind the gate')")"
 # RESET ALL goes back to the ROLE's settings, which is exactly where the mark lives.
 check attack "RESET ALL does not take an agent out of the gate" "it proposes, it does not execute" \
-    "$(as "$BILLING" -c "reset all" -c "select count(*) from clientes")"
+    "$(as "$BILLING" -c "reset all" -c "select count(*) from customers")"
 # One mistaken GRANT must not be the difference between behind the gate and out of
 # it. PostgreSQL 15+ can grant SET on a superuser-only parameter, and before the gate
 # refused the whole agent_gate.* prefix that was a measured exit: with this grant,
 # `set agent_gate.agent = ''` worked and the next raw SELECT ran.
 "$BIN/psql" -X -U "$SUPERUSER" -d "$DB" -qc "grant set on parameter agent_gate.agent to $BILLING"
 check attack "with SET ON PARAMETER granted by mistake, an agent still cannot clear its mark" "an agent session may change" \
-    "$(as "$BILLING" -c "set agent_gate.agent = ''" -c "select count(*) from clientes")"
+    "$(as "$BILLING" -c "set agent_gate.agent = ''" -c "select count(*) from customers")"
 check attack "and the raw SQL after that attempt is still refused" "it proposes, it does not execute" \
-    "$(as "$BILLING" -c "set agent_gate.agent = ''" -c "select count(*) from clientes")"
+    "$(as "$BILLING" -c "set agent_gate.agent = ''" -c "select count(*) from customers")"
 "$BIN/psql" -X -U "$SUPERUSER" -d "$DB" -qc "revoke set on parameter agent_gate.agent from $BILLING"
 
 # ------------------------------------------------ the record is the gate's --
@@ -179,12 +179,12 @@ check_absent attack "a non-agent role's acts() does not show it" "$MARK" \
     "$(as "$APP" -c "select agent_gate.acts(500)")"
 
 # ------------------------------------- GRANT is still the authorization --
-check attack "an agent cannot propose a read of what it was not granted" "permission denied for table secretos" \
-    "$(as "$BILLING" -c "select agent_gate.propose('select clave from secretos', 'read the secrets')")"
-check_absent attack "discover does not show an agent what it was not granted" "secretos" \
+check attack "an agent cannot propose a read of what it was not granted" "permission denied for table secrets" \
+    "$(as "$BILLING" -c "select agent_gate.propose('select passphrase from secrets', 'read the secrets')")"
+check_absent attack "discover does not show an agent what it was not granted" "secrets" \
     "$(as "$BILLING" -c "select agent_gate.discover('', 500)")"
 check attack "after every attack the row is untouched" "pro" \
-    "$(as "$SUPERUSER" -c "select plan from clientes where id = 2")"
+    "$(as "$SUPERUSER" -c "select plan from customers where id = 2")"
 
 # -------------------------------------- and the attacks burned nothing --
 check legit "the refusals did not burn the proposal: its agent still commits it" '"outcome": "kept"' \

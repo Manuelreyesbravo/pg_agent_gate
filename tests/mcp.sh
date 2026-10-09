@@ -47,17 +47,17 @@ trap cleanup EXIT
 
 psql() { "$BIN/psql" -X -q -h "$ROOT/.testcluster" -p "$GATE_PORT" "$@"; }
 
-# The world the client suites expect: clientes(id, plan) with SELECT and UPDATE granted to
-# the agent, and secretos, which the agent is NOT granted -- so a resource cannot show it.
+# The world the client suites expect: customers(id, plan) with SELECT and UPDATE granted to
+# the agent, and secrets, which the agent is NOT granted -- so a resource cannot show it.
 psql -d postgres -c "create role $AGENT login" >/dev/null
 psql -d postgres -c "create database $DB" >/dev/null
 psql -d "$DB" <<SQL >/dev/null
 create extension pg_agent_gate;
-create table clientes (id int primary key, plan text not null);
-insert into clientes values (1, 'free'), (2, 'pro');
-create table secretos (id int primary key, clave text not null);
-insert into secretos values (1, 'do-not-show');
-grant select, update on clientes to $AGENT;
+create table customers (id int primary key, plan text not null);
+insert into customers values (1, 'free'), (2, 'pro');
+create table secrets (id int primary key, passphrase text not null);
+insert into secrets values (1, 'do-not-show');
+grant select, update on customers to $AGENT;
 select agent_gate.register_agent('billing', '$AGENT', 'answers billing questions', p_max_rows => 1000);
 SQL
 

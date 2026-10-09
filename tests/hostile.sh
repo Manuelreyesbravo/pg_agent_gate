@@ -44,44 +44,44 @@ claim_database "$DB"
 "$BIN/psql" -X -U "$SUPERUSER" -d "$DB" -v ON_ERROR_STOP=1 -q -v agent="$AGENT" >/dev/null <<SQL
 CREATE EXTENSION pg_agent_gate;
 
-CREATE TABLE libro (id int PRIMARY KEY, texto text NOT NULL);
-INSERT INTO libro VALUES (1, 'uno'), (2, 'dos');
+CREATE TABLE book (id int PRIMARY KEY, body text NOT NULL);
+INSERT INTO book VALUES (1, 'one'), (2, 'two');
 
 -- The agent has NO privilege on this one. Everything under [indirect] is about
 -- whether something the owner left behind writes here on the agent's behalf.
-CREATE TABLE bitacora (quien text, que text);
-REVOKE ALL ON bitacora FROM PUBLIC;
+CREATE TABLE audit_log (who text, what text);
+REVOKE ALL ON audit_log FROM PUBLIC;
 
-CREATE TABLE secretos (clave text);
-INSERT INTO secretos VALUES ('the-bank-key');
-REVOKE ALL ON secretos FROM PUBLIC;
+CREATE TABLE secrets (passphrase text);
+INSERT INTO secrets VALUES ('the-bank-key');
+REVOKE ALL ON secrets FROM PUBLIC;
 
 -- An ordinary trigger: its function runs as whoever fired it, so it should hit
 -- the same wall the agent would.
-CREATE FUNCTION anotar() RETURNS trigger LANGUAGE plpgsql AS \$t\$
+CREATE FUNCTION log_write() RETURNS trigger LANGUAGE plpgsql AS \$t\$
 BEGIN
-    INSERT INTO bitacora VALUES (current_user, 'trigger');
+    INSERT INTO audit_log VALUES (current_user, 'trigger');
     RETURN NEW;
 END \$t\$;
-CREATE TRIGGER libro_anota AFTER UPDATE ON libro FOR EACH ROW EXECUTE FUNCTION anotar();
+CREATE TRIGGER book_log AFTER UPDATE ON book FOR EACH ROW EXECUTE FUNCTION log_write();
 
 -- A SECURITY DEFINER function the owner left callable. This one runs as the
 -- OWNER, so it can write where the agent cannot. That is PostgreSQL working as
 -- designed, and the point of measuring it is to know it happens.
-CREATE FUNCTION elevar() RETURNS int LANGUAGE plpgsql SECURITY DEFINER AS \$e\$
+CREATE FUNCTION elevate() RETURNS int LANGUAGE plpgsql SECURITY DEFINER AS \$e\$
 BEGIN
-    INSERT INTO bitacora VALUES (current_user, 'security definer');
+    INSERT INTO audit_log VALUES (current_user, 'security definer');
     RETURN 1;
 END \$e\$;
 
 -- A view over a table the agent may not read. Without security_invoker it is
 -- checked with the OWNER's privileges.
-CREATE VIEW ventana AS SELECT clave FROM secretos;
+CREATE VIEW secret_view AS SELECT passphrase FROM secrets;
 
 GRANT USAGE ON SCHEMA public TO :"agent";
-GRANT SELECT, UPDATE ON libro TO :"agent";
-GRANT EXECUTE ON FUNCTION elevar() TO :"agent";
-GRANT SELECT ON ventana TO :"agent";
+GRANT SELECT, UPDATE ON book TO :"agent";
+GRANT EXECUTE ON FUNCTION elevate() TO :"agent";
+GRANT SELECT ON secret_view TO :"agent";
 
 SELECT agent_gate.register_agent('hostile', :'agent', 'the agent used by the second battery', p_max_rows => 5);
 SQL
@@ -238,48 +238,48 @@ record_intact "and the owner cannot TRUNCATE it either" \
 # know it happens, and that the README says so -- a limit only its author knows
 # is not a documented limit.
 
-bitacora() { su -c 'select count(*) from bitacora'; }
+audit_rows() { su -c 'select count(*) from audit_log'; }
 
 # An ordinary trigger runs as whoever fired it, so it hits the same wall the
 # agent would: the write does not happen, and neither does the UPDATE.
-propose_and_commit "update libro set texto = 'trigger' where id = 1" "fire the ordinary trigger" >/dev/null
-expect indirect "an ordinary trigger cannot write where the agent cannot" "0" "$(bitacora)"
-expect indirect "and the write it was attached to did not happen either" "uno" \
-    "$(su -c 'select texto from libro where id = 1')"
+propose_and_commit "update book set body = 'trigger' where id = 1" "fire the ordinary trigger" >/dev/null
+expect indirect "an ordinary trigger cannot write where the agent cannot" "0" "$(audit_rows)"
+expect indirect "and the write it was attached to did not happen either" "one" \
+    "$(su -c 'select body from book where id = 1')"
 
 # THE TRIGGER COMES OFF HERE, and that is not tidying up: while it was attached,
-# every write on libro died with 'permission denied for table bitacora', so the
+# every write on book died with 'permission denied for table audit_log', so the
 # three cases below it were measuring the trigger instead of what they claim.
 # A case that leaves the world changed makes the next ones measure something
 # else -- this file learned that about itself on its first run.
-su -c 'drop trigger libro_anota on libro' >/dev/null
+su -c 'drop trigger book_log on book' >/dev/null
 
 # A SECURITY DEFINER function called from a READ. Since 0.2.3 the gate refuses it at propose
 # (no_opaque_function, because the body is opaque); even if it had not, a read's subtransaction is
 # always rolled back, so it would leave nothing either way. Two layers -- the case checks the
 # outcome, which is the same: nothing written.
-propose_and_commit "select elevar()" "call an elevated function from a read" >/dev/null
-expect indirect "a SECURITY DEFINER function called from a READ leaves nothing" "0" "$(bitacora)"
+propose_and_commit "select elevate()" "call an elevated function from a read" >/dev/null
+expect indirect "a SECURITY DEFINER function called from a READ leaves nothing" "0" "$(audit_rows)"
 
-# The same function inside a WRITE. Until 0.2.3 this was a documented LIMIT: elevar(), being
+# The same function inside a WRITE. Until 0.2.3 this was a documented LIMIT: elevate(), being
 # SECURITY DEFINER, ran as its owner and wrote to a table the agent cannot touch. 0.2.3 closes it:
 # no_opaque_function refuses at propose any statement that calls a volatile or SECURITY DEFINER
-# user function, because its body is opaque to the gate. So the write never runs and bitacora stays
+# user function, because its body is opaque to the gate. So the write never runs and audit_log stays
 # empty -- and the README now says it is refused, not that it writes.
-before=$(bitacora)
-refused=$(agent -c "select agent_gate.propose(\$s\$update libro set texto = 'elevado' || elevar()::text where id = 2\$s\$, \$i\$call an elevated function from a write\$i\$)")
-if echo "$refused" | grep -q 'no_opaque_function' && [ "$(bitacora)" = "$before" ] \
+before=$(audit_rows)
+refused=$(agent -c "select agent_gate.propose(\$s\$update book set body = 'elevated' || elevate()::text where id = 2\$s\$, \$i\$call an elevated function from a write\$i\$)")
+if echo "$refused" | grep -q 'no_opaque_function' && [ "$(audit_rows)" = "$before" ] \
    && [ "$(grep -c -F 'SECURITY DEFINER' "$ROOT/README.md")" -ge 1 ]; then
     report indirect "a SECURITY DEFINER function inside a WRITE is refused at propose, writing nothing" yes ""
 else
     report indirect "a SECURITY DEFINER function inside a WRITE is refused at propose, writing nothing" no \
-        "bitacora: $(bitacora) (expected $before); refused by no_opaque_function: $(echo "$refused" | grep -c no_opaque_function); README mentions SECURITY DEFINER: $(grep -c -F 'SECURITY DEFINER' "$ROOT/README.md")"
+        "audit_log: $(audit_rows) (expected $before); refused by no_opaque_function: $(echo "$refused" | grep -c no_opaque_function); README mentions SECURITY DEFINER: $(grep -c -F 'SECURITY DEFINER' "$ROOT/README.md")"
 fi
 
 # A view without security_invoker is checked with the OWNER's privileges, so it
 # hands over a table the agent may not read. The gate verifies the proposal; it
 # does not re-decide what a view is allowed to show.
-through_view=$(propose_and_commit "select clave from ventana" "read a secret through a view")
+through_view=$(propose_and_commit "select passphrase from secret_view" "read a secret through a view")
 if [[ "$through_view" == *the-bank-key* ]] && [ "$(grep -c -F 'security_invoker' "$ROOT/README.md")" -ge 1 ]; then
     report indirect "a view reads what the agent cannot, and the README says so" yes ""
 else
@@ -297,34 +297,34 @@ propose_only() {
 }
 
 # The table is renamed underneath it.
-id=$(propose_only "update libro set texto = 'renombrada' where id = 1" "before the rename")
-su -c 'alter table libro rename to libro_movido' >/dev/null
+id=$(propose_only "update book set body = 'renamed' where id = 1" "before the rename")
+su -c 'alter table book rename to book_moved' >/dev/null
 expect race "a proposal whose table was renamed is refused" "no longer verifies" \
     "$(agent -c "select agent_gate.commit(${id:-0})")"
-su -c 'alter table libro_movido rename to libro' >/dev/null
-expect race "and the row it would have touched is untouched" "uno" \
-    "$(su -c 'select texto from libro where id = 1')"
+su -c 'alter table book_moved rename to book' >/dev/null
+expect race "and the row it would have touched is untouched" "one" \
+    "$(su -c 'select body from book where id = 1')"
 
 # A column it depends on disappears.
-su -c 'alter table libro add column extra text' >/dev/null
-id=$(propose_only "update libro set extra = 'x' where id = 1" "before the column is dropped")
-su -c 'alter table libro drop column extra' >/dev/null
+su -c 'alter table book add column extra text' >/dev/null
+id=$(propose_only "update book set extra = 'x' where id = 1" "before the column is dropped")
+su -c 'alter table book drop column extra' >/dev/null
 expect race "a proposal whose column was dropped is refused" "no longer verifies" \
     "$(agent -c "select agent_gate.commit(${id:-0})")"
 
 # The privilege is revoked after the proposal verified.
-id=$(propose_only "update libro set texto = 'sin permiso' where id = 1" "before the revoke")
-su -c "revoke update on libro from $AGENT" >/dev/null
+id=$(propose_only "update book set body = 'no permission' where id = 1" "before the revoke")
+su -c "revoke update on book from $AGENT" >/dev/null
 expect race "a proposal whose privilege was revoked is refused" "no longer verifies" \
     "$(agent -c "select agent_gate.commit(${id:-0})")"
-su -c "grant update on libro to $AGENT" >/dev/null
+su -c "grant update on book to $AGENT" >/dev/null
 
 # The row is gone. This one is NOT a refusal: the statement is still valid, it
 # simply touches nothing, and the record says so. Reporting zero rows honestly is
 # the right behaviour -- pretending it failed would be worse.
-su -c "insert into libro values (9, 'nueve')" >/dev/null
-id=$(propose_only "update libro set texto = 'tarde' where id = 9" "before the row is deleted")
-su -c 'delete from libro where id = 9' >/dev/null
+su -c "insert into book values (9, 'nine')" >/dev/null
+id=$(propose_only "update book set body = 'late' where id = 9" "before the row is deleted")
+su -c 'delete from book where id = 9' >/dev/null
 expect race "a proposal whose row vanished keeps nothing and says zero rows" '"rows_affected": 0' \
     "$(agent -c "select agent_gate.commit(${id:-0})")"
 
@@ -332,40 +332,40 @@ expect race "a proposal whose row vanished keeps nothing and says zero rows" '"r
 # commit. The agent's own write is innocent and still must not be kept: a
 # guarantee that stopped holding stops the change that would ride on it.
 su -c "create extension if not exists pg_living_assertions" >/dev/null
-su -c "select living_assertions.declare('ningun_texto_vacio', 'no book row is empty', \$a\$select not exists (select 1 from public.libro where texto = '') as holds\$a\$)" >/dev/null
-su -c "select agent_gate.bind_assertion('hostile', 'ningun_texto_vacio')" >/dev/null
-id=$(propose_only "update libro set texto = 'inocente' where id = 1" "innocent, while somebody else breaks the guarantee")
-su -c "insert into libro values (8, '')" >/dev/null
+su -c "select living_assertions.declare('no_empty_body', 'no book row is empty', \$a\$select not exists (select 1 from public.book where body = '') as holds\$a\$)" >/dev/null
+su -c "select agent_gate.bind_assertion('hostile', 'no_empty_body')" >/dev/null
+id=$(propose_only "update book set body = 'innocent' where id = 1" "innocent, while somebody else breaks the guarantee")
+su -c "insert into book values (8, '')" >/dev/null
 expect race "a write is aborted when a bound assertion broke meanwhile" "broken" \
     "$(agent -c "select agent_gate.commit(${id:-0})")"
-expect race "and that write was not kept" "uno" "$(su -c 'select texto from libro where id = 1')"
-su -c "delete from libro where id = 8" >/dev/null
-su -c "select agent_gate.unbind_assertion('hostile', 'ningun_texto_vacio')" >/dev/null
+expect race "and that write was not kept" "one" "$(su -c 'select body from book where id = 1')"
+su -c "delete from book where id = 8" >/dev/null
+su -c "select agent_gate.unbind_assertion('hostile', 'no_empty_body')" >/dev/null
 
 # Two sessions of the SAME agent at once. The counters that decide whether the
 # gate's own SQL may run are static PER PROCESS, so two backends must not be able
 # to step into each other's window.
-uno=$(propose_only "update libro set texto = 'a' where id = 1" "first of two at once")
-dos=$(propose_only "update libro set texto = 'b' where id = 2" "second of two at once")
-agent -c "select agent_gate.commit(${uno:-0})" >/dev/null &
-agent -c "select agent_gate.commit(${dos:-0})" >/dev/null &
+one=$(propose_only "update book set body = 'a' where id = 1" "first of two at once")
+two=$(propose_only "update book set body = 'b' where id = 2" "second of two at once")
+agent -c "select agent_gate.commit(${one:-0})" >/dev/null &
+agent -c "select agent_gate.commit(${two:-0})" >/dev/null &
 wait
 expect race "two sessions of the same agent commit their own proposals" "a|b" \
-    "$(su -c "select string_agg(texto, '|' order by id) from libro where id in (1, 2)")"
+    "$(su -c "select string_agg(body, '|' order by id) from book where id in (1, 2)")"
 
 # And the same proposal committed twice at the same time: it may be applied once
 # or refused twice, never applied twice.
-su -c "update libro set texto = 'x' where id = 1" >/dev/null
-id=$(propose_only "update libro set texto = texto || 'y' where id = 1" "the same proposal, twice at once")
+su -c "update book set body = 'x' where id = 1" >/dev/null
+id=$(propose_only "update book set body = body || 'y' where id = 1" "the same proposal, twice at once")
 agent -c "select agent_gate.commit(${id:-0})" >/dev/null &
 agent -c "select agent_gate.commit(${id:-0})" >/dev/null &
 wait
-ahora=$(su -c 'select texto from libro where id = 1')
-if [ "$ahora" = "xy" ] || [ "$ahora" = "x" ]; then
+current=$(su -c 'select body from book where id = 1')
+if [ "$current" = "xy" ] || [ "$current" = "x" ]; then
     report race "the same proposal committed twice at once is never applied twice" yes ""
 else
     report race "the same proposal committed twice at once is never applied twice" no \
-        "expected 'xy' or 'x', got: $ahora"
+        "expected 'xy' or 'x', got: $current"
 fi
 
 echo "robust: $robust, indirect: $indirect, race: $race, record: $record"
