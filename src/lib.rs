@@ -39,6 +39,12 @@ pub(crate) static MAX_RESULT_ROWS: GucSetting<i32> = GucSetting::<i32>::new(100)
 /// many seconds it is no longer allowed to stand in for a fresh one.
 pub(crate) static PROPOSAL_TTL_SECONDS: GucSetting<i32> = GucSetting::<i32>::new(900);
 
+/// The largest proposal, SQL plus parameters, in bytes (0.2.14). The record is append-only.
+pub(crate) static MAX_PROPOSAL_BYTES: GucSetting<i32> = GucSetting::<i32>::new(1_048_576);
+
+/// The largest intent, in bytes (0.2.14).
+pub(crate) static MAX_INTENT_BYTES: GucSetting<i32> = GucSetting::<i32>::new(65_536);
+
 /// How durable the record of an ATTEMPT is -- a proposal, a dry run, a read, a
 /// refusal: anything that changed no data. A change the gate keeps is always
 /// committed with the server's configured durability, and its flush carries the
@@ -239,6 +245,26 @@ pub extern "C-unwind" fn _PG_init() {
         &MAX_RESULT_ROWS,
         0,
         100_000,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
+        c"agent_gate.max_proposal_bytes",
+        c"The largest proposal an agent may make, SQL plus parameters, in bytes.",
+        c"The record is append-only: every proposal is kept, so what goes into it is bounded.",
+        &MAX_PROPOSAL_BYTES,
+        1024,
+        i32::MAX,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
+        c"agent_gate.max_intent_bytes",
+        c"The largest intent an agent may give, in bytes.",
+        c"The intent is kept in the append-only record with the proposal.",
+        &MAX_INTENT_BYTES,
+        16,
+        i32::MAX,
         GucContext::Suset,
         GucFlags::default(),
     );

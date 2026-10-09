@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.2.14 -- 2026-10-09
+
+The rest of the third external audit (of 0.2.8), measured on 0.2.13 before it was changed:
+every tooth in `tests/audit4.sh` (in `make verify`) red there with its control green.
+
+* **GATE-09: what dry_run showed is what commit keeps.** The session settings that decide how
+  a statement reads its literals and writes its values are recorded with the proposal, and
+  `dry_run` and `commit` refuse, naming them, if any changed since. Measured: `dry_run` showed
+  2026-03-04, the session set `DateStyle = 'ISO, DMY'`, `commit` kept 2026-04-03.
+* **GATE-11: a read changes nothing.** A `read` calling a built-in that changes state outside
+  its rows (`nextval`, `setval`, advisory locks, large objects, `pg_notify`, `setseed`, WAL and
+  statistics functions) fails the new check `read_changes_nothing`. Measured: a read advanced a
+  sequence by 1,000 and the record said `read`. Allowed in a write.
+* **GATE-13: a reused agent name starts clean.** A proposal made under an earlier registration
+  of the name answers "this agent has no proposal with that id", and `acts()` shows only the
+  current registration's. Measured: the new owner of a name committed the old owner's proposal.
+* **GATE-15: bounded input.** `agent_gate.max_proposal_bytes` (1 MB) and
+  `agent_gate.max_intent_bytes` (64 kB), superuser-only. Measured: 2 MB of SQL and 100 kB of
+  intent went into the append-only record.
+* **GATE-16:** the README now says that the server log can hold an agent's literal SQL.
+* `make verify`: 310 checks on PostgreSQL 18.6 and 19beta2.
+
 ## 0.2.13 -- 2026-10-08
 
 * **Metadata only.** The PGXN description is two sentences now; the longer

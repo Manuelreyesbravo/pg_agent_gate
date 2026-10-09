@@ -348,6 +348,40 @@ pub(crate) fn verify(
                  neither volatile nor SECURITY DEFINER",
             ),
         }
+        // A READ CHANGES NOTHING (0.2.14, external audit GATE-11). Built-ins are vetted above
+        // because they do what their documentation says -- and some say they change state: a read
+        // that called nextval() advanced a sequence 100,000 times and the record said outcome=read,
+        // nothing changed. Those are refused in a read; in a write they are the write's business
+        // (an INSERT's default calls nextval).
+        if kind == Kind::Read {
+            match stateful_builtin(&tree.funcs) {
+                Err(why) => {
+                    v.kind = Some(kind);
+                    v.check(
+                        "read_changes_nothing",
+                        false,
+                        format!("the catalog lookup for the statement's functions failed: {why}"),
+                    );
+                    return v;
+                }
+                Ok(Some(f)) => {
+                    v.kind = Some(kind);
+                    v.check(
+                        "read_changes_nothing",
+                        false,
+                        format!("a read calls {f}, which changes state outside the rows it returns, \
+                                 and the record would say nothing changed"),
+                    );
+                    return v;
+                }
+                Ok(None) => v.check(
+                    "read_changes_nothing",
+                    true,
+                    "no built-in that changes state (sequences, advisory locks, large objects, \
+                     notifications, the WAL) is called",
+                ),
+            }
+        }
         tree_relations = tree.relations;
     }
 
@@ -500,6 +534,37 @@ fn risky_function(funcs: &[pg_sys::Oid]) -> Result<Option<String>, String> {
              where p.oid = any($1::int8[]::oid[])
                and n.nspname not in ('pg_catalog', 'information_schema', 'pg_toast')
                and (p.prosecdef or p.provolatile = 'v')
+             limit 1
+         )",
+        &[PgOid::BuiltIn(PgBuiltInOids::INT8ARRAYOID)],
+        &[ids.into()],
+    )
+}
+
+/// A built-in the statement calls that changes state outside the rows a read returns: sequences,
+/// session advisory locks, large objects, notifications, the random seed, the WAL and statistics.
+/// Ok(None) = none, Ok(Some(name)) = refuse naming it, Err = lookup failed (refuse, fail closed).
+fn stateful_builtin(funcs: &[pg_sys::Oid]) -> Result<Option<String>, String> {
+    if funcs.is_empty() {
+        return Ok(None);
+    }
+    let ids: Vec<i64> = funcs.iter().map(|o| o.to_u32() as i64).collect();
+    crate::exec::get_one_prepared::<String>(
+        "select (
+           select p.proname||'()'
+             from pg_catalog.pg_proc p
+             where p.oid = any($1::int8[]::oid[])
+               and p.pronamespace = 'pg_catalog'::regnamespace
+               and (p.proname in ('nextval', 'setval', 'setseed', 'pg_notify',
+                                  'pg_logical_emit_message', 'pg_switch_wal',
+                                  'pg_create_restore_point', 'pg_create_physical_replication_slot',
+                                  'pg_create_logical_replication_slot', 'pg_drop_replication_slot',
+                                  'pg_replication_origin_create', 'pg_replication_origin_drop')
+                    or p.proname like 'pg\\_advisory\\_%'
+                    or p.proname like 'pg\\_try\\_advisory\\_%'
+                    or p.proname like 'pg\\_stat\\_reset%'
+                    or p.proname like 'lo\\_%'
+                    or p.proname in ('loread', 'lowrite'))
              limit 1
          )",
         &[PgOid::BuiltIn(PgBuiltInOids::INT8ARRAYOID)],

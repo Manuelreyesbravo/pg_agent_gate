@@ -122,16 +122,17 @@ make clean-machine                           # the same, in a fresh container th
 | `pg_temp.sh` | a temporary catalog of the agent hiding what a write sets off | 17 |
 | `rollback.sh` | what a rollback takes from the record | 12 |
 | `audit3.sh` | the third audit: fast-path, the gate's path, foreign proposals, DDL, roles, 2PC, dump | 18 |
+| `audit4.sh` | the rest of it: settings between dry_run and commit, side effects of a read, a reused name, record size | 18 |
 | `isolation.sh` | one proposal committed twice under REPEATABLE READ / SERIALIZABLE | 5 |
 | `session_preload.sh` | a client parameter taking a per-session load out from behind the gate | 4 |
 | pgrx unit tests | the verbs, from inside the server | 13 |
 
-On PostgreSQL 18.6 and 19beta2: **`verified: 292 checks passed, 0 failed`** on
+On PostgreSQL 18.6 and 19beta2: **`verified: 310 checks passed, 0 failed`** on
 both (0.2.12). The fresh Debian container receiving only what git has committed
 runs the same suites, with 18 and 19beta4 from PGDG. CI runs the same
 container for 18 and 19 on every push. `VERIFY_DRIVERS=1` adds real pgjdbc and node-pg sessions.
 
-Those 292 are the hand-written suites above. The amplification class that `0.2.2` and `0.2.3`
+Those 310 are the hand-written suites above. The amplification class that `0.2.2` and `0.2.3`
 closed -- a writing CTE, a cascading foreign key, a trigger, a rule, an opaque (volatile or
 `SECURITY DEFINER`) function, and the commit-time row-count backstop and per-agent allow-list
 that back them -- is guarded by **`make fuzz`**, not by `make verify`. Its teeth build each of
@@ -753,6 +754,25 @@ Said here so nobody learns it the hard way:
   0.2.12 an agent session answers it only for the verbs: any other function
   reached that way -- large objects, `pg_read_file` -- is refused by the
   object-access hook before it runs.
+* **What dry_run showed is what commit keeps (0.2.14).** The session settings that
+  decide how a statement reads its literals and writes its values -- `DateStyle`,
+  `IntervalStyle`, `TimeZone`, `standard_conforming_strings`, `extra_float_digits`,
+  `bytea_output` -- are recorded at `propose`, and `dry_run` and `commit` refuse if
+  any changed since. Measured on 0.2.13: `dry_run` showed March 4, the session set
+  `DateStyle = 'ISO, DMY'`, and `commit` kept April 3.
+* **A read changes nothing (0.2.14).** A `read` that calls a built-in which changes
+  state outside the rows it returns -- `nextval`, `setval`, the `pg_advisory_*` locks,
+  large objects, `pg_notify`, `setseed`, WAL and statistics functions -- is refused;
+  until 0.2.13 one advanced a sequence 100,000 times and the record said `read`. In a
+  write they are allowed (an INSERT's default calls `nextval`). A user function that
+  is STABLE but calls one of them is not seen: its body is not in the statement.
+* **A reused agent name starts clean (0.2.14).** A proposal made under an earlier
+  registration of the same name answers like another agent's, and `acts()` shows only
+  the current registration's.
+* **The record takes bounded input (0.2.14):** `agent_gate.max_proposal_bytes` (1 MB,
+  SQL plus parameters) and `agent_gate.max_intent_bytes` (64 kB), superuser-only. The
+  record stays append-only with no retention helper: reclaiming space still means
+  disabling its triggers by hand.
 * **The verbs run only under READ COMMITTED (0.2.12).** At a stricter level the
   gate would read the proposal and the record from an old snapshot; measured on
   0.2.11, four REPEATABLE READ sessions each kept the same proposal. A verb
@@ -840,7 +860,12 @@ Said here so nobody learns it the hard way:
   that is cancelled, or that fails outside the gate's own subtransaction, where
   `propose` + `commit` would have kept the proposal. Every verdict is also written
   to the server log, which does not roll back -- the verdict (agent, proposal id,
-  kind, outcome), not the statement: with parameters, the log shows `$1`.
+  kind, outcome) -- and since 0.2.10 so is every row a rollback takes, statement
+  and intent included. **The server log can hold what an agent wrote:** the gate's
+  rollback lines, and PostgreSQL's own `log_statement` or
+  `log_min_duration_statement` if configured, which log the `agent_gate.propose(...)`
+  call verbatim. A value passed as a parameter shows as `$1` in the statement; a
+  literal in the SQL shows as written.
 * **Parameters travel as text.** Cast them in the SQL (`$1::int`).
 * **User-defined casts** around a verb's arguments are allowed, like any cast.
   Creating a cast already needs ownership of the types.

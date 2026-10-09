@@ -48,7 +48,11 @@ CREATE TABLE agent_gate_internal.proposals (
     ok             boolean NOT NULL,
     checks         jsonb NOT NULL,
     estimated_rows double precision,
-    proposed_at    timestamptz NOT NULL DEFAULT clock_timestamp()
+    proposed_at    timestamptz NOT NULL DEFAULT clock_timestamp(),
+    -- The session settings that change how the statement reads its literals and writes its values,
+    -- as they were when it was verified (0.2.14). dry_run and commit refuse if they changed since:
+    -- what dry_run showed must be what commit keeps.
+    settings       jsonb
 );
 CREATE INDEX ON agent_gate_internal.proposals (agent, id DESC);
 
@@ -144,6 +148,20 @@ BEGIN
     END IF;
 END $$;
 
+-- The session settings that decide how a statement reads its literals (dates, intervals, time
+-- zones, backslashes) and how values become text (floats, bytea). Recorded with a proposal and
+-- compared at dry_run and commit (0.2.14).
+CREATE FUNCTION agent_gate_internal._session_settings() RETURNS jsonb
+LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $$
+    SELECT jsonb_build_object(
+               'DateStyle', current_setting('DateStyle'),
+               'IntervalStyle', current_setting('IntervalStyle'),
+               'TimeZone', current_setting('TimeZone'),
+               'standard_conforming_strings', current_setting('standard_conforming_strings'),
+               'extra_float_digits', current_setting('extra_float_digits'),
+               'bytea_output', current_setting('bytea_output'))
+$$;
+
 CREATE FUNCTION agent_gate_internal._record_proposal(
     p_agent text, p_role text, p_intent text, p_sql text, p_params text[],
     p_kind text, p_ok boolean, p_checks jsonb, p_estimated double precision)
@@ -153,9 +171,12 @@ DECLARE
     new_id bigint;
 BEGIN
     PERFORM agent_gate_internal._only_the_gate();
+    -- The settings are read here, in the agent's own session: this function is SECURITY DEFINER,
+    -- which changes the role and not the session's settings.
     INSERT INTO agent_gate_internal.proposals
-        (agent, role, backend_pid, intent, sql, params, kind, ok, checks, estimated_rows)
-    VALUES (p_agent, p_role, pg_backend_pid(), p_intent, p_sql, p_params, p_kind, p_ok, p_checks, p_estimated)
+        (agent, role, backend_pid, intent, sql, params, kind, ok, checks, estimated_rows, settings)
+    VALUES (p_agent, p_role, pg_backend_pid(), p_intent, p_sql, p_params, p_kind, p_ok, p_checks, p_estimated,
+            agent_gate_internal._session_settings())
     RETURNING id INTO new_id;
     RETURN new_id;
 END $$;
@@ -203,7 +224,15 @@ BEGIN
                    'age_seconds', extract(epoch FROM clock_timestamp() - p.proposed_at),
                    'committed', EXISTS (SELECT 1 FROM agent_gate_internal.executions e
                                         WHERE e.proposal = p.id AND e.mode = 'commit'
-                                          AND e.outcome = 'kept'))
+                                          AND e.outcome = 'kept'),
+                   -- Made under an earlier registration of the same name (0.2.14): a name that
+                   -- was unregistered and given to another role is not the same principal.
+                   'predates_agent', p.proposed_at < (SELECT a.registered_at FROM agent_gate_internal.agents a
+                                                       WHERE a.name = p.agent),
+                   -- The settings that changed since it was verified, by name (0.2.14).
+                   'settings_changed', (SELECT string_agg(format('%s (%s then, %s now)', k, p.settings ->> k, n.v), ', ' ORDER BY k)
+                                          FROM jsonb_each_text(agent_gate_internal._session_settings()) AS n(k, v)
+                                         WHERE p.settings IS NOT NULL AND p.settings ->> k IS DISTINCT FROM n.v))
           FROM agent_gate_internal.proposals p
          WHERE p.id = p_id);
 END $$;
@@ -276,6 +305,9 @@ BEGIN
                               WHERE e.proposal = p.id), '[]')) AS a
                   FROM agent_gate_internal.proposals p
                  WHERE p.agent = p_agent
+                   -- Only this registration's acts (0.2.14): a reused name does not inherit them.
+                   AND p.proposed_at >= (SELECT a.registered_at FROM agent_gate_internal.agents a
+                                          WHERE a.name = p_agent)
                  ORDER BY p.id DESC
                  LIMIT greatest(least(p_limit, 500), 1)) recent), '[]');
 END $$;

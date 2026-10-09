@@ -51,7 +51,7 @@ cargo pgrx --version 2>/dev/null | grep -q "$PGRX_VERSION" \
     git clone https://github.com/Manuelreyesbravo/pg_living_assertions
     make -C pg_living_assertions install PG_CONFIG=$PG_CONFIG"
 
-SUITES=(adversarial hostile privileges rls_isolation dump_restore upgrade flushes plan_time pg_temp rollback audit3 isolation session_preload)
+SUITES=(adversarial hostile privileges rls_isolation dump_restore upgrade flushes plan_time pg_temp rollback audit3 audit4 isolation session_preload)
 if [ "${VERIFY_DRIVERS:-0}" = 1 ]; then
     SUITES+=(drivers)
 fi

@@ -2,7 +2,7 @@
    "name": "pg_agent_gate",
    "abstract": "Agents propose, PostgreSQL decides: a native gate between LLM agents and the database",
    "description": "With pg_agent_gate an LLM agent proposes one SQL statement instead of running it; PostgreSQL checks it against its own parser, catalog and privileges, shows the exact before/after of every affected row, runs it under the agent's own rights, and records every proposal and refusal append-only. Session-level hooks make the gate the only way in.",
-   "version": "0.2.13",
+   "version": "0.2.14",
    "maintainer": [
       "Manuel Reyes <manuelreyesbravo@gmail.com>"
    ],
@@ -12,7 +12,7 @@
          "abstract": "Agents propose, PostgreSQL verifies, runs and records -- and an agent session cannot do anything else",
          "file": "src/lib.rs",
          "docfile": "README.md",
-         "version": "0.2.13"
+         "version": "0.2.14"
       }
    },
    "prereqs": {

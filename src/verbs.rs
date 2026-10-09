@@ -275,6 +275,23 @@ fn propose_one(sql: &str, intent: &str, params: Option<Vec<Option<String>>>) -> 
     if intent.trim().chars().count() < 3 {
         error!("pg_agent_gate: say what the proposal is for (intent); it stays in the record");
     }
+    // The record is append-only, so what goes into it is bounded (0.2.14, external audit GATE-15):
+    // 30 MB of SQL and 5 MB of intent were accepted and kept.
+    let max_sql = crate::MAX_PROPOSAL_BYTES.get().max(0) as usize;
+    let max_intent = crate::MAX_INTENT_BYTES.get().max(0) as usize;
+    let params_len: usize = params.as_ref().map_or(0, |p| p.iter().map(|x| x.as_ref().map_or(0, String::len)).sum());
+    if sql.len() + params_len > max_sql {
+        error!(
+            "pg_agent_gate: the proposal is {} bytes with its parameters, over agent_gate.max_proposal_bytes ({max_sql}); the record keeps every proposal",
+            sql.len() + params_len
+        );
+    }
+    if intent.len() > max_intent {
+        error!(
+            "pg_agent_gate: the intent is {} bytes, over agent_gate.max_intent_bytes ({max_intent}); say what it is for, briefly",
+            intent.len()
+        );
+    }
     let who = identity();
     let cfg = config(&who);
     let verdict = verify::verify(sql, &params, cfg.allow_ddl, &cfg.allowed, true);
@@ -496,12 +513,21 @@ fn execute(proposal: i64, mode: Mode) -> Value {
     let peek: Option<JsonB> =
         read_internal::<JsonB>("select agent_gate_internal._load_proposal($1)", &[proposal.into()]).filter(|j| !j.0.is_null());
     let owner = peek.as_ref().and_then(|j| j.0["agent"].as_str().map(str::to_string));
-    if owner.as_deref() != Some(who.agent.as_str()) {
+    // A proposal made under an earlier registration of this name belongs to that registration, not
+    // to this one (0.2.14, external audit GATE-13): the same answer as another agent's.
+    let earlier = peek.as_ref().and_then(|j| j.0["predates_agent"].as_bool()) == Some(true);
+    if owner.as_deref() != Some(who.agent.as_str()) || earlier {
         log!(
             "pg_agent_gate: agent={} asked for proposal {} which {}",
             who.agent,
             proposal,
-            if owner.is_some() { "belongs to another agent" } else { "does not exist" }
+            if earlier {
+                "was made under an earlier registration of this name"
+            } else if owner.is_some() {
+                "belongs to another agent"
+            } else {
+                "does not exist"
+            }
         );
         return json!({ "proposal": proposal, "mode": mode.as_str(), "outcome": "refused", "reason": "this agent has no proposal with that id" });
     }
@@ -535,6 +561,19 @@ fn execute(proposal: i64, mode: Mode) -> Value {
     }
     if mode == Mode::Commit && p["committed"].as_bool() == Some(true) {
         return refuse_execution(&who, proposal, mode, started, "it was already committed once".into(), json!(null));
+    }
+    // What dry_run showed must be what commit keeps (0.2.14, external audit GATE-09): DateStyle,
+    // standard_conforming_strings and the rest decide how the statement reads its literals and
+    // writes its values, and the session may change them between the two calls.
+    if let Some(changed) = p["settings_changed"].as_str() {
+        return refuse_execution(
+            &who,
+            proposal,
+            mode,
+            started,
+            format!("session settings changed since it was verified: {changed}; set them back, or propose again"),
+            json!(null),
+        );
     }
 
     let sql = p["sql"].as_str().unwrap_or_default().to_string();
