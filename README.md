@@ -867,11 +867,22 @@ Said here so nobody learns it the hard way:
   call verbatim. A value passed as a parameter shows as `$1` in the statement; a
   literal in the SQL shows as written.
 * **Parameters travel as text.** Cast them in the SQL (`$1::int`).
-* **User-defined casts** around a verb's arguments are allowed, like any cast.
-  Creating a cast already needs ownership of the types.
+* **A cast that runs a function around a verb's argument is refused (0.2.15).**
+  Only the implicit cast the parser inserts to coerce a constant to the verb's own
+  parameter type, through a built-in function, passes. An explicit cast, an I/O
+  conversion cast, or a cast through a user function would run that function while
+  the executor evaluates the argument -- before verification raises the proposal
+  flag, so the definer guard would not see it -- and is refused at parse time. Pass
+  such values as parameters, or cast them inside the proposed SQL (`$1::int`), where
+  verification covers them.
+* **`allow_ddl` is schema power, not a bigger `max_rows`.** An agent allowed DDL runs
+  any `CREATE`, `ALTER` or `DROP` its grants permit; the change is verified by running
+  it in a rolled-back subtransaction and kept only if that succeeds, but `max_rows`
+  does not bound it -- DDL changes the schema, not a counted set of rows, so a granted
+  `DROP TABLE` is kept. Grant DDL narrowly, and leave `allow_ddl => false` unless a
+  specific agent needs it.
 
 ## License
-
 Apache License 2.0 -- see [LICENSE](LICENSE). Copyright 2026 Manuel Reyes Bravo.
 
 The name is not licensed with the code: see [TRADEMARK.md](TRADEMARK.md).

@@ -1,6 +1,31 @@
 # Changelog
 
+## 0.2.15 -- 2026-10-26
+
+A security review of the library before wider use. No SQL object changes -- the fixes are in
+the loaded library, so the version bumps to match (`sql/pg_agent_gate--0.2.14--0.2.15.sql`
+changes nothing in the catalog). Each case below is red on 0.2.14 and green here
+(`tests/hostile.sh`).
+
+* **A cast that runs a function in a verb's own argument is refused.** Before, `simple_argument`
+  accepted an I/O conversion cast (`CoerceViaIO`) and an explicit cast (`FuncExpr`) around a verb's
+  argument. Either runs a function of the agent's choosing while the executor evaluates the
+  argument -- before `verify()` raises the proposal flag, so the SECURITY DEFINER guard (0.2.7) did
+  not see it, and the gate's promise that nothing the session types executes except the verbs was
+  false. Now only the implicit cast the parser inserts to coerce a constant to the verb's parameter
+  type, through a built-in function (one in `pg_catalog`), passes; every other cast around a verb's
+  argument is refused at parse time. Measured: an owner's cast calling a SECURITY DEFINER writer ran
+  and wrote to a table the agent cannot touch; now it never runs.
+* **A lone `;` no longer crashes the backend.** `propose(';')` parses to one statement whose node
+  is null; reading its type dereferenced a null pointer, and in preloaded code that takes the whole
+  cluster down. It is now reported as zero statements and refused.
+* **`analyze_tree` fails closed** if the verified statement does not re-parse to one non-empty
+  statement, instead of indexing an empty list.
+* The threat model now says that a cast around a verb's argument is refused (it had said such casts
+  were allowed), and that `allow_ddl` is schema power that `max_rows` does not bound.
+
 ## 0.2.14 -- 2026-10-09
+
 
 The rest of the third external audit (of 0.2.8), measured on 0.2.13 before it was changed:
 every tooth in `tests/audit4.sh` (in `make verify`) red there with its control green.

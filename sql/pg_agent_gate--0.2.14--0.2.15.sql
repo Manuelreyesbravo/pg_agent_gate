@@ -1,0 +1,18 @@
+-- 0.2.14 -> 0.2.15
+--
+-- Library only; no object of the extension changes. The behaviour the catalog
+-- version must track lives in the loaded library (hooks.rs, verify.rs), and this
+-- script exists so that the version the catalog reports is the version installed.
+-- What changed (see CHANGELOG.md):
+--
+--   * A cast that runs a function around a verb's own ARGUMENT is refused at parse
+--     time. Such a cast was evaluated before verification began -- before the
+--     SECURITY DEFINER guard (0.2.7) was in place -- so a function the agent chose,
+--     a SECURITY DEFINER one among them, could run outside the gate. Only the
+--     implicit cast the parser inserts to coerce a constant to a verb's parameter
+--     type, through a built-in function, still passes (tests/hostile.sh).
+--   * A proposal of one empty statement (a lone ";") no longer dereferences a null
+--     node. In preloaded code that crash took the whole cluster down; it is now
+--     reported as zero statements and refused (tests/hostile.sh).
+--   * analyze_tree fails closed if the verified statement does not re-parse to one
+--     non-empty statement, instead of indexing an empty list.

@@ -639,7 +639,12 @@ fn keep_out_of_workers() {
 unsafe fn analyze_tree(statement: &str, n_params: usize) -> Tree {
     let text = CString::new(statement).expect("the statement was parsed from a NUL-free text");
     let raws = pg_sys::raw_parser(text.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT);
+    // The statement was already verified as one non-empty statement; re-parsing must
+    // yield exactly that. Fail closed (the subtransaction catches a panic and verify
+    // refuses) rather than indexing an empty list or dereferencing a null node.
+    assert_eq!(list_len(raws), 1, "the verified statement re-parses to one statement");
     let raw = pg_sys::list_nth(raws, 0) as *mut pg_sys::RawStmt;
+    assert!(!(*raw).stmt.is_null(), "the verified statement re-parses to a non-empty node");
     let types = vec![pg_sys::TEXTOID; n_params];
     let queries = pg_sys::pg_analyze_and_rewrite_fixedparams(
         raw,
@@ -723,6 +728,13 @@ unsafe fn parse(sql: &str, text: &CString) -> Parsed {
     }
     let raw = &*(pg_sys::list_nth(list, 0) as *mut pg_sys::RawStmt);
     let node = raw.stmt;
+    if node.is_null() {
+        // An empty statement (e.g. ";") parses to a single RawStmt whose node is
+        // null. It runs nothing; report zero statements so verify refuses it as
+        // "not exactly one statement" instead of dereferencing the null (crash).
+        parsed.count = 0;
+        return parsed;
+    }
     let tag = (*node).type_;
 
     let start = raw.stmt_location.max(0) as usize;

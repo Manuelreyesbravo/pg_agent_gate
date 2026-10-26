@@ -188,6 +188,13 @@ hostile "a 10 KB identifier" \
 hostile "an empty proposal" agent -c "select agent_gate.propose(\$s\$\$s\$, \$i\$empty\$i\$)"
 hostile "committing a proposal id that does not exist" agent -c "select agent_gate.commit(999999)"
 hostile "committing a negative id" agent -c "select agent_gate.commit(-1)"
+# F1 (0.2.15): a lone ";" parses to ONE statement whose node is null. Reading its
+# type dereferenced a null pointer and crashed the backend -- in preloaded code,
+# the whole cluster. It is now reported as zero statements and refused. The verdict
+# here is the one [robust] cares about: the server is still the same server.
+hostile "a lone semicolon (one empty statement, not zero)" agent -c "select agent_gate.propose(\$s\$;\$s\$, \$i\$semicolon\$i\$)"
+hostile "whitespace and a comment, then a semicolon" agent -c "select agent_gate.propose(\$s\$  /* x */ ;\$s\$, \$i\$comment then semicolon\$i\$)"
+
 
 # A query that never ends is not a crash, but it holds a backend. What stops it
 # is a statement_timeout, which the OWNER sets on the role -- the gate does not
@@ -276,9 +283,29 @@ else
         "audit_log: $(audit_rows) (expected $before); refused by no_opaque_function: $(echo "$refused" | grep -c no_opaque_function); README mentions SECURITY DEFINER: $(grep -c -F 'SECURITY DEFINER' "$ROOT/README.md")"
 fi
 
+# H1 (0.2.15): a cast around a verb's OWN argument runs its function while the
+# executor evaluates the argument -- before verify() raises the proposal flag, so
+# the SECURITY DEFINER guard (0.2.7) did not cover it. The owner leaves a cast that
+# calls a SECURITY DEFINER writer; the agent puts it on a verb argument. Before, the
+# function ran (a row in audit_log the agent cannot write); now the cast is refused
+# at parse time and nothing runs. Dropped afterwards so later cases measure their own thing.
+su -c "create function cast_leak(int) returns text language sql security definer as \$fn\$ insert into audit_log values('cast_leak', 'ran via a cast in a verb argument'); select 'x' \$fn\$" >/dev/null
+su -c "create cast (int as text) with function cast_leak(int) as explicit" >/dev/null
+cast_before=$(audit_rows)
+cast_leak_out=$(agent -c "select agent_gate.propose(5::text, \$i\$a cast that runs a function\$i\$)")
+if echo "$cast_leak_out" | grep -q 'run code' && [ "$(audit_rows)" = "$cast_before" ]; then
+    report indirect "a cast that runs a function in a verb argument is refused, and the function never runs" yes ""
+else
+    report indirect "a cast that runs a function in a verb argument is refused, and the function never runs" no \
+        "audit_log: $(audit_rows) (expected $cast_before); refused by 'run code': $(echo "$cast_leak_out" | grep -c 'run code'); said: $cast_leak_out"
+fi
+su -c "drop cast (int as text)" >/dev/null
+su -c "drop function cast_leak(int)" >/dev/null
+
 # A view without security_invoker is checked with the OWNER's privileges, so it
 # hands over a table the agent may not read. The gate verifies the proposal; it
 # does not re-decide what a view is allowed to show.
+
 through_view=$(propose_and_commit "select passphrase from secret_view" "read a secret through a view")
 if [[ "$through_view" == *the-bank-key* ]] && [ "$(grep -c -F 'security_invoker' "$ROOT/README.md")" -ge 1 ]; then
     report indirect "a view reads what the agent cannot, and the README says so" yes ""

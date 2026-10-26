@@ -10,8 +10,11 @@
 # 0.2.1 changes no SQL and still bumps: verify.rs now refuses a CTE that writes (max_rows
 # did not see its rows) and set_config() inside a proposal (it moved the context a
 # row-level policy reads). Same version, different behaviour, is the same lie.
+# 0.2.15 changes no SQL and still bumps: hooks.rs refuses a cast that runs a function in
+# a verb argument (it ran before verification, outside the gate), and verify.rs no longer
+# crashes the backend on a lone ";". Same version, different behaviour, is the same lie.
 name = "pg_agent_gate"
-version = "0.2.14"
+version = "0.2.15"
 
 edition = "2021"
 description = "Agents propose, PostgreSQL decides: a native gate between LLM agents and the database"

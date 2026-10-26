@@ -439,8 +439,13 @@ unsafe fn verb_call(node: *mut pg_sys::Node) -> Result<(), String> {
     Ok(())
 }
 
-/// Literals and parameters, and the casts the parser wraps them in. Anything
-/// that could call a function of the agent's choosing is refused here.
+/// Literals and parameters, the relabels and array constructors the parser wraps
+/// them in, and -- only -- the implicit cast the parser inserts to coerce a
+/// constant to the verb's own parameter type through a built-in function. An
+/// explicit cast, an I/O conversion cast, or any cast through a non-built-in
+/// function is code of the agent's own choosing: it runs while this argument is
+/// evaluated, before verify() raises the proposal flag, so the definer guard
+/// would not see it. All of those are refused here.
 unsafe fn simple_argument(node: *mut pg_sys::Node) -> Result<(), String> {
     const ARGS: &str = "arguments of a verb must be literals or parameters, not expressions that run code";
     if node.is_null() {
@@ -451,9 +456,6 @@ unsafe fn simple_argument(node: *mut pg_sys::Node) -> Result<(), String> {
         pg_sys::NodeTag::T_RelabelType => {
             simple_argument((*(node as *mut pg_sys::RelabelType)).arg as *mut pg_sys::Node)
         }
-        pg_sys::NodeTag::T_CoerceViaIO => {
-            simple_argument((*(node as *mut pg_sys::CoerceViaIO)).arg as *mut pg_sys::Node)
-        }
         pg_sys::NodeTag::T_ArrayExpr => {
             let a = &*(node as *mut pg_sys::ArrayExpr);
             for i in 0..list_len(a.elements) {
@@ -463,9 +465,10 @@ unsafe fn simple_argument(node: *mut pg_sys::Node) -> Result<(), String> {
         }
         pg_sys::NodeTag::T_FuncExpr => {
             let f = &*(node as *mut pg_sys::FuncExpr);
-            let cast = f.funcformat == pg_sys::CoercionForm::COERCE_EXPLICIT_CAST
-                || f.funcformat == pg_sys::CoercionForm::COERCE_IMPLICIT_CAST;
-            if !cast {
+            let catalog = pg_sys::get_namespace_oid(c"pg_catalog".as_ptr(), false);
+            if f.funcformat != pg_sys::CoercionForm::COERCE_IMPLICIT_CAST
+                || pg_sys::get_func_namespace(f.funcid) != catalog
+            {
                 return Err(ARGS.into());
             }
             for i in 0..list_len(f.args) {
