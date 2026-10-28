@@ -562,6 +562,24 @@ fn execute(proposal: i64, mode: Mode) -> Value {
     if mode == Mode::Commit && p["committed"].as_bool() == Some(true) {
         return refuse_execution(&who, proposal, mode, started, "it was already committed once".into(), json!(null));
     }
+    // A requires_approval agent commits only what an approver has approved. The
+    // approval only lifts this block: the guards below still run. _load_proposal
+    // reports the agent's flag and whether an approval exists.
+    if mode == Mode::Commit
+        && p["requires_approval"].as_bool() == Some(true)
+        && p["approved"].as_bool() != Some(true)
+    {
+        return refuse_execution(
+            &who,
+            proposal,
+            mode,
+            started,
+            "this agent requires approval: an approver must call agent_gate.approve(proposal) \
+             before this can be committed"
+                .into(),
+            json!(null),
+        );
+    }
     // What dry_run showed must be what commit keeps (0.2.14, external audit GATE-09): DateStyle,
     // standard_conforming_strings and the rest decide how the statement reads its literals and
     // writes its values, and the session may change them between the two calls.

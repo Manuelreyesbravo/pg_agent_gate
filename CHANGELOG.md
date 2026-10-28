@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.3.0 -- 2026-10-27
+
+Human-in-the-middle approvals. An agent registered with `requires_approval` may propose and
+dry-run but cannot commit its own proposal until an approver records consent; the approval only
+lifts that block, and every guard still runs at commit. The ownership rule does not change -- the
+agent still commits its own proposal -- so `execute()` is untouched (`tests/approvals.sh`).
+
+* **`register_agent(..., p_requires_approval boolean DEFAULT false)`.** A sixth, defaulted
+  parameter. When true, the agent's `commit` and `propose_and_commit` are refused with "this agent
+  requires approval" until an approval exists for that proposal; `max_rows`, the bound assertions and
+  the commit-time backstop are then checked exactly as before once it may proceed -- an approval is
+  consent to commit, not a bypass of the guards.
+* **`agent_gate.approve(proposal)` and the `agent_gate_approver` group.** A call for an approver --
+  a member of the predefined `agent_gate_approver` role, never the proposal's own agent -- that
+  records consent for one proposal in `agent_gate_internal.approvals` (one row per proposal). It runs
+  nothing. `approve` is revoked from `PUBLIC` and granted only to the group; an agent is behind the
+  gate and cannot call it, so no self-approval is possible.
+* **The record names who approved.** `agent_gate_internal.executions.approved_by` carries the
+  approver on a kept commit that needed approval, and the `approvals` table survives `pg_dump` like
+  the rest of the record.
+
 ## 0.2.15 -- 2026-10-26
 
 A security review of the library before wider use. No SQL object changes -- the fixes are in
