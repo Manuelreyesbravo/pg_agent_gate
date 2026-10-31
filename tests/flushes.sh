@@ -30,7 +30,10 @@ CREATE TABLE flow (id int PRIMARY KEY, n int NOT NULL);
 INSERT INTO flow SELECT g, 0 FROM generate_series(1, 10) g;
 GRANT USAGE ON SCHEMA public TO :"agent";
 GRANT SELECT, UPDATE ON flow TO :"agent";
-SELECT agent_gate.register_agent('flushes', :'agent', 'counts the WAL flushes an act pays', p_max_rows => 5);
+-- It writes over and over to count what each act pays: a budget far past what it writes, so
+-- the write budget (0.4.0) is not what it measures.
+SELECT agent_gate.register_agent('flushes', :'agent', 'counts the WAL flushes an act pays', p_max_rows => 5,
+                                 p_max_rows_per_window => 1000000);
 SQL
 
 cd "$ROOT"

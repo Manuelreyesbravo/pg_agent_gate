@@ -398,6 +398,9 @@ struct Outcome {
     rows: Rows,
     abort: Option<String>,
     assertions: Vec<Value>,
+    /// The rows a write really changed -- the statement's own, or what the backstop measured
+    /// when cascades, triggers or rules moved more. What the write budget is charged.
+    moved: Option<i64>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -412,6 +415,7 @@ fn record_execution(
     assertions: Value,
     sample: Option<Value>,
     duration_ms: f64,
+    rows_moved: Option<i64>,
 ) -> Option<i64> {
     if outcome == "kept" {
         restore_for_a_change();
@@ -425,7 +429,7 @@ fn record_execution(
         serde_json::to_string(&reason).unwrap_or_default(),
     );
     let id: Option<i64> = call_internal(
-        "select agent_gate_internal._record_execution($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+        "select agent_gate_internal._record_execution($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
         &[
             proposal.into(),
             mode.as_str().to_string().into(),
@@ -437,6 +441,7 @@ fn record_execution(
             JsonB(assertions).into(),
             sample.map(JsonB).into(),
             duration_ms.into(),
+            rows_moved.into(),
         ],
     );
     if let Some(e) = id {
@@ -447,7 +452,7 @@ fn record_execution(
 
 fn refuse_execution(who: &Identity, proposal: i64, mode: Mode, started: Instant, reason: String, checks: Value) -> Value {
     let ms = started.elapsed().as_secs_f64() * 1000.0;
-    let execution = record_execution(proposal, mode, "refused", Some(reason.clone()), None, None, None, json!([]), None, ms);
+    let execution = record_execution(proposal, mode, "refused", Some(reason.clone()), None, None, None, json!([]), None, ms, None);
     log!("pg_agent_gate: agent={} proposal={} mode={} outcome=refused", who.agent, proposal, mode.as_str());
     json!({
         "proposal": proposal,
@@ -625,6 +630,29 @@ fn execute(proposal: i64, mode: Mode) -> Value {
     let bindings = cfg.bindings.clone();
     let max_rows = cfg.max_rows;
 
+    // THE WRITE BUDGET (0.4.0). max_rows bounds one proposal; an agent that loops split a write
+    // it was refused into slices that each fit (agent-gate-demo/compare: a 6-row table emptied
+    // in two legal commits, 5 + 1). So an agent's writes are also counted against a budget per
+    // window, from the record of what it already kept. Read HERE, before the subtransaction: on
+    // commit the agent's row is locked, and a lock taken inside the subtransaction would be
+    // released when a guard aborts it. dry_run reads without the lock and reports the same
+    // verdict. Only agents have a budget; a human using the gate on purpose has none.
+    // Ok(Some((budget, used))), Ok(None) = no budget applies, Err(()) = it could not be read.
+    let budget: Result<Option<(i64, i64)>, ()> = if kind == Kind::Write && who.is_agent {
+        let q = "select agent_gate_internal._budget($1, $2)";
+        let found: Option<JsonB> = if mode == Mode::Commit {
+            call_internal(q, &[who.agent.clone().into(), true.into()])
+        } else {
+            read_internal(q, &[who.agent.clone().into(), false.into()])
+        };
+        found
+            .and_then(|JsonB(b)| Some((b["budget"].as_i64()?, b["used"].as_i64()?)))
+            .map(Some)
+            .ok_or(())
+    } else {
+        Ok(None)
+    };
+
     let result = in_subxact(
         || {
             let tup_before = xact_tuples();   // the backstop's starting point, inside this subxact
@@ -663,6 +691,7 @@ fn execute(proposal: i64, mode: Mode) -> Value {
             };
 
             let mut abort = None;
+            let mut moved_total: Option<i64> = None;
             if kind != Kind::Read {
                 // Deferred constraints fire HERE, inside the gate, and not at the
                 // caller's commit where nothing would be watching.
@@ -670,6 +699,9 @@ fn execute(proposal: i64, mode: Mode) -> Value {
                     let _running = state::proposal();
                     state::allow_gate_utility();   // SET CONSTRAINTS is the gate's own utility
                     Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("constraints");
+                }
+                if kind == Kind::Write {
+                    moved_total = Some(rows.processed as i64);
                 }
                 if kind == Kind::Write && rows.processed as i64 > max_rows {
                     abort = Some(format!(
@@ -685,6 +717,7 @@ fn execute(proposal: i64, mode: Mode) -> Value {
                     match (tup_before, xact_tuples()) {
                         (Some(before), Some(after)) => {
                             let moved = after.saturating_sub(before);
+                            moved_total = Some(moved.max(rows.processed as i64));
                             if moved > max_rows {
                                 abort = Some(format!(
                                     "it changed {moved} rows in all -- {} named plus more from a trigger, \
@@ -700,6 +733,27 @@ fn execute(proposal: i64, mode: Mode) -> Value {
                                     .into(),
                             );
                         }
+                    }
+                }
+                // The budget, against the rows this write really moved. The message names no
+                // number: "may touch at most N" is what the model read to cut its slices.
+                if abort.is_none() && kind == Kind::Write {
+                    match budget {
+                        Ok(Some((limit, used))) if used + moved_total.unwrap_or(0) > limit => {
+                            abort = Some(
+                                "it would exceed this agent's write budget for the current window; \
+                                 an administrator can raise it (agent_gate.set_budget)"
+                                    .into(),
+                            );
+                        }
+                        Err(()) => {
+                            abort = Some(
+                                "the agent's write budget could not be read, so this write cannot be \
+                                 proven within it"
+                                    .into(),
+                            );
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -731,7 +785,7 @@ fn execute(proposal: i64, mode: Mode) -> Value {
                     assertions.push(r);
                 }
             }
-            Outcome { rows, abort, assertions }
+            Outcome { rows, abort, assertions, moved: moved_total }
         },
         |o| mode == Mode::Commit && kind != Kind::Read && o.abort.is_none(),
     );
@@ -740,10 +794,10 @@ fn execute(proposal: i64, mode: Mode) -> Value {
     // The hint is what an agent fixes a proposal from: it travels structured,
     // not only folded into the reason text.
     let mut error = None;
-    let (outcome, reason, rows, processed, truncated, assertions) = match result {
+    let (outcome, reason, rows, processed, truncated, assertions, moved) = match result {
         Err(f) => {
             error = Some(f.json());
-            ("aborted", Some(format!("it ran and PostgreSQL raised {}", f.describe())), Vec::new(), None, None, Vec::new())
+            ("aborted", Some(format!("it ran and PostgreSQL raised {}", f.describe())), Vec::new(), None, None, Vec::new(), None)
         }
         Ok(o) => {
             let outcome = if o.abort.is_some() {
@@ -755,7 +809,7 @@ fn execute(proposal: i64, mode: Mode) -> Value {
             } else {
                 "rolled_back"
             };
-            (outcome, o.abort, o.rows.rows, Some(o.rows.processed), Some(o.rows.truncated), o.assertions)
+            (outcome, o.abort, o.rows.rows, Some(o.rows.processed), Some(o.rows.truncated), o.assertions, o.moved)
         }
     };
 
@@ -772,6 +826,7 @@ fn execute(proposal: i64, mode: Mode) -> Value {
         Value::Array(assertions.clone()),
         sample,
         ms,
+        moved,
     );
     log!(
         "pg_agent_gate: agent={} proposal={} mode={} outcome={}",

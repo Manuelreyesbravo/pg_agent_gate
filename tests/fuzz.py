@@ -316,7 +316,16 @@ def main():
     # escapes are EXPECTED, so without the gate a clean run is the failure.
     gate_on = not os.environ.get("FUZZ_NO_GATE")
     if gate_on:
-        su.execute(f"select agent_gate.register_agent('fuzzer', '{AGENT}', 'fuzz target', p_max_rows => {MAX_ROWS})")
+        # The k-sweep commits over and over with one agent to prove the max_rows boundary; since
+        # 0.4.0 the write budget would abort it first. Give it a budget it cannot reach, so the
+        # oracle measures max_rows. Older versions (the v0.2.0 teeth run) have no budget.
+        has_budget = su.execute(
+            "select 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace "
+            "where n.nspname = 'agent_gate' and p.proname = 'register_agent' "
+            "and 'p_max_rows_per_window' = any(p.proargnames)").fetchone()
+        budget = ", p_max_rows_per_window => 1000000000" if has_budget else ""
+        su.execute(f"select agent_gate.register_agent('fuzzer', '{AGENT}', 'fuzz target', "
+                   f"p_max_rows => {MAX_ROWS}{budget})")
     else:
         print("NEGATIVE CONTROL: no gate -- escapes are expected")
 

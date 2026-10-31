@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.4.0 -- 2026-10-31
+
+A write budget per agent, **on by default** -- a change of behavior, hence the minor version.
+`max_rows` bounds one proposal, and an agent that loops split a write it was refused into slices
+that each fit: measured with a plain Qwen3-8B (`agent-gate-demo/compare`), a model told "may touch
+at most 5" emptied a 6-row table in two legal commits, 5 + 1. Each statement was decided by the
+database; their sum was not. Now it is (`tests/budget.sh`, 21 checks).
+
+* **Every agent has a budget of rows per window.** `agents.max_rows_per_window` and
+  `window_seconds`; unset, the budget is the agent's `max_rows` per hour. A commit whose rows,
+  added to what the agent kept in the window, would pass it is aborted with "it would exceed this
+  agent's write budget for the current window". The message names no number: the old one told the
+  model exactly how large to cut its slices. `dry_run` reports the same verdict.
+* **It counts what really changed.** `executions.rows_moved` records the rows a kept write moved,
+  cascades, triggers and rules included (what the backstop measures), and the budget sums that.
+* **No race.** On commit the agent's row is locked (`FOR NO KEY UPDATE`) before the count, so two
+  sessions of one agent cannot each spend the same remainder: four parallel commits of 3 rows
+  against a budget of 3 keep exactly one. The lock is taken before the guarded subtransaction, so
+  an abort does not release it.
+* **`register_agent(..., p_max_rows_per_window integer DEFAULT NULL, p_window_seconds integer
+  DEFAULT 3600)`**, and two administration calls, revoked from `PUBLIC` like `register_agent`:
+  `agent_gate.set_budget(agent, rows, window_seconds)` and `agent_gate.reset_budget(agent)` -- the
+  whole budget back from now, after a person has looked at what the agent did. The record is never
+  rewritten; the agent's row says since when the budget counts.
+* **Upgrading.** Every existing agent gets `max_rows_per_window = max_rows` per hour, and the
+  upgrade raises a NOTICE that lists them. An agent that legitimately writes more than its
+  `max_rows` in an hour needs `set_budget` after `ALTER EXTENSION pg_agent_gate UPDATE`.
+* **Suites.** `tests/budget.sh` is new; `approvals.sh` (0.3.0) was not in `make verify` and now is.
+  `flushes.sh` and the fuzzer's `max_rows` oracle write over and over with one agent to measure
+  something else, so they register it with a budget it cannot reach.
+
 ## 0.3.0 -- 2026-10-27
 
 Human-in-the-middle approvals. An agent registered with `requires_approval` may propose and
