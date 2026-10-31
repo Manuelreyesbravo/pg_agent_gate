@@ -71,7 +71,7 @@ check "3. a non-approver role is refused by approve()" "permission denied" \
 # 4. the guards still run after approval: an over-limit delete is aborted.
 p4=$(propose "$AGENT" "delete from orders" "cleanup")
 run "$APPROVER" "select agent_gate.approve($p4)" >/dev/null
-check "4. an approved over-limit change is still aborted by max_rows" "may touch at most 5" \
+check "4. an approved over-limit change is still aborted by max_rows" "more than this agent may change in one statement" \
     "$(run "$AGENT" "select agent_gate.commit($p4)")"
 
 # 5. propose_and_commit cannot sidestep approval.

@@ -13,6 +13,10 @@ database; their sum was not. Now it is (`tests/budget.sh`, 21 checks).
   added to what the agent kept in the window, would pass it is aborted with "it would exceed this
   agent's write budget for the current window". The message names no number: the old one told the
   model exactly how large to cut its slices. `dry_run` reports the same verdict.
+* **The max_rows refusal no longer names the limit.** "it touched 8 rows and this agent may touch
+  at most 5" became "it touched 8 rows, more than this agent may change in one statement" (and the
+  same for the amplification backstop): the number was what the model read to size its slices. An
+  agent that wants its limit still gets it from `discover()`, on purpose.
 * **It counts what really changed.** `executions.rows_moved` records the rows a kept write moved,
   cascades, triggers and rules included (what the backstop measures), and the budget sums that.
 * **No race.** On commit the agent's row is locked (`FOR NO KEY UPDATE`) before the count, so two

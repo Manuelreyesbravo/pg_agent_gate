@@ -63,7 +63,7 @@ WITH the gate: the same role, registered as an agent (max_rows 5, no DDL)
 
   ...and the same three, PROPOSED through the gate:
   1. propose + commit:  DELETE FROM orders   (8 rows, the agent may touch 5)
-     commit: aborted -- it touched 8 rows and this agent may touch at most 5
+     commit: aborted -- it touched 8 rows, more than this agent may change in one statement
   2. propose:  DROP TABLE customers
      refused at propose -- kind_allowed: T_DropStmt changes the schema or the server, and this agent is not allowed DDL
   3. propose:  a read that moves the tenant from inside the statement

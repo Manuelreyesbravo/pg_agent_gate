@@ -704,9 +704,11 @@ fn execute(proposal: i64, mode: Mode) -> Value {
                     moved_total = Some(rows.processed as i64);
                 }
                 if kind == Kind::Write && rows.processed as i64 > max_rows {
+                    // No number in the refusal (0.4.0): "may touch at most N" told a looping model
+                    // the size of the slice to cut. The agent can still ask discover() for its limit.
                     abort = Some(format!(
-                        "it touched {} rows and this agent may touch at most {}",
-                        rows.processed, max_rows
+                        "it touched {} rows, more than this agent may change in one statement",
+                        rows.processed
                     ));
                 } else if kind == Kind::Write {
                     // Backstop: the top-level count is not the whole story. Measure the tuples this
@@ -721,7 +723,7 @@ fn execute(proposal: i64, mode: Mode) -> Value {
                             if moved > max_rows {
                                 abort = Some(format!(
                                     "it changed {moved} rows in all -- {} named plus more from a trigger, \
-                                     cascade, rule or function -- and this agent may touch at most {max_rows}",
+                                     cascade, rule or function -- more than this agent may change in one statement",
                                     rows.processed
                                 ));
                             }
