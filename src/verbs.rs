@@ -91,7 +91,7 @@ fn call_internal<T: FromDatum + IntoDatum>(query: &str, args: &[DatumWithOid]) -
 /// The gate's own SQL that only READS. Read-only SPI: no transaction id, so no
 /// commit record and no flush. The record functions called this way are
 /// VOLATILE plpgsql, and read with a fresh snapshot inside.
-fn read_internal<T: FromDatum + IntoDatum>(query: &str, args: &[DatumWithOid]) -> Option<T> {
+pub(crate) fn read_internal<T: FromDatum + IntoDatum>(query: &str, args: &[DatumWithOid]) -> Option<T> {
     let _gate = state::trusted();
     crate::exec::with_gate_search_path(|| Spi::connect(|client| {
         client

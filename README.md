@@ -678,7 +678,10 @@ read a definer function's body or re-decide what a view may show.
 * a proposal runs only after PostgreSQL's parser, planner, analyzer and
   rewriter accept it as one statement of a kind the agent may run;
 * a write that touches more than `max_rows` rows, or breaks a bound assertion,
-  is undone;
+  is undone; and its writes over a window stay within its budget (0.4.0);
+* no other role can become it: an agent role has no members, so no session but
+  its own login can `SET ROLE` into it (0.4.1) -- connect each agent, or each
+  seat of a broker, as its own role;
 * the context its row-level policies read cannot be moved -- not by `SET`, not
   at connection start, not by `set_config()` inside a proposal;
 * everything it proposed and did is recorded append-only, including why

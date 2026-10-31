@@ -191,6 +191,17 @@ unsafe extern "C-unwind" fn process_utility(
             );
         }
     }
+    // AN AGENT ROLE HAS NO MEMBERS (0.4.1). The gate knows an agent session by agent_gate.agent,
+    // which PostgreSQL applies when the agent role CONNECTS; a member of that role can SET ROLE
+    // into it (or set_config('role', ...)) from a session of its own and have the agent's
+    // privileges with no gate at all -- measured on 0.4.0: `SET ROLE seat; DELETE FROM t` took 20
+    // rows past a max_rows of 2. Only members (and superusers, outside the gate by design) can do
+    // that, so a statement that ADDS a membership in a registered agent role is refused, whatever
+    // its form: GRANT, CREATE ROLE ... IN ROLE, ALTER GROUP ... ADD USER. Read before and after,
+    // so an installation upgraded with memberships already in place can still administer its roles
+    // while it revokes them (the upgrade warns); it only cannot add one.
+    let watch = !pstmt.is_null() && changes_membership((*pstmt).utilityStmt);
+    let before = if watch { agent_memberships() } else { None };
     match PREV_PROCESS_UTILITY {
         Some(prev) => prev(pstmt, query_string, read_only_tree, context, params, query_env, dest, qc),
         None => pg_sys::standard_ProcessUtility(
@@ -204,6 +215,41 @@ unsafe extern "C-unwind" fn process_utility(
             qc,
         ),
     }
+    if let (Some(before), Some(after)) = (before, if watch { agent_memberships() } else { None }) {
+        let added: Vec<&String> = after.iter().filter(|m| !before.contains(m)).collect();
+        if !added.is_empty() {
+            let added = added.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
+            error!(
+                "pg_agent_gate: this would make a role a member of an agent role ({added}); a member \
+                 can SET ROLE into it in a session the gate does not watch. An agent role has no \
+                 members: each agent, or each seat of a broker, logs in as its own role"
+            );
+        }
+    }
+}
+
+/// A utility statement that can add a member to a role.
+unsafe fn changes_membership(stmt: *mut pg_sys::Node) -> bool {
+    !stmt.is_null()
+        && matches!(
+            (*stmt).type_,
+            pg_sys::NodeTag::T_GrantRoleStmt | pg_sys::NodeTag::T_CreateRoleStmt | pg_sys::NodeTag::T_AlterRoleStmt
+        )
+}
+
+/// Every membership in a registered agent role ('agent <- member'), or None where the extension
+/// is not installed in this database at 0.4.1 or later: the library is loaded cluster-wide, the
+/// record is per database, and a newer library over an older schema enforces what that schema has.
+fn agent_memberships() -> Option<Vec<String>> {
+    let installed: Option<bool> = Spi::get_one(
+        "select to_regprocedure('agent_gate_internal._agent_memberships()') is not null",
+    )
+    .ok()
+    .flatten();
+    if installed != Some(true) {
+        return None;
+    }
+    crate::verbs::read_internal::<Vec<String>>("select agent_gate_internal._agent_memberships()", &[])
 }
 
 #[pg_guard]

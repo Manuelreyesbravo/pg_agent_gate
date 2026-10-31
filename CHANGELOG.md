@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.4.1 -- 2026-10-31
+
+An agent role has no members. The gate knows an agent session by `agent_gate.agent`, which
+`register_agent` sets on the role and PostgreSQL applies when that role connects. A session of
+another role that `SET ROLE`s into the agent's -- or calls `set_config('role', ...)` -- has the
+agent's privileges without that setting, so it is not behind the gate. Measured on 0.4.0: a broker
+role granted the agent role ran `SET ROLE seat; DELETE FROM t` and deleted 20 rows past a
+`max_rows` of 2, with nothing proposed and nothing recorded. Only a member of a role (or a
+superuser, outside the gate by design) can switch into it, so that is the rule now
+(`tests/membership.sh`, 16 checks):
+
+* **`register_agent` refuses a role that has members**, naming them.
+* **No statement may add a member to a registered agent role**, whatever its form -- `GRANT`,
+  `CREATE ROLE ... IN ROLE`, `ALTER GROUP ... ADD USER`: the library reads the memberships before
+  and after every statement that can change one, and refuses the statement if it added one.
+  Comparing, not only checking, keeps role administration working on an installation that is
+  upgraded with memberships already in place; it only cannot add new ones.
+* **Upgrading.** If an agent role already has members, `ALTER EXTENSION pg_agent_gate UPDATE`
+  warns with each `agent <- member` pair; revoke them. Each agent -- or each seat of a broker --
+  logs in as its own role.
+* Role administration that adds no member to an agent is unchanged: a `CREATEROLE` role creates
+  roles, anyone changes their own password (both in the suite).
+
 ## 0.4.0 -- 2026-10-31
 
 A write budget per agent, **on by default** -- a change of behavior, hence the minor version.

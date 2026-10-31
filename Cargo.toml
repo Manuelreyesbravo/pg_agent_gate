@@ -14,7 +14,7 @@
 # a verb argument (it ran before verification, outside the gate), and verify.rs no longer
 # crashes the backend on a lone ";". Same version, different behaviour, is the same lie.
 name = "pg_agent_gate"
-version = "0.4.0"
+version = "0.4.1"
 
 edition = "2021"
 description = "Agents propose, PostgreSQL decides: a native gate between LLM agents and the database"
