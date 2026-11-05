@@ -137,6 +137,14 @@ pub(crate) const SETTABLE_BY_AGENTS: &[&str] = &[
 /// stands on this".
 pub(crate) static SETTABLE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 
+/// The parameters a superuser added to `agent_gate.settable`, lower-cased.
+pub(crate) fn settable_extra() -> Vec<String> {
+    match SETTABLE.get().and_then(|c| c.into_string().ok()) {
+        Some(extra) => extra.split(',').map(|p| p.trim().to_lowercase()).filter(|p| !p.is_empty()).collect(),
+        None => Vec::new(),
+    }
+}
+
 pub(crate) fn settable(name: &str) -> bool {
     if SETTABLE_BY_AGENTS.contains(&name) {
         return true;

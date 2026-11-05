@@ -216,21 +216,16 @@ pub(crate) fn verify(
     // from, a sublink, a CTE, schema-qualified or not.
     // A user function's body is not in this tree, so it could call set_config or write rows no one
     // counts. If it is volatile or SECURITY DEFINER, no_opaque_function below refuses the statement.
+    // CREATE TABLE AS and SELECT INTO -- and CREATE MATERIALIZED VIEW, the same node -- are DDL
+    // that RUN a query, and up to 0.4.1 the DDL branch only ran it: its query was never walked. Over
+    // a CTE that deletes, an allow_ddl agent deleted every row of a table with no max_rows, no budget
+    // and no count, and the record said ddl (review of 2026-11-05). That query is now judged on its
+    // analyzed and rewritten tree, like a read, before anything runs; the rest of a DDL still runs
+    // in a subtransaction that is rolled back.
+    let runs_a_query =
+        kind == Kind::Ddl && (tag == pg_sys::NodeTag::T_CreateTableAsStmt || parsed.select_into);
     let mut tree_relations: Vec<pg_sys::Oid> = Vec::new();
-    if kind == Kind::Ddl {
-        match in_subxact(|| run_statement(&v.statement), |_| false) {
-            Ok(()) => v.check(
-                "executes",
-                true,
-                "it ran inside a subtransaction that was rolled back: nothing was kept",
-            ),
-            Err(f) => {
-                v.kind = Some(kind);
-                v.check("executes", false, f.describe());
-                return v;
-            }
-        }
-    } else {
+    if kind != Kind::Ddl || runs_a_query {
         let n_params = params.as_ref().map_or(0, |p| p.len());
         let tree = match in_subxact(|| unsafe { analyze_tree(&v.statement, n_params) }, |_| false) {
             Ok(tree) => tree,
@@ -250,8 +245,13 @@ pub(crate) fn verify(
             v.check(
                 "no_writing_cte",
                 false,
-                "a CTE here changes data, and max_rows only counts the rows of the outer statement: \
-                 propose each write as its own statement",
+                if runs_a_query {
+                    "a CTE here changes data, and a CREATE TABLE AS or SELECT INTO is DDL, which \
+                     counts no rows: propose the write as its own statement"
+                } else {
+                    "a CTE here changes data, and max_rows only counts the rows of the outer statement: \
+                     propose each write as its own statement"
+                },
             );
             return v;
         }
@@ -267,57 +267,66 @@ pub(crate) fn verify(
             return v;
         }
         v.check("keeps_its_context", true, "nothing in the statement calls set_config()");
-        // The allow-list does NOT skip the check -- it is consulted inside it, so an allowed
-        // table still refuses an UNSAFE amplifier (a cascade the agent could not do directly,
-        // a SECURITY DEFINER trigger, a rule). A blanket skip reopened the 0.2.2 breach.
-        match amplifying_object(&tree.targets, allowed) {
-            Err(why) => {
-                // Fail CLOSED: a lookup we could not complete is not "nothing to find".
-                v.kind = Some(kind);
-                v.check(
-                    "no_amplification",
-                    false,
-                    format!("the catalog lookup for cascading keys, triggers and rules failed, \
-                             so this write cannot be proven bounded: {why}"),
-                );
-                return v;
-            }
-            Ok(Some(obj)) => {
-                v.kind = Some(kind);
-                v.check(
-                    "no_amplification",
-                    false,
-                    format!(
-                        "writing this table fires {obj}, whose effect the gate cannot check \
-                         and which is not counted against max_rows. A non-SECURITY DEFINER \
-                         trigger you accept can be allow-listed with agent_gate.allow_write; a \
-                         cascade, a rule, or a SECURITY DEFINER trigger cannot be allow-listed \
-                         in this version -- remove it or restructure the write"
-                    ),
-                );
-                return v;
-            }
-            Ok(None) => {
-                if tree.modifies && tree.targets.is_empty() {
-                    // A modifying statement whose target we could not resolve: refuse, do not run.
+        if kind != Kind::Ddl {
+            // The allow-list does NOT skip the check -- it is consulted inside it, so an allowed
+            // table still refuses an UNSAFE amplifier (a cascade the agent could not do directly,
+            // a SECURITY DEFINER trigger, a rule). A blanket skip reopened the 0.2.2 breach.
+            match amplifying_object(&tree.targets, allowed) {
+                Err(why) => {
+                    // Fail CLOSED: a lookup we could not complete is not "nothing to find".
                     v.kind = Some(kind);
                     v.check(
                         "no_amplification",
                         false,
-                        "this statement modifies data but its target relation could not be \
-                         identified, so it cannot be checked for amplification",
+                        format!("the catalog lookup for cascading keys, triggers and rules failed, \
+                                 so this write cannot be proven bounded: {why}"),
                     );
                     return v;
                 }
-                v.check(
-                    "no_amplification",
-                    true,
-                    "no unsafe cascade, trigger or rule on this write's target (or an \
-                     inheritance child of it) can amplify it beyond the agent's reach",
-                );
+                Ok(Some(obj)) => {
+                    v.kind = Some(kind);
+                    v.check(
+                        "no_amplification",
+                        false,
+                        format!(
+                            "writing this table fires {obj}, whose effect the gate cannot check \
+                             and which is not counted against max_rows. A non-SECURITY DEFINER \
+                             trigger you accept can be allow-listed with agent_gate.allow_write; a \
+                             cascade, a rule, or a SECURITY DEFINER trigger cannot be allow-listed \
+                             in this version -- remove it or restructure the write"
+                        ),
+                    );
+                    return v;
+                }
+                Ok(None) => {
+                    if tree.modifies && tree.targets.is_empty() {
+                        // A modifying statement whose target we could not resolve: refuse, do not run.
+                        v.kind = Some(kind);
+                        v.check(
+                            "no_amplification",
+                            false,
+                            "this statement modifies data but its target relation could not be \
+                             identified, so it cannot be checked for amplification",
+                        );
+                        return v;
+                    }
+                    v.check(
+                        "no_amplification",
+                        true,
+                        "no unsafe cascade, trigger or rule on this write's target (or an \
+                         inheritance child of it) can amplify it beyond the agent's reach",
+                    );
+                }
             }
         }
-        match risky_function(&tree.funcs) {
+        // SQL IN A TEXT ARGUMENT (0.4.2, review of 2026-11-05). A built-in is vetted because it does
+        // what its documentation says, and some say they run a query given as text: query_to_xml(),
+        // ts_stat(), ts_rewrite(), the *_to_xml() family, tablefunc's crosstab(). That query is parsed
+        // and run while the gate steps aside, so nothing above saw it: set_config() inside it moved
+        // the tenant while the same statement read, and nextval() inside it advanced a sequence from
+        // a read. The class is refused by what the function IS (its C entry point), not by its name:
+        // see hidden_sql_function and the list in SQL_FROM_TEXT.
+        match opaque_function(&tree.funcs) {
             Err(why) => {
                 v.kind = Some(kind);
                 v.check(
@@ -328,25 +337,41 @@ pub(crate) fn verify(
                 );
                 return v;
             }
-            Ok(Some(f)) => {
+            Ok(Some(Opaque::SqlFromText(f))) => {
+                v.kind = Some(kind);
+                v.check(
+                    "no_hidden_sql",
+                    false,
+                    format!("the statement calls {f}, which parses and runs SQL it receives as text \
+                             (or builds from a name) where no check of the gate sees it. It was refused \
+                             before planning, so it did not run. Propose that query itself"),
+                );
+                return v;
+            }
+            Ok(Some(Opaque::Body(f))) => {
+                v.check("no_hidden_sql", true, "no function that runs SQL from a text is called");
                 v.kind = Some(kind);
                 v.check(
                     "no_opaque_function",
                     false,
                     format!("the statement calls {f}; a user function that is volatile or \
-                             SECURITY DEFINER has a body the gate cannot see -- it may write \
-                             rows no one counts, or run as its owner outside the agent's tenant. \
-                             It was refused before planning, so it did not run. \
-                             If it does not write, mark it STABLE or IMMUTABLE"),
+                             SECURITY DEFINER, that this agent can alter, or whose SET clause sets a \
+                             parameter an agent may not set, has a body or a context the gate cannot \
+                             vouch for -- it may write rows no one counts, or run outside the agent's \
+                             tenant. It was refused before planning, so it did not run"),
                 );
                 return v;
             }
-            Ok(None) => v.check(
-                "no_opaque_function",
-                true,
-                "every function called is a vetted built-in, or a user function that is \
-                 neither volatile nor SECURITY DEFINER",
-            ),
+            Ok(None) => {
+                v.check("no_hidden_sql", true, "no function that runs SQL from a text is called");
+                v.check(
+                    "no_opaque_function",
+                    true,
+                    "every function called is a vetted built-in, or a user function that is \
+                     neither volatile nor SECURITY DEFINER, is not this agent's to alter, and sets \
+                     no parameter an agent may not set",
+                );
+            }
         }
         // A READ CHANGES NOTHING (0.2.14, external audit GATE-11). Built-ins are vetted above
         // because they do what their documentation says -- and some say they change state: a read
@@ -382,7 +407,23 @@ pub(crate) fn verify(
                 ),
             }
         }
-        tree_relations = tree.relations;
+        if kind != Kind::Ddl {
+            tree_relations = tree.relations;
+        }
+    }
+    if kind == Kind::Ddl {
+        match in_subxact(|| run_statement(&v.statement), |_| false) {
+            Ok(()) => v.check(
+                "executes",
+                true,
+                "it ran inside a subtransaction that was rolled back: nothing was kept",
+            ),
+            Err(f) => {
+                v.kind = Some(kind);
+                v.check("executes", false, f.describe());
+                return v;
+            }
+        }
     }
 
     // 4. The planner, last: only a statement with nothing opaque left in it gets here, so what
@@ -516,29 +557,129 @@ fn amplifying_object(targets: &[pg_sys::Oid], allowed: &[u32]) -> Result<Option<
     )
 }
 
-/// A USER function the statement calls that the gate cannot vouch for: volatile (its body may
-/// write rows no one counted, like a trigger) or SECURITY DEFINER (it runs as its owner, outside
-/// the agent's tenant, like a cascade). Built-in functions (pg_catalog and friends) are vetted and
-/// excluded, as is a non-volatile, non-SECURITY DEFINER user function. Ok(None) = all vouched,
-/// Ok(Some(name)) = refuse naming it, Err = lookup failed (refuse, fail closed).
-fn risky_function(funcs: &[pg_sys::Oid]) -> Result<Option<String>, String> {
+/// The C entry points (prosrc of a LANGUAGE internal or C function) that parse and run SQL given
+/// to them as text, or built from a name, through SPI -- where the hooks step aside, because the
+/// statement that called them is already the gate's to run. Derived (0.4.2) from the PostgreSQL
+/// source, not from a list of names: every SQL-callable function whose implementation reaches
+/// SPI_execute, SPI_prepare or SPI_cursor_open/find with text it did not write itself.
+///   * src/backend/utils/adt/xml.c: query_to_xml, query_to_xmlschema, query_to_xml_and_xmlschema
+///     and cursor_to_xml, cursor_to_xmlschema (a query or a cursor given by the caller);
+///     table_, schema_ and database_to_xml[schema|_and_xmlschema] (a SELECT built from a name).
+///   * src/backend/utils/adt/tsvector_op.c: ts_stat1, ts_stat2 (ts_stat(query [, weights])).
+///   * src/backend/utils/adt/tsquery_rewrite.c: tsquery_rewrite_query (ts_rewrite(tsquery, query)).
+///   * contrib, installed as an extension: tablefunc's crosstab, crosstab_hash, connectby_text,
+///     connectby_text_serial; xml2's xpath_table; every dblink_* entry point (already volatile).
+/// The other users of SPI in the server are triggers (ri_triggers.c, tsvector_update_trigger, the
+/// spi/tcn/lo contribs), which no statement calls, and ruleutils.c, whose queries are fixed catalog
+/// reads (pg_get_ruledef, pg_get_viewdef). Checked against pg_proc of PostgreSQL 18.6 and 19beta2:
+/// `select oid::regprocedure from pg_proc where prolang in (12, 13) and prosrc = any(...)`.
+pub(crate) const SQL_FROM_TEXT: &[&str] = &[
+    "query_to_xml",
+    "query_to_xmlschema",
+    "query_to_xml_and_xmlschema",
+    "cursor_to_xml",
+    "cursor_to_xmlschema",
+    "table_to_xml",
+    "table_to_xmlschema",
+    "table_to_xml_and_xmlschema",
+    "schema_to_xml",
+    "schema_to_xmlschema",
+    "schema_to_xml_and_xmlschema",
+    "database_to_xml",
+    "database_to_xmlschema",
+    "database_to_xml_and_xmlschema",
+    "ts_stat1",
+    "ts_stat2",
+    "tsquery_rewrite_query",
+    "crosstab",
+    "crosstab_hash",
+    "connectby_text",
+    "connectby_text_serial",
+    "xpath_table",
+];
+
+/// Whether a C entry point (with its language) is one of SQL_FROM_TEXT. LANGUAGE internal is 12 and
+/// C is 13, fixed in pg_language.dat; nothing else can name a C symbol.
+pub(crate) fn runs_sql_from_text(prolang: u32, prosrc: &str) -> bool {
+    (prolang == 12 || prolang == 13) && (SQL_FROM_TEXT.contains(&prosrc) || prosrc.starts_with("dblink"))
+}
+
+/// A parameter a function's SET clause may set and still be vouched for: one an agent may set
+/// itself, or search_path, which only names where the function's own body looks (the usual
+/// hardening of a function, and the gate's own functions carry it).
+pub(crate) fn set_clause_allowed(name: &str) -> bool {
+    let name = name.trim().to_lowercase();
+    name == "search_path" || crate::settable(&name)
+}
+
+pub(crate) enum Opaque {
+    /// A function that runs SQL from a text: `no_hidden_sql`.
+    SqlFromText(String),
+    /// A user function whose body or context the gate cannot vouch for: `no_opaque_function`.
+    Body(String),
+}
+
+/// The first function the statement calls that the gate cannot vouch for, or `None`:
+///   * one that runs SQL from a text (SQL_FROM_TEXT), built-in or not;
+///   * a USER function -- created after initdb, OID >= FirstNormalObjectId, so an extension
+///     installed into pg_catalog is not taken for a built-in -- that is
+///       - SECURITY DEFINER (it runs as its owner, outside the agent's tenant, like a cascade), or
+///       - volatile (its body may write rows no one counted, like a trigger), or
+///       - in an agent's session, ALTERABLE BY THE AGENT: owned by a role whose privileges it has
+///         (0.4.2). Its STABLE or IMMUTABLE is then the adversary's own claim -- an allow_ddl agent
+///         marked a plpgsql function that calls set_config() IMMUTABLE, and the planner ran it --
+///         so it is opaque whatever it says, or
+///       - one whose SET clause sets a parameter an agent may not set (0.4.2): the clause applies
+///         while the body runs, so `SET app.tenant_id = '2'` reads the other tenant's rows.
+/// Err = the lookup failed (refuse, fail closed).
+fn opaque_function(funcs: &[pg_sys::Oid]) -> Result<Option<Opaque>, String> {
     if funcs.is_empty() {
         return Ok(None);
     }
     let ids: Vec<i64> = funcs.iter().map(|o| o.to_u32() as i64).collect();
-    crate::exec::get_one_prepared::<String>(
+    let symbols: Vec<String> = SQL_FROM_TEXT.iter().map(|s| s.to_string()).collect();
+    let mut settable: Vec<String> = crate::SETTABLE_BY_AGENTS.iter().map(|s| s.to_string()).collect();
+    settable.extend(crate::settable_extra());
+    settable.push("search_path".into());
+    let found = crate::exec::get_one_prepared::<String>(
         "select (
-           select 'function '||n.nspname||'.'||p.proname||
-                  case when p.prosecdef then ' (security definer)' else ' (volatile)' end
-             from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid = p.pronamespace
-             where p.oid = any($1::int8[]::oid[])
-               and n.nspname not in ('pg_catalog', 'information_schema', 'pg_toast')
-               and (p.prosecdef or p.provolatile = 'v')
-             limit 1
+           select case when x.from_text then 'T' else 'B' end ||
+                  n.nspname || '.' || p.proname || '()' ||
+                  case when x.from_text then '' else ' (' || x.why || ')' end
+             from pg_catalog.pg_proc p
+             join pg_catalog.pg_namespace n on n.oid = p.pronamespace
+             cross join lateral (
+               select p.prolang in (12, 13)
+                      and (p.prosrc = any($2::text[]) or p.prosrc like 'dblink%') as from_text,
+                      case
+                        when p.oid < 16384 then null
+                        when p.prosecdef then 'security definer'
+                        when p.provolatile = 'v' then 'volatile'
+                        when $3 and pg_catalog.pg_has_role(p.proowner, 'USAGE')
+                          then 'this agent can alter it, so what it is marked is its own claim'
+                        else (select 'its SET clause sets ' || pg_catalog.split_part(c, '=', 1) ||
+                                     ', which an agent may not set'
+                                from pg_catalog.unnest(p.proconfig) c
+                               where pg_catalog.lower(pg_catalog.split_part(c, '=', 1)) <> all($4::text[])
+                               limit 1)
+                      end as why) x
+            where p.oid = any($1::int8[]::oid[])
+              and (x.from_text or x.why is not null)
+            order by x.from_text desc
+            limit 1
          )",
-        &[PgOid::BuiltIn(PgBuiltInOids::INT8ARRAYOID)],
-        &[ids.into()],
-    )
+        &[
+            PgOid::BuiltIn(PgBuiltInOids::INT8ARRAYOID),
+            PgOid::BuiltIn(PgBuiltInOids::TEXTARRAYOID),
+            PgOid::BuiltIn(PgBuiltInOids::BOOLOID),
+            PgOid::BuiltIn(PgBuiltInOids::TEXTARRAYOID),
+        ],
+        &[ids.into(), symbols.into(), crate::agent_is_set().into(), settable.into()],
+    )?;
+    Ok(found.map(|f| match f.split_at(1) {
+        ("T", rest) => Opaque::SqlFromText(rest.to_string()),
+        (_, rest) => Opaque::Body(rest.to_string()),
+    }))
 }
 
 /// A built-in the statement calls that changes state outside the rows a read returns: sequences,
@@ -656,9 +797,28 @@ unsafe fn analyze_tree(statement: &str, n_params: usize) -> Tree {
     let mut tree = Tree::default();
     for i in 0..list_len(queries) {
         let q = pg_sys::list_nth(queries, i) as *mut pg_sys::Query;
-        tree.writing_cte |= (*q).hasModifyingCTE;
-        collect_target(q, &mut tree);
-        pg_sys::query_tree_walker_impl(q, Some(walk), &mut tree as *mut Tree as *mut c_void, 0);
+        // A CREATE TABLE AS (SELECT INTO is analyzed into one) is a utility whose query the
+        // analyzer has resolved but the rewriter has not: rewrite a copy, as EXPLAIN does, so views
+        // are expanded and row-level policies added, and walk that.
+        let ctas = (*q).commandType == pg_sys::CmdType::CMD_UTILITY
+            && !(*q).utilityStmt.is_null()
+            && (*(*q).utilityStmt).type_ == pg_sys::NodeTag::T_CreateTableAsStmt;
+        let walked: Vec<*mut pg_sys::Query> = if ctas {
+            let inner = (*((*q).utilityStmt as *mut pg_sys::CreateTableAsStmt)).query;
+            assert!(
+                !inner.is_null() && (*inner).type_ == pg_sys::NodeTag::T_Query,
+                "the query of a CREATE TABLE AS is analyzed"
+            );
+            let rewritten = pg_sys::QueryRewrite(pg_sys::copyObjectImpl(inner as *const c_void) as *mut pg_sys::Query);
+            (0..list_len(rewritten)).map(|j| pg_sys::list_nth(rewritten, j) as *mut pg_sys::Query).collect()
+        } else {
+            vec![q]
+        };
+        for q in walked {
+            tree.writing_cte |= (*q).hasModifyingCTE;
+            collect_target(q, &mut tree);
+            pg_sys::query_tree_walker_impl(q, Some(walk), &mut tree as *mut Tree as *mut c_void, 0);
+        }
         if tree.set_config {
             break;
         }

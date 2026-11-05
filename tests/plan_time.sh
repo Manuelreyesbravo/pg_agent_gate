@@ -125,9 +125,11 @@ GRANT SELECT ON shop.catalog_v TO :"role";
 SQL
 
 # 0.2.8, parallel workers. The hook keys on a counter that lives in the backend; a parallel worker
-# has its own, at 0. A DDL proposal (an allow_ddl agent) is not walked -- the hook is its only guard
-# against a SECURITY DEFINER function -- and CREATE TABLE AS can run its SELECT in workers. With
-# the leader not participating, nothing the leader runs would trip the hook.
+# has its own, at 0. A DDL proposal (an allow_ddl agent) was not walked up to 0.4.1 -- the hook was
+# its only guard against a SECURITY DEFINER function -- and CREATE TABLE AS can run its SELECT in
+# workers. With the leader not participating, nothing the leader runs would trip the hook. Since
+# 0.4.2 the query of a CREATE TABLE AS is walked, so the hook is exercised through a wrapper the
+# walker passes (a DBA's STABLE function over the SECURITY DEFINER one).
 DDL_ROLE=agent_gate_plan_time_ddl
 claim_role "$DDL_ROLE"
 "$BIN/psql" -X -U "$SUPERUSER" -d "$DB" -v ON_ERROR_STOP=1 -q -v ddl="$DDL_ROLE" >/dev/null <<SQL
@@ -135,10 +137,12 @@ CREATE TABLE shop.big AS SELECT g AS id FROM generate_series(1, 200000) g;
 ANALYZE shop.big;
 CREATE FUNCTION vault.peek_par(i int) RETURNS text LANGUAGE sql STABLE PARALLEL SAFE SECURITY DEFINER AS
   \$\$ SELECT s FROM vault.secret \$\$;
+CREATE FUNCTION vault.wrap_par(i int) RETURNS text LANGUAGE plpgsql STABLE PARALLEL SAFE AS
+  \$\$ BEGIN RETURN vault.peek_par(i); END \$\$;
 CREATE SCHEMA loot AUTHORIZATION :"ddl";
 GRANT USAGE ON SCHEMA shop, vault TO :"ddl";
 GRANT SELECT ON shop.big TO :"ddl";
-GRANT EXECUTE ON FUNCTION vault.peek_par(int) TO :"ddl";
+GRANT EXECUTE ON FUNCTION vault.peek_par(int), vault.wrap_par(int) TO :"ddl";
 SELECT agent_gate.register_agent('plan_time_ddl', :'ddl', 'creates tables in its own schema', p_allow_ddl => true);
 -- Make a parallel plan certain, and keep the leader out of it.
 ALTER DATABASE $DB SET parallel_setup_cost = 0;
@@ -337,6 +341,10 @@ ddl() { "$BIN/psql" -X -U "$DDL_ROLE" -d "$DB" -tA -c "select agent_gate.propose
 out=$(ddl "create table loot.t as select vault.peek_par(g) as s from generate_series(1, 10) g")
 equals "an allow_ddl agent's CREATE TABLE AS over a SECURITY DEFINER function keeps no table" "" \
     "$(as_super -c "select to_regclass('loot.t')")"
+contains "  ...refused before it runs, naming the function (0.4.2: its query is walked)" 'vault.peek_par() (security definer)' "$out"
+out=$(ddl "create table loot.t2 as select vault.wrap_par(g) as s from generate_series(1, 10) g")
+equals "the same through a STABLE wrapper the walker passes keeps no table" "" \
+    "$(as_super -c "select to_regclass('loot.t2')")"
 contains "  ...stopped by the hook, naming the function" 'SECURITY DEFINER function vault.peek_par()' "$out"
 absent "  ...and the secret is not in what it receives" "$SECRET" "$out"
 # And what must work: a plain CREATE TABLE AS that the planner would run in parallel.

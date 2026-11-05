@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.4.2 -- 2026-11-05
+
+**Security release.** Three ways for an agent to get SQL past the gate's checks, found by a
+review of 0.4.1. Upgrade with `ALTER EXTENSION pg_agent_gate UPDATE` after installing the new
+library; no object of the schema changes. Each finding has its cases in `tests/audit5.sh` (44
+checks: against 0.4.1, 34 fail -- the other 10 are controls and effects that hold either way;
+against 0.4.2 on PostgreSQL 18.6 and 19beta2, 44 pass).
+
+* **SQL passed to a function as text was not checked.** Some built-ins run a query they receive
+  as text, or build from a name: `query_to_xml()`, `query_to_xmlschema()`,
+  `query_to_xml_and_xmlschema()`, `cursor_to_xml()`, `cursor_to_xmlschema()`, the `table_`,
+  `schema_` and `database_to_xml*()` functions, `ts_stat()` and `ts_rewrite(tsquery, text)`;
+  so do the contrib functions `crosstab()` and `connectby()` (tablefunc), which are `STABLE`
+  and passed, `xpath_table()` (xml2), and dblink's (already refused as volatile). That query ran where none of the gate's checks applied: an ordinary agent
+  could call `set_config()` inside it and read another tenant's rows in the same statement, or
+  call `nextval()` from a read. A call to any of them is now refused (`no_hidden_sql`). The list
+  is derived from the PostgreSQL source -- every SQL-callable function that hands text it did
+  not write to SPI -- and matched by C entry point, not by name (`verify.rs`, `SQL_FROM_TEXT`).
+* **While the agent's SQL runs, some functions do not start, wherever they are reached.** In an
+  agent's session the executor now asks the gate before it runs any function, built-ins
+  included, and the gate stops `set_config()`, a function from the list above, and a user
+  function that the agent can alter or whose `SET` clause sets a parameter an agent may not
+  set. This covers what the statement's own tree does not show: the body of another function,
+  a `CHECK` constraint, a default, a constant folded by the planner.
+* **An `allow_ddl` agent's `CREATE TABLE AS` or `SELECT INTO` over a CTE that writes was not
+  bounded.** The DDL path ran the statement without checking its query, so such a statement
+  deleted rows with no `max_rows`, no write budget and no row count in the record. The query of
+  a `CREATE TABLE AS`, `SELECT INTO` or `CREATE MATERIALIZED VIEW` is now checked like a read
+  before anything runs: a writing CTE (`no_writing_cte`), `set_config()` (`keeps_its_context`),
+  a function from the list above or an opaque function is refused.
+* **A function the agent can alter, or one with a `SET` clause, is no longer vouched for.** A
+  user function marked `STABLE` or `IMMUTABLE` passed `no_opaque_function`, but an `allow_ddl`
+  agent writes that marking itself: a plpgsql function it marked `IMMUTABLE` called
+  `set_config()` and the planner ran it. A user function owned by a role whose privileges the
+  agent has is now refused in that agent's proposals whatever it is marked. A user function
+  whose `SET` clause sets a parameter an agent may not set (`agent_gate.settable` and the
+  built-in allowlist; `search_path` is allowed) is refused too: a DBA's `STABLE` function with
+  `SET app.tenant_id = '2'` read the other tenant's rows for any agent with `EXECUTE` on it,
+  which every role has by default.
+* **Behavior changes to expect.** An agent can no longer call these XML and text-search
+  functions or tablefunc's in a proposal, nor its own functions; an `allow_ddl` agent's
+  functional index or `CHECK` over a function it owns is refused when it runs. A DBA's function
+  with `SET work_mem` or another parameter outside the allowlist is refused for agents;
+  `SET search_path` is not.
+* **README.** The local timings of "What it costs" are gone: `make bench` measures on your
+  machine against the thresholds and the README publishes no number of its own. The suite
+  table and the count are those of 0.4.2. `propose` is documented as running an `allow_ddl`
+  agent's DDL in a rolled-back subtransaction, and the "not covered" notes say to `REVOKE
+  EXECUTE ... FROM PUBLIC`, since not granting is not enough.
+
 ## 0.4.1 -- 2026-10-31
 
 An agent role has no members. The gate knows an agent session by `agent_gate.agent`, which

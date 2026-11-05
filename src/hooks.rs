@@ -543,6 +543,32 @@ unsafe extern "C-unwind" fn object_access(
     sub_id: std::ffi::c_int,
     arg: *mut std::ffi::c_void,
 ) {
+    // THE FLOOR UNDER no_hidden_sql, keeps_its_context AND no_opaque_function (0.4.2). The executor
+    // invokes this hook for every function it is about to run -- built-ins included, unlike
+    // fmgr_hook -- wherever the function sits: the statement, the SQL query_to_xml() parses from a
+    // text, the body of another function, a CHECK constraint, a default, an index expression, the
+    // planner folding an IMMUTABLE call. The checks of verify.rs see only the statement's own tree,
+    // and the review of 2026-11-05 reached set_config() through the rest: query_to_xml() over a
+    // text, a function marked STABLE that calls it, an allow_ddl agent's function in a CHECK of its
+    // own table. So while the agent's SQL runs, in an agent's session, none of these starts.
+    if access == pg_sys::ObjectAccessType::OAT_FUNCTION_EXECUTE
+        && state::proposal_running()
+        && crate::agent_is_set()
+    {
+        if let Some(what) = stopped_function(object_id) {
+            ErrorReport::new(
+                PgSqlErrorCode::ERRCODE_INSUFFICIENT_PRIVILEGE,
+                format!("pg_agent_gate: the proposal reached {what}; it was stopped before it ran"),
+                "pg_agent_gate",
+            )
+            .set_detail(
+                "it was reached where the gate's checks do not look -- SQL given as text, the body of \
+                 another function, a constraint, a default or an index expression -- so its effect would \
+                 be neither verified nor bound to the agent's tenant",
+            )
+            .report(PgLogLevel::ERROR);
+        }
+    }
     if access == pg_sys::ObjectAccessType::OAT_FUNCTION_EXECUTE && fastpath_call() && must_judge() {
         let (schema, name) = function_identity(object_id);
         if !(schema == "agent_gate" && VERBS.contains(&name.as_str())) {
@@ -555,6 +581,79 @@ unsafe extern "C-unwind" fn object_access(
     if let Some(prev) = PREV_OBJECT_ACCESS {
         prev(access, class_id, object_id, sub_id, arg);
     }
+}
+
+/// What the floor stops, named, or None: set_config(); a function that runs SQL from a text
+/// (verify::SQL_FROM_TEXT); and a user function the agent can alter, or whose SET clause sets a
+/// parameter an agent may not set (verify::opaque_function decides the same on the tree). A volatile
+/// user function is not stopped here: one reached through a body is the same kind of call the DBA
+/// placed there, and the floor under SECURITY DEFINER is definer_guard. Read from the syscache:
+/// this runs inside the executor, where SPI is not an option.
+unsafe fn stopped_function(oid: pg_sys::Oid) -> Option<String> {
+    if oid == pg_sys::Oid::from(pg_sys::F_SET_CONFIG) {
+        return Some(
+            "pg_catalog.set_config(), which would change a parameter the agent's row-level policies may read".into(),
+        );
+    }
+    let tup = pg_sys::SearchSysCache1(pg_sys::SysCacheIdentifier::PROCOID as _, pg_sys::Datum::from(oid));
+    if tup.is_null() {
+        return None;
+    }
+    let form = pg_sys::heap_tuple_get_struct::<pg_sys::FormData_pg_proc>(tup);
+    let lang = (*form).prolang.to_u32();
+    let owner = (*form).proowner;
+    let nsp = (*form).pronamespace;
+    let name = CStr::from_ptr((*form).proname.data.as_ptr()).to_string_lossy().into_owned();
+    let user_function = oid.to_u32() >= pg_sys::FirstNormalObjectId;
+    let mut isnull = false;
+    let src = pg_sys::SysCacheGetAttr(
+        pg_sys::SysCacheIdentifier::PROCOID as _,
+        tup,
+        pg_sys::Anum_pg_proc_prosrc as _,
+        &mut isnull,
+    );
+    let prosrc = if isnull {
+        String::new()
+    } else {
+        CStr::from_ptr(pg_sys::text_to_cstring(src.cast_mut_ptr::<pg_sys::text>())).to_string_lossy().into_owned()
+    };
+    let config: Vec<String> = if user_function {
+        let d = pg_sys::SysCacheGetAttr(
+            pg_sys::SysCacheIdentifier::PROCOID as _,
+            tup,
+            pg_sys::Anum_pg_proc_proconfig as _,
+            &mut isnull,
+        );
+        if isnull {
+            Vec::new()
+        } else {
+            Vec::<Option<String>>::from_polymorphic_datum(d, false, pg_sys::TEXTARRAYOID)
+                .unwrap_or_default()
+                .into_iter()
+                .flatten()
+                .collect()
+        }
+    } else {
+        Vec::new()
+    };
+    pg_sys::ReleaseSysCache(tup);
+    let schema = pg_sys::get_namespace_name(nsp);
+    let schema = if schema.is_null() { "?".into() } else { CStr::from_ptr(schema).to_string_lossy().into_owned() };
+    let who = format!("{schema}.{name}()");
+    if crate::verify::runs_sql_from_text(lang, &prosrc) {
+        return Some(format!("{who}, which runs SQL it receives as text where no check of the gate sees it"));
+    }
+    if !user_function {
+        return None;
+    }
+    if pg_sys::has_privs_of_role(pg_sys::GetUserId(), owner) {
+        return Some(format!("{who}, a function this agent can alter, so what it is marked is its own claim"));
+    }
+    config
+        .iter()
+        .map(|c| c.split('=').next().unwrap_or_default().to_string())
+        .find(|p| !crate::verify::set_clause_allowed(p))
+        .map(|p| format!("{who}, whose SET clause sets {p}, which an agent may not set"))
 }
 
 /// A fast-path call: no client query is running (PostgresMain leaves debug_query_string NULL for a
