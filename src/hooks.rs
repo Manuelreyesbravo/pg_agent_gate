@@ -19,6 +19,26 @@
 //! from C). `fmgr_hook` is the floor under verification: while the agent's SQL
 //! runs, no SECURITY DEFINER function starts, however it was reached (0.2.7).
 //!
+//! THE FLOOR: CODE IS JUDGED WHERE IT STARTS (0.4.3). The checks of verify.rs read the
+//! statement's own tree, and the tree is not where all the code is: a domain's CHECK, a table's
+//! CHECK or DEFAULT, an index expression, an aggregate's transition function, a range type's
+//! subtype_diff, a trigger, another function's body. Each review found the next place (0.4.2:
+//! SQL given as text, CHECK and DEFAULT; 0.4.3: domains, aggregates, a range type's support
+//! function reached from the type cache). So the rule does not depend on finding them: while
+//! the agent's SQL runs, every function is judged at the moment it starts, by one function,
+//! `floor()`, on the two paths by which PostgreSQL starts a function --
+//!   * the executor (`object_access`, OAT_FUNCTION_EXECUTE): every expression it evaluates,
+//!     built-ins included, wherever the expression came from;
+//!   * the function manager (`needs_floor` + `definer_guard`): a function C code calls through
+//!     a cached FmgrInfo, with no executor around it -- the type cache, RI checks, triggers,
+//!     index support. PostgreSQL asks `needs_fmgr_hook` when it looks such a function up, and
+//!     calls `fmgr_hook` each time it starts. A built-in is looked up by the fast path that asks
+//!     no hook; on these paths it is chosen by DDL only a superuser runs (operator classes, base
+//!     types), or has a signature no built-in that changes state has (a range's subtype_diff).
+//! What the floor stops is said in `floor()`; whose function it is, is judged against the AGENT'S
+//! role -- the session's login role -- and never the current user, which PostgreSQL switches to a
+//! table's owner for an RI check.
+//!
 //! THE COMMON CASE IS FREE. Once preloaded, these run on every statement of
 //! every session, and almost none belong to an agent. Each hook first asks two
 //! questions that allocate nothing -- is the gate's own SQL running, is the
@@ -47,6 +67,7 @@ static mut PREV_POST_PARSE: pg_sys::post_parse_analyze_hook_type = None;
 static mut PREV_PROCESS_UTILITY: pg_sys::ProcessUtility_hook_type = None;
 static mut PREV_EXECUTOR_START: pg_sys::ExecutorStart_hook_type = None;
 static mut PREV_FMGR: pg_sys::fmgr_hook_type = None;
+static mut PREV_NEEDS_FMGR: pg_sys::needs_fmgr_hook_type = None;
 static mut PREV_OBJECT_ACCESS: pg_sys::object_access_hook_type = None;
 static mut INSTALLED: bool = false;
 
@@ -66,6 +87,8 @@ pub(crate) unsafe fn install() {
     pg_sys::ExecutorStart_hook = Some(executor_start);
     PREV_FMGR = pg_sys::fmgr_hook;
     pg_sys::fmgr_hook = Some(definer_guard);
+    PREV_NEEDS_FMGR = pg_sys::needs_fmgr_hook;
+    pg_sys::needs_fmgr_hook = Some(needs_floor);
     PREV_OBJECT_ACCESS = pg_sys::object_access_hook;
     pg_sys::object_access_hook = Some(object_access);
     INSTALLED = true;
@@ -312,10 +335,56 @@ unsafe extern "C-unwind" fn definer_guard(
             .set_hint("Do not place a SECURITY DEFINER function where an agent's statement reaches it.")
             .report(PgLogLevel::ERROR);
         }
+        // THE FLOOR ON THE FUNCTION MANAGER'S PATH (0.4.3). A function C code calls through a cached
+        // FmgrInfo never meets the executor's hook: an allow_ddl agent's own plpgsql function, set
+        // as a range type's subtype_diff, ran from the type cache while a GiST index was built --
+        // at propose it SET the tenant and raised the other tenant's row into the `executes`
+        // detail; at commit it deleted 20 rows under a max_rows of 2 (review of 0.4.2). Such a
+        // function reaches this hook because needs_floor() asked for it when it was looked up.
+        if crate::agent_is_set() {
+            if let Some(what) = floor((*flinfo).fn_oid) {
+                stop(what);
+            }
+        }
     }
     if let Some(prev) = PREV_FMGR {
         prev(event, flinfo, private);
     }
+}
+
+/// needs_fmgr_hook: asked when a function that is not a fast-path built-in is looked up, for the
+/// executor and for C code alike. In an agent's session, a user function the floor would stop is
+/// routed through fmgr_security_definer, so that definer_guard sees each call however it is made.
+/// The verdict is the function's own (its owner, its language, its SET clause), not the moment's,
+/// because the lookup can be cached long before the call: the type cache keeps it for the session.
+/// Only such functions pay for the detour; every other session pays one load.
+#[pg_guard]
+unsafe extern "C-unwind" fn needs_floor(oid: pg_sys::Oid) -> bool {
+    if let Some(prev) = PREV_NEEDS_FMGR {
+        if prev(oid) {
+            return true;
+        }
+    }
+    crate::agent_is_set()
+        && oid.to_u32() >= pg_sys::FirstNormalObjectId
+        && pg_sys::IsTransactionState()
+        && user_verdict(oid).is_some()
+}
+
+fn stop(what: String) -> ! {
+    ErrorReport::new(
+        PgSqlErrorCode::ERRCODE_INSUFFICIENT_PRIVILEGE,
+        format!("pg_agent_gate: the proposal reached {what}; it was stopped before it ran"),
+        "pg_agent_gate",
+    )
+    .set_detail(
+        "it was reached where the gate's checks do not look -- SQL given as text, the body of another \
+         function, a constraint, a default, an index expression, a type's support function, an \
+         aggregate or a trigger -- so its effect would be neither verified, counted, nor bound to the \
+         agent's tenant",
+    )
+    .report(PgLogLevel::ERROR);
+    unreachable!()
 }
 
 /// `schema.name` of the function if it is SECURITY DEFINER, else None. Read from the syscache: this
@@ -551,22 +620,15 @@ unsafe extern "C-unwind" fn object_access(
     // and the review of 2026-11-05 reached set_config() through the rest: query_to_xml() over a
     // text, a function marked STABLE that calls it, an allow_ddl agent's function in a CHECK of its
     // own table. So while the agent's SQL runs, in an agent's session, none of these starts.
+    // Since 0.4.3 this is one of the floor's two paths (see the module comment and floor()): a
+    // domain's CHECK and an aggregate's transition function come here too, and what C code calls
+    // through a cache comes to definer_guard.
     if access == pg_sys::ObjectAccessType::OAT_FUNCTION_EXECUTE
         && state::proposal_running()
         && crate::agent_is_set()
     {
-        if let Some(what) = stopped_function(object_id) {
-            ErrorReport::new(
-                PgSqlErrorCode::ERRCODE_INSUFFICIENT_PRIVILEGE,
-                format!("pg_agent_gate: the proposal reached {what}; it was stopped before it ran"),
-                "pg_agent_gate",
-            )
-            .set_detail(
-                "it was reached where the gate's checks do not look -- SQL given as text, the body of \
-                 another function, a constraint, a default or an index expression -- so its effect would \
-                 be neither verified nor bound to the agent's tenant",
-            )
-            .report(PgLogLevel::ERROR);
+        if let Some(what) = floor(object_id) {
+            stop(what);
         }
     }
     if access == pg_sys::ObjectAccessType::OAT_FUNCTION_EXECUTE && fastpath_call() && must_judge() {
@@ -583,28 +645,100 @@ unsafe extern "C-unwind" fn object_access(
     }
 }
 
-/// What the floor stops, named, or None: set_config(); a function that runs SQL from a text
-/// (verify::SQL_FROM_TEXT); and a user function the agent can alter, or whose SET clause sets a
-/// parameter an agent may not set (verify::opaque_function decides the same on the tree). A volatile
-/// user function is not stopped here: one reached through a body is the same kind of call the DBA
-/// placed there, and the floor under SECURITY DEFINER is definer_guard. Read from the syscache:
-/// this runs inside the executor, where SPI is not an option.
-unsafe fn stopped_function(oid: pg_sys::Oid) -> Option<String> {
+/// WHAT THE FLOOR STOPS (0.4.3), named, or None. While the agent's SQL runs, a function that starts:
+///   * set_config(), which moves a parameter the agent's row-level policies may read;
+///   * one that runs SQL from a text (verify::SQL_FROM_TEXT), built-in or not;
+///   * a built-in that changes state outside the rows the gate counts (verify::state_change):
+///     a session advisory lock, a large object, setval(), the WAL -- in any statement; and
+///     nextval(), a transaction advisory lock or a notification in a read, which changes nothing;
+///   * a user function the agent can alter (owned by a role whose privileges the AGENT'S role
+///     has) -- what it is marked is the adversary's own claim -- or whose SET clause sets a
+///     parameter that carries the context a policy reads (verify::set_clause_allowed).
+/// A volatile user function of the DBA's is not stopped here: one reached through a body is the
+/// call the DBA placed there, and what it writes is counted (the backstop in verbs.rs, for a DDL
+/// too since 0.4.3); the floor under SECURITY DEFINER is definer_guard. Read from the syscache:
+/// this runs inside the executor and the function manager, where SPI is not an option.
+unsafe fn floor(oid: pg_sys::Oid) -> Option<String> {
     if oid == pg_sys::Oid::from(pg_sys::F_SET_CONFIG) {
         return Some(
             "pg_catalog.set_config(), which would change a parameter the agent's row-level policies may read".into(),
         );
     }
+    if oid.to_u32() >= pg_sys::FirstNormalObjectId {
+        return user_verdict(oid);
+    }
+    match builtin_class(oid) {
+        Builtin::Plain => None,
+        Builtin::SqlFromText => {
+            Some(format!("{}, which runs SQL it receives as text where no check of the gate sees it", function_name(oid)))
+        }
+        Builtin::ChangesState(crate::verify::StateChange::InARead)
+            if matches!(state::running_kind(), state::RUNNING_WRITE | state::RUNNING_DDL) =>
+        {
+            None
+        }
+        Builtin::ChangesState(crate::verify::StateChange::InARead) if state::running_kind() == state::RUNNING_TRIAL => {
+            Some(format!(
+                "{}, which changes state, and proposing changes nothing: what a sequence gives out is not \
+                 rolled back (an identity column numbers the rows of a new column without it)",
+                function_name(oid)
+            ))
+        }
+        Builtin::ChangesState(crate::verify::StateChange::InARead) => Some(format!(
+            "{}, which changes state, and a read changes nothing",
+            function_name(oid)
+        )),
+        Builtin::ChangesState(crate::verify::StateChange::Always) => Some(format!(
+            "{}, which changes state outside the rows the gate counts",
+            function_name(oid)
+        )),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Builtin {
+    Plain,
+    SqlFromText,
+    ChangesState(crate::verify::StateChange),
+}
+
+thread_local! {
+    /// What each built-in is, by OID. A built-in (OID below FirstNormalObjectId) is fixed at initdb,
+    /// so the answer is read once per backend: the executor asks for every function it starts, and
+    /// 0.4.2 read the catalog -- and copied the whole body -- each time (~110x on a read whose
+    /// plpgsql helper re-ran a query per row; review of 0.4.2).
+    static BUILTINS: std::cell::RefCell<std::collections::HashMap<u32, Builtin>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+unsafe fn builtin_class(oid: pg_sys::Oid) -> Builtin {
+    if let Some(b) = BUILTINS.with(|m| m.borrow().get(&oid.to_u32()).copied()) {
+        return b;
+    }
     let tup = pg_sys::SearchSysCache1(pg_sys::SysCacheIdentifier::PROCOID as _, pg_sys::Datum::from(oid));
     if tup.is_null() {
-        return None;
+        return Builtin::Plain;
     }
     let form = pg_sys::heap_tuple_get_struct::<pg_sys::FormData_pg_proc>(tup);
     let lang = (*form).prolang.to_u32();
-    let owner = (*form).proowner;
-    let nsp = (*form).pronamespace;
+    let in_catalog = (*form).pronamespace == pg_sys::Oid::from(pg_sys::PG_CATALOG_NAMESPACE);
     let name = CStr::from_ptr((*form).proname.data.as_ptr()).to_string_lossy().into_owned();
-    let user_function = oid.to_u32() >= pg_sys::FirstNormalObjectId;
+    let from_text = (lang == 12 || lang == 13) && prosrc_runs_sql(tup, lang);
+    pg_sys::ReleaseSysCache(tup);
+    let b = if from_text {
+        Builtin::SqlFromText
+    } else if let Some(c) = in_catalog.then(|| crate::verify::state_change(&name)).flatten() {
+        Builtin::ChangesState(c)
+    } else {
+        Builtin::Plain
+    };
+    BUILTINS.with(|m| m.borrow_mut().insert(oid.to_u32(), b));
+    b
+}
+
+/// The C entry point of an internal or C function, compared with SQL_FROM_TEXT. Only those two
+/// languages name a C symbol in prosrc, so only they are read: a plpgsql body can be megabytes.
+unsafe fn prosrc_runs_sql(tup: pg_sys::HeapTuple, lang: u32) -> bool {
     let mut isnull = false;
     let src = pg_sys::SysCacheGetAttr(
         pg_sys::SysCacheIdentifier::PROCOID as _,
@@ -612,12 +746,40 @@ unsafe fn stopped_function(oid: pg_sys::Oid) -> Option<String> {
         pg_sys::Anum_pg_proc_prosrc as _,
         &mut isnull,
     );
-    let prosrc = if isnull {
-        String::new()
+    if isnull {
+        return false;
+    }
+    let c = pg_sys::text_to_cstring(src.cast_mut_ptr::<pg_sys::text>());
+    let runs = crate::verify::runs_sql_from_text(lang, &CStr::from_ptr(c).to_string_lossy());
+    pg_sys::pfree(c.cast());
+    runs
+}
+
+/// The floor's verdict on a USER function (OID >= FirstNormalObjectId): what it is, not where it
+/// was reached. Used by both paths and by needs_floor, so it allocates nothing on a function it
+/// lets through, except to read a C function's entry point or a SET clause that is there.
+unsafe fn user_verdict(oid: pg_sys::Oid) -> Option<String> {
+    let tup = pg_sys::SearchSysCache1(pg_sys::SysCacheIdentifier::PROCOID as _, pg_sys::Datum::from(oid));
+    if tup.is_null() {
+        return None;
+    }
+    let form = pg_sys::heap_tuple_get_struct::<pg_sys::FormData_pg_proc>(tup);
+    let lang = (*form).prolang.to_u32();
+    let owner = (*form).proowner;
+    let from_text = (lang == 12 || lang == 13) && prosrc_runs_sql(tup, lang);
+    // THE AGENT'S ROLE, not GetUserId() (0.4.3). An RI check runs as the referenced table's owner
+    // (SetUserIdAndSecContext), and 0.4.2 asked whether THAT role could alter the function: a
+    // superuser owner can alter every function, so citext's equality operator was "the agent's"
+    // and every write to a table with a citext foreign key was refused (review of 0.4.2). The
+    // agent is the session's login role: an agent session can SET neither ROLE nor SESSION
+    // AUTHORIZATION (the allowlist), and an agent role has no members (0.4.1).
+    let alterable = pg_sys::has_privs_of_role(pg_sys::GetSessionUserId(), owner);
+    let bad_set = if from_text || alterable
+        || pg_sys::heap_attisnull(tup, pg_sys::Anum_pg_proc_proconfig as _, std::ptr::null_mut())
+    {
+        None
     } else {
-        CStr::from_ptr(pg_sys::text_to_cstring(src.cast_mut_ptr::<pg_sys::text>())).to_string_lossy().into_owned()
-    };
-    let config: Vec<String> = if user_function {
+        let mut isnull = false;
         let d = pg_sys::SysCacheGetAttr(
             pg_sys::SysCacheIdentifier::PROCOID as _,
             tup,
@@ -625,35 +787,30 @@ unsafe fn stopped_function(oid: pg_sys::Oid) -> Option<String> {
             &mut isnull,
         );
         if isnull {
-            Vec::new()
+            None
         } else {
             Vec::<Option<String>>::from_polymorphic_datum(d, false, pg_sys::TEXTARRAYOID)
                 .unwrap_or_default()
                 .into_iter()
                 .flatten()
-                .collect()
+                .map(|c| c.split('=').next().unwrap_or_default().to_string())
+                .find(|p| !crate::verify::set_clause_allowed(p))
         }
-    } else {
-        Vec::new()
     };
     pg_sys::ReleaseSysCache(tup);
-    let schema = pg_sys::get_namespace_name(nsp);
-    let schema = if schema.is_null() { "?".into() } else { CStr::from_ptr(schema).to_string_lossy().into_owned() };
-    let who = format!("{schema}.{name}()");
-    if crate::verify::runs_sql_from_text(lang, &prosrc) {
-        return Some(format!("{who}, which runs SQL it receives as text where no check of the gate sees it"));
+    if from_text {
+        return Some(format!("{}, which runs SQL it receives as text where no check of the gate sees it", function_name(oid)));
     }
-    if !user_function {
-        return None;
+    if alterable {
+        return Some(format!("{}, a function this agent can alter, so what it is marked is its own claim", function_name(oid)));
     }
-    if pg_sys::has_privs_of_role(pg_sys::GetUserId(), owner) {
-        return Some(format!("{who}, a function this agent can alter, so what it is marked is its own claim"));
-    }
-    config
-        .iter()
-        .map(|c| c.split('=').next().unwrap_or_default().to_string())
-        .find(|p| !crate::verify::set_clause_allowed(p))
-        .map(|p| format!("{who}, whose SET clause sets {p}, which an agent may not set"))
+    bad_set.map(|p| format!("{}, whose SET clause sets {p}, which carries the context a policy may read", function_name(oid)))
+}
+
+/// `schema.name()` of a function, for a refusal.
+unsafe fn function_name(oid: pg_sys::Oid) -> String {
+    let (schema, name) = function_identity(oid);
+    format!("{schema}.{name}()")
 }
 
 /// A fast-path call: no client query is running (PostgresMain leaves debug_query_string NULL for a

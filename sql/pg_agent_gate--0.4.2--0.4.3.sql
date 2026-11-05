@@ -1,0 +1,4 @@
+-- 0.4.2 -> 0.4.3
+--
+-- For an installation of the unreleased 0.4.2 (built from the repository). Library only; no
+-- object of the extension changes. See pg_agent_gate--0.4.1--0.4.3.sql and CHANGELOG.md.

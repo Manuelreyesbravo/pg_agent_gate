@@ -1,0 +1,24 @@
+-- 0.4.1 -> 0.4.3
+--
+-- Library only; no object of the extension changes. The behaviour the catalog version must
+-- track lives in the loaded library (verify.rs, hooks.rs, verbs.rs), and this script exists so that
+-- the version the catalog reports is the version installed. A security release (0.4.2 was never
+-- released; its fixes ship here): what changed is in CHANGELOG.md, and each finding has its case
+-- in tests/audit5.sh or tests/audit6.sh.
+--
+--   * Code is judged where it starts. While the agent's SQL runs, every function is judged when
+--     the executor or the function manager starts it, wherever it was reached -- another
+--     function's body, a CHECK, a DEFAULT, a domain's CHECK, an aggregate's transition function,
+--     a range type's support function called from the type cache, a trigger. It stops
+--     set_config(); a function that runs SQL given to it as text (query_to_xml() and the rest of
+--     the *_to_xml() family, ts_stat(), ts_rewrite(), tablefunc's crosstab() and connectby(),
+--     dblink); a built-in that changes state outside the rows the gate counts (in a read, also
+--     nextval()); a user function the agent's role can alter; and one whose SET clause moves the
+--     context a policy reads.
+--   * A user function the agent can alter, or with such a SET clause, is opaque
+--     (no_opaque_function), whatever its volatility says; an aggregate is judged by the
+--     functions it runs. A write or DDL that creates large objects, takes a session advisory lock
+--     or calls setval() is refused (changes_only_rows).
+--   * The query of an allow_ddl agent's CREATE TABLE AS, SELECT INTO or CREATE MATERIALIZED
+--     VIEW is checked like a read. A DDL's trial at propose runs as execution, judged as a read;
+--     what a DDL changes in tables that existed before it counts against max_rows and the budget.

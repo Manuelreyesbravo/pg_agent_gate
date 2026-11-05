@@ -158,6 +158,41 @@ pub(crate) fn proposal() -> Guard {
     enter(&PROPOSAL)
 }
 
+/// WHAT THE AGENT'S SQL IS, WHILE IT RUNS (0.4.3). The floor under the checks (hooks.rs) stops a
+/// built-in that changes state outside rows by what the statement is: nextval() is how an INSERT
+/// numbers its rows, and the same call in a read changes what the record says did not change.
+/// 0 = not known yet, judged as a read (the strictest); then RUNNING_READ, _WRITE or _DDL.
+static KIND: AtomicU32 = AtomicU32::new(0);
+pub(crate) const RUNNING_READ: u32 = 1;
+pub(crate) const RUNNING_WRITE: u32 = 2;
+pub(crate) const RUNNING_DDL: u32 = 3;
+/// The run of an allow_ddl agent's DDL at PROPOSE, rolled back: proposing changes nothing, so the
+/// floor judges it as a read -- a sequence does not roll back with it (review of 0.4.2: a DEFAULT
+/// nextval() over 10 rows advanced a DBA's sequence by proposing alone).
+pub(crate) const RUNNING_TRIAL: u32 = 4;
+
+pub(crate) fn running_kind() -> u32 {
+    KIND.load(SeqCst)
+}
+
+/// Restores, when dropped, the kind that was running when it was taken: verify() runs again
+/// inside execute(), and each sets the kind of what it runs.
+pub(crate) struct KindScope(u32);
+
+impl Drop for KindScope {
+    fn drop(&mut self) {
+        KIND.store(self.0, SeqCst);
+    }
+}
+
+pub(crate) fn kind_scope() -> KindScope {
+    KindScope(KIND.load(SeqCst))
+}
+
+pub(crate) fn set_running_kind(kind: u32) {
+    KIND.store(kind, SeqCst);
+}
+
 pub(crate) fn checking_assertions() -> Guard {
     enter(&CHECKING)
 }
@@ -187,6 +222,7 @@ fn reset_counters() {
     TRUSTED.store(0, SeqCst);
     PROPOSAL.store(0, SeqCst);
     CHECKING.store(0, SeqCst);
+    KIND.store(0, SeqCst);
 }
 
 fn forget_transaction() {

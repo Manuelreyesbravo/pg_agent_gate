@@ -1,54 +1,122 @@
 # Changelog
 
-## 0.4.2 -- 2026-11-05
+## 0.4.3 -- 2026-11-05
 
-**Security release.** Three ways for an agent to get SQL past the gate's checks, found by a
-review of 0.4.1. Upgrade with `ALTER EXTENSION pg_agent_gate UPDATE` after installing the new
-library; no object of the schema changes. Each finding has its cases in `tests/audit5.sh` (44
-checks: against 0.4.1, 34 fail -- the other 10 are controls and effects that hold either way;
-against 0.4.2 on PostgreSQL 18.6 and 19beta2, 44 pass).
+**Security release.** 0.4.2 was never released: its fixes ship here, together with what a review
+of 0.4.2 found through and around them. Upgrade with `ALTER EXTENSION pg_agent_gate UPDATE` after
+installing the new library; no object of the schema changes. The 0.4.2 findings have their cases in
+`tests/audit5.sh` (44 checks: against 0.4.1, 34 fail -- the other 10 are controls and effects that
+hold either way), those of the review of 0.4.2 in `tests/audit6.sh` (44 checks: against 0.4.2 on
+PostgreSQL 18.6, 31 fail -- the other 13 are controls; on 19beta2, 29, as the citext case below
+does not reproduce there). Against 0.4.3, on 18.6 and 19beta2, the suites of `make verify`: 434
+passed, 0 failed on both (the pgrx unit tests could not run in this environment).
 
-* **SQL passed to a function as text was not checked.** Some built-ins run a query they receive
-  as text, or build from a name: `query_to_xml()`, `query_to_xmlschema()`,
+**The principle: code is judged where it starts.** Every finding of both reviews was code the
+statement's own tree does not show -- SQL given to a function as text, another function's body, a
+`CHECK` or `DEFAULT`, a domain's `CHECK`, an aggregate's transition function, a range type's
+`subtype_diff` called from the type cache -- running with no judgment, judged against the wrong
+role, or changing rows no one counted. Chasing the next place is a list that is never complete. So while
+the agent's SQL runs, every function is judged at the moment it starts, by one rule (`floor()` in
+`hooks.rs`), on both paths by which PostgreSQL starts a function: the executor's
+(`OAT_FUNCTION_EXECUTE`, built-ins included, wherever the expression came from) and the function
+manager's (`needs_fmgr_hook` + `fmgr_hook`: C code calling through a cached function -- the type
+cache, RI checks, triggers, index support). Whose function it is, is judged against the agent's own
+role. And what such code changes is counted: a DDL's effect on rows is accounted like a write's.
+
+What the rule stops, while the agent's SQL runs, wherever reached:
+
+* **`set_config()`**, which moves the parameter a row-level policy reads (0.4.2).
+* **A function that runs SQL it receives as text.** `query_to_xml()`, `query_to_xmlschema()`,
   `query_to_xml_and_xmlschema()`, `cursor_to_xml()`, `cursor_to_xmlschema()`, the `table_`,
-  `schema_` and `database_to_xml*()` functions, `ts_stat()` and `ts_rewrite(tsquery, text)`;
-  so do the contrib functions `crosstab()` and `connectby()` (tablefunc), which are `STABLE`
-  and passed, `xpath_table()` (xml2), and dblink's (already refused as volatile). That query ran where none of the gate's checks applied: an ordinary agent
-  could call `set_config()` inside it and read another tenant's rows in the same statement, or
-  call `nextval()` from a read. A call to any of them is now refused (`no_hidden_sql`). The list
-  is derived from the PostgreSQL source -- every SQL-callable function that hands text it did
-  not write to SPI -- and matched by C entry point, not by name (`verify.rs`, `SQL_FROM_TEXT`).
-* **While the agent's SQL runs, some functions do not start, wherever they are reached.** In an
-  agent's session the executor now asks the gate before it runs any function, built-ins
-  included, and the gate stops `set_config()`, a function from the list above, and a user
-  function that the agent can alter or whose `SET` clause sets a parameter an agent may not
-  set. This covers what the statement's own tree does not show: the body of another function,
-  a `CHECK` constraint, a default, a constant folded by the planner.
+  `schema_` and `database_to_xml*()` functions, `ts_stat()` and `ts_rewrite(tsquery, text)`; the
+  contrib functions `crosstab()` and `connectby()` (tablefunc), which are `STABLE` and passed,
+  `xpath_table()` (xml2), and dblink's. That query ran where none of the gate's checks applied: an
+  ordinary agent called `set_config()` inside it and read another tenant's rows in the same
+  statement, or `nextval()` from a read. A call to any of them is refused (`no_hidden_sql`), and
+  stopped wherever reached. The list is derived from the PostgreSQL source -- every SQL-callable
+  function that hands text it did not write to SPI -- and matched by C entry point, not by name
+  (`verify.rs`, `SQL_FROM_TEXT`) (0.4.2).
+* **A user function the agent can alter** -- owned by a role whose privileges the agent's role has.
+  Its `STABLE` or `IMMUTABLE` is the adversary's own claim: an `allow_ddl` agent marked a plpgsql
+  function that calls `set_config()` `IMMUTABLE` and the planner ran it (0.4.2). In 0.4.3 the same
+  holds on the function manager's path: the agent's own plpgsql function, set as a range type's
+  `subtype_diff`, ran from the type cache during a GiST build -- at propose it ran `SET
+  app.tenant_id` and raised the other tenant's row into the `executes` detail; at commit it deleted
+  20 rows under a `max_rows` of 2 and advanced a sequence 13,704 times, recorded as a DDL of 0 rows.
+* **A built-in that changes state outside the rows the gate counts.** A session advisory lock, a
+  large object, `setval()`, the WAL: in any statement. `nextval()`, transaction advisory locks and
+  `pg_notify()`: in a read (an `INSERT`'s default numbers its rows with `nextval()`, and a DBA's
+  trigger may notify on a write that is kept). Up to 0.4.2
+  this was decided on the statement's tree only, and for reads only: a domain's `CHECK` ran
+  `nextval()` from a read -- also for an ordinary agent through `pg_input_is_valid(text,
+  'domain')` --, took a session advisory lock that outlived the read, and created large objects
+  from a write; `lo_from_bytea()` in a write's subquery created 50 of them on a 1-row `UPDATE`. Now
+  a write or a DDL that calls one is refused (`changes_only_rows`), and the floor stops it wherever
+  it sits.
+* **A user function whose `SET` clause moves the context a policy reads**: a custom parameter
+  (`app.tenant_id`, `agent_gate.*`), `role`, `session_authorization`, `row_security`,
+  `session_replication_role`. A DBA's `STABLE` function with `SET app.tenant_id = '2'` read the
+  other tenant's rows for any agent (0.4.2).
+
+And around it:
+
+* **An aggregate is the functions it runs.** `pg_proc` marks every aggregate `IMMUTABLE`, so a DBA's
+  aggregate over a volatile transition function passed `no_opaque_function` and advanced a sequence
+  25 times from a read. Its transition, final, combine, serial and moving-aggregate functions are
+  now judged as if the statement called them.
+* **A DDL's effect on rows is counted.** An `allow_ddl` agent's `ALTER TABLE ... ADD COLUMN ...
+  DEFAULT` or `ADD CONSTRAINT ... CHECK` over a DBA's volatile function deleted 20 rows of another
+  table under a `max_rows` of 2, recorded as 0 rows and charged to no budget. What a DDL changes in
+  tables that existed before it -- from a default, a constraint, an index expression or a function
+  it ran -- is now counted like a write: against `max_rows`, the write budget, and the record's
+  `rows_moved`. Rows of the relations the DDL itself creates are its own.
+* **The DDL trial at propose is execution.** It ran outside the executing window, so a utility
+  statement a function reached (that `SET app.tenant_id`) was not refused as nested; and so did the
+  `EXPLAIN`, where the planner runs what it folds. Both now run as the commit runs: in the window,
+  with only the statement itself allowed as a utility, under the floor. Proposing changes nothing: a
+  DDL's trial is judged as a read, so a `DEFAULT nextval()` over a table's rows -- which advanced a
+  DBA's sequence by proposing alone -- is refused at propose; an identity column numbers the rows.
+  Since the agent's SQL can no longer move its context or run as another role, what it raises is
+  what its own rights and tenant can read, and the check's detail can be returned.
 * **An `allow_ddl` agent's `CREATE TABLE AS` or `SELECT INTO` over a CTE that writes was not
-  bounded.** The DDL path ran the statement without checking its query, so such a statement
-  deleted rows with no `max_rows`, no write budget and no row count in the record. The query of
-  a `CREATE TABLE AS`, `SELECT INTO` or `CREATE MATERIALIZED VIEW` is now checked like a read
-  before anything runs: a writing CTE (`no_writing_cte`), `set_config()` (`keeps_its_context`),
-  a function from the list above or an opaque function is refused.
-* **A function the agent can alter, or one with a `SET` clause, is no longer vouched for.** A
-  user function marked `STABLE` or `IMMUTABLE` passed `no_opaque_function`, but an `allow_ddl`
-  agent writes that marking itself: a plpgsql function it marked `IMMUTABLE` called
-  `set_config()` and the planner ran it. A user function owned by a role whose privileges the
-  agent has is now refused in that agent's proposals whatever it is marked. A user function
-  whose `SET` clause sets a parameter an agent may not set (`agent_gate.settable` and the
-  built-in allowlist; `search_path` is allowed) is refused too: a DBA's `STABLE` function with
-  `SET app.tenant_id = '2'` read the other tenant's rows for any agent with `EXECUTE` on it,
-  which every role has by default.
-* **Behavior changes to expect.** An agent can no longer call these XML and text-search
-  functions or tablefunc's in a proposal, nor its own functions; an `allow_ddl` agent's
-  functional index or `CHECK` over a function it owns is refused when it runs. A DBA's function
-  with `SET work_mem` or another parameter outside the allowlist is refused for agents;
-  `SET search_path` is not.
-* **README.** The local timings of "What it costs" are gone: `make bench` measures on your
-  machine against the thresholds and the README publishes no number of its own. The suite
-  table and the count are those of 0.4.2. `propose` is documented as running an `allow_ddl`
-  agent's DDL in a rolled-back subtransaction, and the "not covered" notes say to `REVOKE
-  EXECUTE ... FROM PUBLIC`, since not granting is not enough.
+  bounded** (0.4.2). The query of a `CREATE TABLE AS`, `SELECT INTO` or `CREATE MATERIALIZED VIEW`
+  is checked like a read before anything runs: a writing CTE (`no_writing_cte`), `set_config()`
+  (`keeps_its_context`), a function from the list above or an opaque function is refused.
+
+Regressions of the unreleased 0.4.2, fixed before release:
+
+* **Writes checked by a foreign key over an extension's type were refused.** An RI check runs as the
+  referenced table's owner, and 0.4.2 asked whether THAT role could alter the function: a superuser
+  owner can alter every function, so `citext`'s equality operator counted as the agent's and every
+  write to a table with a `citext` foreign key was aborted (PostgreSQL 18; 19beta2 checks the key
+  another way). The question is now asked of the agent's role -- the session's login role, which an
+  agent session can neither `SET ROLE` nor `SET SESSION AUTHORIZATION` away from.
+* **A DBA's function with a harmless `SET` clause was refused**, and with it every read of a table
+  whose policy function pinned `plan_cache_mode`: 0.4.2 allowed only what an agent may set itself.
+  `work_mem`, `jit`, `plan_cache_mode`, `search_path` -- how a body runs -- pass; what carries the
+  context a policy reads does not.
+* **The floor read the whole function body each time a function started** -- ~110x on a read whose
+  plpgsql helper re-ran a query per row (a 960 kB body, 5,000 rows: 3,741-4,001 ms on 18.6 and
+  4,522-4,958 ms on 19beta2, against 45-55 ms and 39-51 ms now; the same query by a superuser
+  directly, 20-40 ms). A built-in's verdict is read once per backend, a user function's from the
+  syscache without its body, and only a C function's entry point is read at all.
+
+**Behavior changes to expect.** An agent can no longer call the XML and text-search functions above
+or tablefunc's in a proposal, nor its own functions -- also not as a range type's support function,
+a trigger or an aggregate's transition function; an `allow_ddl` agent's functional index or `CHECK`
+over a function it owns is refused when it runs. A write or DDL that creates large objects, takes a
+session advisory lock or calls `setval()` is refused; a DDL whose default or constraint changes more
+rows of existing tables than `max_rows` is aborted and counts against the budget; proposing a DDL
+that would advance a sequence over a table's rows is refused. In an agent's session, its own SQL
+functions are not inlined by the planner (PostgreSQL does not inline a function the function
+manager's hook asks to see).
+
+**README.** The local timings of "What it costs" are gone: `make bench` measures on your machine
+against the thresholds and the README publishes no number of its own. The suite table and the count
+are those of 0.4.3. `propose` is documented as running an `allow_ddl` agent's DDL in a rolled-back
+subtransaction under the floor, and "What it does not cover" says what the floor leaves: a DBA's
+function marked `STABLE` or `IMMUTABLE` that writes, an `allow_ddl` agent's rewrite of its own tables,
+code an agent plants that other roles later run, and why `REVOKE EXECUTE ... FROM PUBLIC` is needed.
 
 ## 0.4.1 -- 2026-10-31
 

@@ -497,6 +497,49 @@ fn xact_tuples() -> Option<i64> {
     .flatten()
 }
 
+/// THE SAME BACKSTOP FOR A DDL (0.4.3), per relation. A schema change runs code over rows -- a
+/// DEFAULT or a CHECK added to a table that has some, an index expression, a range type's
+/// support function in an index build -- and up to 0.4.2 nothing it changed was counted: an
+/// allow_ddl agent's ALTER TABLE ... DEFAULT over a DBA's volatile function deleted 20 rows of
+/// another table under a max_rows of 2, recorded as a ddl of 0 rows (review of 0.4.2). Rows of the
+/// relations the DDL itself creates are its own (a CREATE TABLE AS fills one, a table rewrite
+/// writes a new heap), so the count is taken over the relations that existed before it: their
+/// counters, keyed by OID, before the statement; their sum since, after it.
+fn xact_tuples_by_relation() -> Option<JsonB> {
+    let _running = state::proposal();
+    crate::exec::get_one_prepared::<JsonB>(
+        "select coalesce(pg_catalog.jsonb_object_agg(c.oid::text, \
+                           pg_catalog.pg_stat_get_xact_tuples_inserted(c.oid) \
+                         + pg_catalog.pg_stat_get_xact_tuples_updated(c.oid) \
+                         + pg_catalog.pg_stat_get_xact_tuples_deleted(c.oid)), '{}'::jsonb) \
+           from pg_catalog.pg_class c \
+          where c.relkind in ('r', 'm', 'p') \
+            and c.relnamespace not in (select n.oid from pg_catalog.pg_namespace n \
+                                        where n.nspname in ('pg_catalog', 'information_schema', \
+                                                            'agent_gate', 'agent_gate_internal'))",
+        &[],
+        &[],
+    )
+    .ok()
+    .flatten()
+}
+
+fn xact_tuples_since(before: &JsonB) -> Option<i64> {
+    let _running = state::proposal();
+    crate::exec::get_one_prepared::<i64>(
+        "select coalesce(sum(pg_catalog.pg_stat_get_xact_tuples_inserted(c.oid) \
+                           + pg_catalog.pg_stat_get_xact_tuples_updated(c.oid) \
+                           + pg_catalog.pg_stat_get_xact_tuples_deleted(c.oid) \
+                           - b.value::bigint), 0)::bigint \
+           from pg_catalog.pg_class c \
+           join pg_catalog.jsonb_each_text($1) b on b.key = c.oid::text",
+        &[PgOid::BuiltIn(PgBuiltInOids::JSONBOID)],
+        &[JsonB(before.0.clone()).into()],
+    )
+    .ok()
+    .flatten()
+}
+
 fn execute(proposal: i64, mode: Mode) -> Value {
     let started = Instant::now();
     let who = identity();
@@ -638,7 +681,8 @@ fn execute(proposal: i64, mode: Mode) -> Value {
     // released when a guard aborts it. dry_run reads without the lock and reports the same
     // verdict. Only agents have a budget; a human using the gate on purpose has none.
     // Ok(Some((budget, used))), Ok(None) = no budget applies, Err(()) = it could not be read.
-    let budget: Result<Option<(i64, i64)>, ()> = if kind == Kind::Write && who.is_agent {
+    // A DDL's budget too (0.4.3): what it changes in tables that existed before it is counted.
+    let budget: Result<Option<(i64, i64)>, ()> = if kind != Kind::Read && who.is_agent {
         let q = "select agent_gate_internal._budget($1, $2)";
         let found: Option<JsonB> = if mode == Mode::Commit {
             call_internal(q, &[who.agent.clone().into(), true.into()])
@@ -655,7 +699,11 @@ fn execute(proposal: i64, mode: Mode) -> Value {
 
     let result = in_subxact(
         || {
+            // Whatever runs from here is judged by the floor as this kind of statement.
+            let _kind = state::kind_scope();
+            state::set_running_kind(verify::running(kind));
             let tup_before = xact_tuples();   // the backstop's starting point, inside this subxact
+            let ddl_before = if kind == Kind::Ddl { xact_tuples_by_relation() } else { None };
             // Hold the executing window across BOTH the verified statement and the gate's own SET
             // CONSTRAINTS below (where deferred constraint triggers fire): any utility a trigger,
             // constraint or function reaches is nested and refused, except the one the gate runs
@@ -703,6 +751,27 @@ fn execute(proposal: i64, mode: Mode) -> Value {
                 if kind == Kind::Write {
                     moved_total = Some(rows.processed as i64);
                 }
+                if kind == Kind::Ddl {
+                    match ddl_before.as_ref().and_then(xact_tuples_since) {
+                        Some(moved) => {
+                            moved_total = Some(moved);
+                            if moved > max_rows {
+                                abort = Some(format!(
+                                    "it changed {moved} rows of tables that existed before it -- from a default, \
+                                     a constraint, an index expression or a function it ran -- more than this \
+                                     agent may change in one statement"
+                                ));
+                            }
+                        }
+                        None => {
+                            abort = Some(
+                                "the row-count backstop could not read the transaction's tuple statistics, \
+                                 so this DDL cannot be proven to change no more rows than this agent may"
+                                    .into(),
+                            );
+                        }
+                    }
+                }
                 if kind == Kind::Write && rows.processed as i64 > max_rows {
                     // No number in the refusal (0.4.0): "may touch at most N" told a looping model
                     // the size of the slice to cut. The agent can still ask discover() for its limit.
@@ -739,7 +808,7 @@ fn execute(proposal: i64, mode: Mode) -> Value {
                 }
                 // The budget, against the rows this write really moved. The message names no
                 // number: "may touch at most N" is what the model read to cut its slices.
-                if abort.is_none() && kind == Kind::Write {
+                if abort.is_none() && kind != Kind::Read {
                     match budget {
                         Ok(Some((limit, used))) if used + moved_total.unwrap_or(0) > limit => {
                             abort = Some(

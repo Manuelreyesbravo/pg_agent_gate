@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# The public-readiness review of 0.4.1 (2026-11-05): the findings closed in 0.4.2, each with its
+# The public-readiness review of 0.4.1 (2026-11-05): the findings closed in 0.4.2 (unreleased; they
+# ship in 0.4.3, where tests/audit6.sh covers the review of 0.4.2), each with its
 # tooth and its control. Every verdict is read from the effect -- the other tenant's row, the
 # sequence, the table -- and not from the gate's own answer alone.
 #

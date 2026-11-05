@@ -31,6 +31,15 @@ pub(crate) enum Kind {
     Ddl,
 }
 
+/// The kind of a statement as the floor reads it (state::running_kind).
+pub(crate) fn running(kind: Kind) -> u32 {
+    match kind {
+        Kind::Read => state::RUNNING_READ,
+        Kind::Write => state::RUNNING_WRITE,
+        Kind::Ddl => state::RUNNING_DDL,
+    }
+}
+
 impl Kind {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
@@ -193,6 +202,10 @@ pub(crate) fn verify(
         return v;
     }
     v.check("kind_allowed", true, format!("{} statement ({tag:?})", kind.as_str()));
+    // From here on, whatever runs is judged by the floor as this kind of statement (hooks::floor),
+    // and the kind that ran before is back when verify returns.
+    let _kind = state::kind_scope();
+    state::set_running_kind(running(kind));
 
     // 3. The analyzed and rewritten tree, BEFORE anything is planned. The order is the fix of
     // 0.2.6: up to 0.2.5 the EXPLAIN came first, and the planner constant-folds an IMMUTABLE call
@@ -239,6 +252,7 @@ pub(crate) fn verify(
         if tree.modifies && kind == Kind::Read {
             // A SELECT whose CTE writes is a write.
             kind = Kind::Write;
+            state::set_running_kind(running(kind));
         }
         if tree.writing_cte {
             v.kind = Some(kind);
@@ -376,43 +390,80 @@ pub(crate) fn verify(
         // A READ CHANGES NOTHING (0.2.14, external audit GATE-11). Built-ins are vetted above
         // because they do what their documentation says -- and some say they change state: a read
         // that called nextval() advanced a sequence 100,000 times and the record said outcome=read,
-        // nothing changed. Those are refused in a read; in a write they are the write's business
-        // (an INSERT's default calls nextval).
-        if kind == Kind::Read {
-            match stateful_builtin(&tree.funcs) {
-                Err(why) => {
-                    v.kind = Some(kind);
-                    v.check(
-                        "read_changes_nothing",
-                        false,
-                        format!("the catalog lookup for the statement's functions failed: {why}"),
-                    );
-                    return v;
-                }
-                Ok(Some(f)) => {
-                    v.kind = Some(kind);
-                    v.check(
-                        "read_changes_nothing",
-                        false,
-                        format!("a read calls {f}, which changes state outside the rows it returns, \
-                                 and the record would say nothing changed"),
-                    );
-                    return v;
-                }
-                Ok(None) => v.check(
-                    "read_changes_nothing",
-                    true,
-                    "no built-in that changes state (sequences, advisory locks, large objects, \
-                     notifications, the WAL) is called",
-                ),
+        // nothing changed. Those are refused in a read. In a write or a DDL, nextval() is the
+        // write's business (an INSERT's default calls it), but what changes state outside the rows
+        // the gate counts -- a large object, a session lock, setval() -- is refused there too
+        // (0.4.3). The floor (hooks::floor) stops the same list wherever it is reached.
+        let (name, read) = if kind == Kind::Read {
+            ("read_changes_nothing", true)
+        } else {
+            ("changes_only_rows", false)
+        };
+        match stateful_builtin(&tree.funcs, kind) {
+            Err(why) => {
+                v.kind = Some(kind);
+                v.check(name, false, format!("the catalog lookup for the statement's functions failed: {why}"));
+                return v;
             }
+            Ok(Some(f)) if read => {
+                v.kind = Some(kind);
+                v.check(
+                    name,
+                    false,
+                    format!("a read calls {f}, which changes state outside the rows it returns, \
+                             and the record would say nothing changed"),
+                );
+                return v;
+            }
+            Ok(Some(f)) => {
+                v.kind = Some(kind);
+                v.check(
+                    name,
+                    false,
+                    format!("the statement calls {f}, which changes state outside the rows max_rows \
+                             and the write budget count"),
+                );
+                return v;
+            }
+            Ok(None) if read => v.check(
+                name,
+                true,
+                "no built-in that changes state (sequences, advisory locks, large objects, \
+                 notifications, the WAL) is called",
+            ),
+            Ok(None) => v.check(
+                name,
+                true,
+                "no built-in that changes state outside rows (session locks, large objects, \
+                 setval, the WAL) is called",
+            ),
         }
         if kind != Kind::Ddl {
             tree_relations = tree.relations;
         }
     }
     if kind == Kind::Ddl {
-        match in_subxact(|| run_statement(&v.statement), |_| false) {
+        // THE TRIAL IS EXECUTION (0.4.3). The DDL runs here, at propose, with everything it reaches:
+        // a default over the table's rows, a CHECK, an index expression, a range type's support
+        // function. Up to 0.4.2 it ran outside the executing window, so a utility one of those
+        // reached was not refused as nested: an allow_ddl agent's subtype_diff ran `SET
+        // app.tenant_id` from a GiST build and raised the other tenant's row into this check's
+        // detail (review of 0.4.2). It runs as the commit runs it now: in the window, with the
+        // statement itself the one utility allowed, under the floor. So what it raises is what
+        // the agent's own rights and tenant can read, and the detail can be returned.
+        // At propose (`estimate`) the run is a trial that is rolled back, and the floor judges it as
+        // such: nextval() is stopped there as in a read. Re-verified at commit, it runs as a DDL.
+        let as_kind = if estimate { state::RUNNING_TRIAL } else { state::RUNNING_DDL };
+        match in_subxact(
+            || {
+                let _kind = state::kind_scope();
+                state::set_running_kind(as_kind);
+                let _executing = state::executing_verified();
+                state::allow_gate_utility();
+                run_statement(&v.statement)
+            },
+            |_| false,
+        ) {
             Ok(()) => v.check(
                 "executes",
                 true,
@@ -438,11 +489,21 @@ pub(crate) fn verify(
             format!("EXPLAIN (FORMAT JSON) {}", v.statement)
         };
         let args = text_args(params);
-        match in_subxact(|| explain_plan(&explain, &args), |_| false) {
+        // The planner folds an IMMUTABLE call and estimates a STABLE one by running it: the EXPLAIN
+        // is execution too (0.4.3), in the executing window with only itself as the utility allowed.
+        match in_subxact(
+            || {
+                let _executing = state::executing_verified();
+                state::allow_gate_utility();
+                explain_plan(&explain, &args)
+            },
+            |_| false,
+        ) {
             Ok(plan) => {
                 let (rows, modifies, plan_relations) = read_plan(&plan);
                 if modifies && kind == Kind::Read {
                     kind = Kind::Write;
+                    state::set_running_kind(running(kind));
                 }
                 // The estimate comes from statistics gathered over the whole table, beneath
                 // row-level security and beneath a view: an agent that sees none of a value's rows
@@ -604,12 +665,90 @@ pub(crate) fn runs_sql_from_text(prolang: u32, prosrc: &str) -> bool {
     (prolang == 12 || prolang == 13) && (SQL_FROM_TEXT.contains(&prosrc) || prosrc.starts_with("dblink"))
 }
 
-/// A parameter a function's SET clause may set and still be vouched for: one an agent may set
-/// itself, or search_path, which only names where the function's own body looks (the usual
-/// hardening of a function, and the gate's own functions carry it).
+/// Parameters that carry the context a row-level policy reads, besides the custom ones: who is
+/// acting, and whether policies (and triggers) apply at all.
+pub(crate) const CONTEXT_PARAMETERS: &[&str] = &["role", "session_authorization", "row_security", "session_replication_role"];
+
+/// A parameter a function's SET clause may set and still be vouched for (0.4.3). What a SET clause
+/// must not do is move the context the agent's policies read while the body runs: a custom
+/// parameter (`app.tenant_id`, `agent_gate.*`: the ordinary way to separate tenants, and no list
+/// can name the ones an application invents) or one of CONTEXT_PARAMETERS. Everything else a
+/// built-in parameter sets is how the body runs -- work_mem, jit, plan_cache_mode, search_path --
+/// and 0.4.2, which allowed only what an agent may set itself, refused every read of a table whose
+/// policy function pinned plan_cache_mode (review of 0.4.2). An agent's own allowlist still passes.
 pub(crate) fn set_clause_allowed(name: &str) -> bool {
     let name = name.trim().to_lowercase();
-    name == "search_path" || crate::settable(&name)
+    crate::settable(&name) || !(name.contains('.') || CONTEXT_PARAMETERS.contains(&name.as_str()))
+}
+
+/// How a built-in changes state outside the rows the gate counts.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum StateChange {
+    /// In any statement: a session advisory lock outlives the proposal, a large object is rows of
+    /// pg_largeobject no max_rows counts (50 of them rode on a 1-row UPDATE), setval() rewinds what
+    /// others are numbered with, a WAL record or a replication slot outlives the transaction.
+    Always,
+    /// Only in a read: nextval() is how an INSERT numbers its rows, a transaction advisory lock
+    /// ends with the transaction, and a notification is sent only if the change is kept -- what a
+    /// DBA's trigger does on a write. A read that does any of them changed something nonetheless.
+    InARead,
+}
+
+/// What a pg_catalog function does to state outside rows, by name (0.2.14; split by statement in
+/// 0.4.3, when the same list became the floor's: hooks::floor).
+pub(crate) fn state_change(proname: &str) -> Option<StateChange> {
+    const IN_A_READ: &[&str] = &[
+        "nextval",
+        "pg_advisory_xact_lock",
+        "pg_advisory_xact_lock_shared",
+        "pg_try_advisory_xact_lock",
+        "pg_try_advisory_xact_lock_shared",
+        "pg_notify",
+    ];
+    const ALWAYS: &[&str] = &[
+        "setval",
+        "setseed",
+        "pg_logical_emit_message",
+        "pg_switch_wal",
+        "pg_create_restore_point",
+        "pg_create_physical_replication_slot",
+        "pg_create_logical_replication_slot",
+        "pg_drop_replication_slot",
+        "pg_replication_origin_create",
+        "pg_replication_origin_drop",
+        "loread",
+        "lowrite",
+    ];
+    if IN_A_READ.contains(&proname) {
+        Some(StateChange::InARead)
+    } else if ALWAYS.contains(&proname)
+        || proname.starts_with("pg_advisory_")
+        || proname.starts_with("pg_try_advisory_")
+        || proname.starts_with("pg_stat_reset")
+        || proname.starts_with("lo_")
+    {
+        Some(StateChange::Always)
+    } else {
+        None
+    }
+}
+
+/// The functions a statement calls ($1), with what an AGGREGATE among them runs (0.4.3).
+/// AggregateCreate stores every aggregate as IMMUTABLE, so an aggregate over a DBA's volatile
+/// transition function passed no_opaque_function and advanced a sequence 25 times from a read
+/// (review of 0.4.2). Its code is its support functions; they are judged as if called.
+macro_rules! called_cte {
+    () => {
+        "with called(oid) as (
+            select pg_catalog.unnest($1::int8[]::oid[])
+            union
+            select c.f
+              from pg_catalog.pg_aggregate a
+              cross join lateral pg_catalog.unnest(array[a.aggtransfn::oid, a.aggfinalfn::oid,
+                     a.aggcombinefn::oid, a.aggserialfn::oid, a.aggdeserialfn::oid,
+                     a.aggmtransfn::oid, a.aggminvtransfn::oid, a.aggmfinalfn::oid]) c(f)
+             where a.aggfnoid = any($1::int8[]::oid[]) and c.f <> 0::oid) "
+    };
 }
 
 pub(crate) enum Opaque {
@@ -640,9 +779,9 @@ fn opaque_function(funcs: &[pg_sys::Oid]) -> Result<Option<Opaque>, String> {
     let symbols: Vec<String> = SQL_FROM_TEXT.iter().map(|s| s.to_string()).collect();
     let mut settable: Vec<String> = crate::SETTABLE_BY_AGENTS.iter().map(|s| s.to_string()).collect();
     settable.extend(crate::settable_extra());
-    settable.push("search_path".into());
+    let context: Vec<String> = CONTEXT_PARAMETERS.iter().map(|s| s.to_string()).collect();
     let found = crate::exec::get_one_prepared::<String>(
-        "select (
+        concat!(called_cte!(), "select (
            select case when x.from_text then 'T' else 'B' end ||
                   n.nspname || '.' || p.proname || '()' ||
                   case when x.from_text then '' else ' (' || x.why || ')' end
@@ -655,26 +794,29 @@ fn opaque_function(funcs: &[pg_sys::Oid]) -> Result<Option<Opaque>, String> {
                         when p.oid < 16384 then null
                         when p.prosecdef then 'security definer'
                         when p.provolatile = 'v' then 'volatile'
-                        when $3 and pg_catalog.pg_has_role(p.proowner, 'USAGE')
+                        when $3 and pg_catalog.pg_has_role(session_user, p.proowner, 'USAGE')
                           then 'this agent can alter it, so what it is marked is its own claim'
-                        else (select 'its SET clause sets ' || pg_catalog.split_part(c, '=', 1) ||
-                                     ', which an agent may not set'
+                        else (select 'its SET clause sets ' || k.n ||
+                                     ', which carries the context a policy may read'
                                 from pg_catalog.unnest(p.proconfig) c
-                               where pg_catalog.lower(pg_catalog.split_part(c, '=', 1)) <> all($4::text[])
+                                cross join lateral (select pg_catalog.lower(pg_catalog.split_part(c, '=', 1)) n) k
+                               where not (k.n = any($4::text[])
+                                          or (pg_catalog.strpos(k.n, '.') = 0 and k.n <> all($5::text[])))
                                limit 1)
                       end as why) x
-            where p.oid = any($1::int8[]::oid[])
+            where p.oid in (select oid from called)
               and (x.from_text or x.why is not null)
             order by x.from_text desc
             limit 1
-         )",
+         )"),
         &[
             PgOid::BuiltIn(PgBuiltInOids::INT8ARRAYOID),
             PgOid::BuiltIn(PgBuiltInOids::TEXTARRAYOID),
             PgOid::BuiltIn(PgBuiltInOids::BOOLOID),
             PgOid::BuiltIn(PgBuiltInOids::TEXTARRAYOID),
+            PgOid::BuiltIn(PgBuiltInOids::TEXTARRAYOID),
         ],
-        &[ids.into(), symbols.into(), crate::agent_is_set().into(), settable.into()],
+        &[ids.into(), symbols.into(), crate::agent_is_set().into(), settable.into(), context.into()],
     )?;
     Ok(found.map(|f| match f.split_at(1) {
         ("T", rest) => Opaque::SqlFromText(rest.to_string()),
@@ -682,35 +824,28 @@ fn opaque_function(funcs: &[pg_sys::Oid]) -> Result<Option<Opaque>, String> {
     }))
 }
 
-/// A built-in the statement calls that changes state outside the rows a read returns: sequences,
-/// session advisory locks, large objects, notifications, the random seed, the WAL and statistics.
-/// Ok(None) = none, Ok(Some(name)) = refuse naming it, Err = lookup failed (refuse, fail closed).
-fn stateful_builtin(funcs: &[pg_sys::Oid]) -> Result<Option<String>, String> {
+/// A built-in the statement calls -- or an aggregate it calls runs -- that changes state outside
+/// the rows the gate counts (state_change): in a read, any of them; in a write or a DDL, those that
+/// are not how a write numbers or serializes its rows (0.4.3: 50 large objects rode on a 1-row
+/// UPDATE). Ok(None) = none, Ok(Some(name)) = refuse naming it, Err = lookup failed (fail closed).
+fn stateful_builtin(funcs: &[pg_sys::Oid], kind: Kind) -> Result<Option<String>, String> {
     if funcs.is_empty() {
         return Ok(None);
     }
     let ids: Vec<i64> = funcs.iter().map(|o| o.to_u32() as i64).collect();
-    crate::exec::get_one_prepared::<String>(
-        "select (
-           select p.proname||'()'
+    let names = crate::exec::get_one_prepared::<Vec<String>>(
+        concat!(called_cte!(), "select coalesce(array_agg(p.proname::text), '{}')
              from pg_catalog.pg_proc p
-             where p.oid = any($1::int8[]::oid[])
-               and p.pronamespace = 'pg_catalog'::regnamespace
-               and (p.proname in ('nextval', 'setval', 'setseed', 'pg_notify',
-                                  'pg_logical_emit_message', 'pg_switch_wal',
-                                  'pg_create_restore_point', 'pg_create_physical_replication_slot',
-                                  'pg_create_logical_replication_slot', 'pg_drop_replication_slot',
-                                  'pg_replication_origin_create', 'pg_replication_origin_drop')
-                    or p.proname like 'pg\\_advisory\\_%'
-                    or p.proname like 'pg\\_try\\_advisory\\_%'
-                    or p.proname like 'pg\\_stat\\_reset%'
-                    or p.proname like 'lo\\_%'
-                    or p.proname in ('loread', 'lowrite'))
-             limit 1
-         )",
+            where p.oid in (select oid from called)
+              and p.pronamespace = 'pg_catalog'::regnamespace"),
         &[PgOid::BuiltIn(PgBuiltInOids::INT8ARRAYOID)],
         &[ids.into()],
-    )
+    )?;
+    Ok(names.unwrap_or_default().into_iter().find(|n| match state_change(n) {
+        Some(StateChange::Always) => true,
+        Some(StateChange::InARead) => kind == Kind::Read,
+        None => false,
+    }).map(|n| format!("{n}()")))
 }
 
 /// Whether the current role could NOT read in full some relation the statement touches -- in the
