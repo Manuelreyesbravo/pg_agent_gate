@@ -112,27 +112,32 @@ make clean-machine                           # the same, in a fresh container th
 | suite | what it attacks | checks |
 |---|---|---|
 | `adversarial.sh` | every channel a session can type, and what can be slipped past `propose` | 59 |
-| `hostile.sh` | garbage into the verbs, the record rewritten, the world moved between propose and commit | 37 |
+| `hostile.sh` | garbage into the verbs, the record rewritten, the world moved between propose and commit | 40 |
 | `privileges.sh` | the privilege boundary between agents, roles and the record | 31 |
 | `rls_isolation.sh` | moving the context a row-level policy reads: `SET`, startup parameters, `set_config` | 22 |
 | `dump_restore.sh` | the record across `pg_dump` and restore | 10 |
 | `upgrade.sh` | an installation of the oldest schema, upgraded | 13 |
 | `flushes.sh` | the WAL flushes each act pays against its durability | 8 |
-| `plan_time.sh` | what runs while the gate verifies and plans | 43 |
+| `plan_time.sh` | what runs while the gate verifies and plans | 45 |
 | `pg_temp.sh` | a temporary catalog of the agent hiding what a write sets off | 17 |
 | `rollback.sh` | what a rollback takes from the record | 12 |
 | `audit3.sh` | the third audit: fast-path, the gate's path, foreign proposals, DDL, roles, 2PC, dump | 18 |
 | `audit4.sh` | the rest of it: settings between dry_run and commit, side effects of a read, a reused name, record size | 18 |
 | `isolation.sh` | one proposal committed twice under REPEATABLE READ / SERIALIZABLE | 5 |
 | `session_preload.sh` | a client parameter taking a per-session load out from behind the gate | 4 |
+| `approvals.sh` | an agent that needs an approver committing its own proposal | 7 |
+| `budget.sh` | a write split into slices that each fit `max_rows` (0.4.0) | 21 |
+| `membership.sh` | another role becoming the agent with `SET ROLE` (0.4.1) | 16 |
+| `audit5.sh` | SQL passed as text, `CREATE TABLE AS` over a writing CTE, functions the agent can alter or with a `SET` clause (0.4.2) | 44 |
 | pgrx unit tests | the verbs, from inside the server | 13 |
 
-On PostgreSQL 18.6 and 19beta2: **`verified: 310 checks passed, 0 failed`** on
-both (0.2.12). The fresh Debian container receiving only what git has committed
-runs the same suites, with 18 and 19beta4 from PGDG. CI runs the same
-container for 18 and 19 on every push. `VERIFY_DRIVERS=1` adds real pgjdbc and node-pg sessions.
+On PostgreSQL 18.6 and 19beta2, for 0.4.2, the suites above: **390 checks passed, 0 failed** on both;
+`make verify` adds the 13 pgrx unit tests. The fresh Debian container receiving only
+what git has committed runs the same suites, with 18 and 19beta4 from PGDG. CI runs the
+same container for 18 and 19 on every push. `VERIFY_DRIVERS=1` adds real pgjdbc and
+node-pg sessions.
 
-Those 310 are the hand-written suites above. The amplification class that `0.2.2` and `0.2.3`
+Those 390 are the hand-written suites above. The amplification class that `0.2.2` and `0.2.3`
 closed -- a writing CTE, a cascading foreign key, a trigger, a rule, an opaque (volatile or
 `SECURITY DEFINER`) function, and the commit-time row-count backstop and per-agent allow-list
 that back them -- is guarded by **`make fuzz`**, not by `make verify`. Its teeth build each of
@@ -235,7 +240,7 @@ piece in its place returns a decision you can see.
 | verb | does |
 |---|---|
 | `discover(filter, max_objects)` | tables, views and functions the agent has privileges on, with columns, types, keys, constraints and comments. Objects owned by extensions are left out. Includes a fingerprint, so a client can tell the schema changed |
-| `propose(sql, intent, params)` | verifies one statement and records it. Runs nothing |
+| `propose(sql, intent, params)` | verifies one statement and records it. Runs nothing -- except an `allow_ddl` agent's DDL, which is verified by running it in a subtransaction that is rolled back |
 | `dry_run(proposal)` | runs it inside a subtransaction and rolls it back: rows touched, before/after of every row of a write, whether bound assertions would still hold |
 | `commit(proposal)` | verifies again, runs it and keeps it if every guard agrees. A proposal is committed at most once |
 | `propose_and_commit(sql, intent, params)` | `propose` then `commit` in ONE call, so in one transaction: the same checks (verified at propose and again at execution), the same record, one commit instead of two. No `dry_run` in between -- for a statement whose effect the agent has already seen, or a read. Returns `{outcome, proposal, commit}`; a statement that does not verify never reaches execution (`refused_at_propose`, `commit` null) |
@@ -263,12 +268,25 @@ Nothing is reimplemented. Each check is PostgreSQL itself:
    refused. Inside the statement it moves, while the statement runs, the
    parameter a row-level policy reads; before 0.2.1,
    `... where set_config('app.tenant_id', '2', true) is not null` read another
-   tenant's rows. **Not covered:** a function that already exists and calls
-   `set_config` in its own body -- its body is not in the tree. Do not grant an
-   agent `EXECUTE` on one.
-6. **no_amplification**, **no_opaque_function** -- on the same tree: a write
-   whose cascade, trigger or rule the gate cannot vouch for, and a call to a user
-   function that is volatile or `SECURITY DEFINER` (see "What it does not do").
+   tenant's rows. Since 0.4.2 the same holds below the tree: in an agent's session,
+   while its SQL runs, `set_config()` does not start wherever it is reached -- the
+   SQL a function receives as text, the body of another function, a `CHECK`, a
+   default. The executor asks the gate before it runs any function, built-ins
+   included (`tests/audit5.sh`).
+6. **no_amplification**, **no_hidden_sql**, **no_opaque_function** -- on the same
+   tree: a write whose cascade, trigger or rule the gate cannot vouch for; a call
+   to a function that runs SQL it receives as text (`query_to_xml()` and the rest
+   of the `*_to_xml()` family, `ts_stat()`, `ts_rewrite()`, tablefunc's
+   `crosstab()` and `connectby()`, dblink), whose query no check sees (0.4.2); and
+   a call to a user function that is volatile or `SECURITY DEFINER`, that the agent
+   can alter -- its `STABLE` or `IMMUTABLE` is then its own claim -- or whose `SET`
+   clause sets a parameter an agent may not set (both 0.4.2; see "What it does not
+   do"). A function that runs SQL from a text, one the agent can alter and one with
+   such a `SET` clause are also stopped at execution wherever they are reached, as a
+   `SECURITY DEFINER` one is since 0.2.7.
+   For an `allow_ddl` agent, the query of a `CREATE TABLE AS`, `SELECT INTO` or
+   `CREATE MATERIALIZED VIEW` gets checks 4 to 6 too (0.4.2): up to 0.4.1 it was
+   only run, and over a CTE that deletes it deleted rows no limit counted.
 7. **resolves** -- only now `EXPLAIN` plans it, for the estimate. **The order is
    a guarantee (0.2.6):** planning runs functions -- it folds an `IMMUTABLE` call
    with constant arguments and estimates a `STABLE` one by calling it -- so up
@@ -551,8 +569,7 @@ that was not an agent, to prove the cases were dangerous at all.
 Against 0.2.0, 9 of 10 variants of the two did damage. Against 0.2.1, 0 of 10;
 both are refused at `propose` (checks 5 and 6 above), and both now have cases in
 the suites that are red against 0.2.0. On the same run, with the gate in place:
-the model's correct SQL was never refused (0 of 27 false positives), and the
-gate's own work cost 0.54 ms per act, median, over running the same SQL directly.
+the model's correct SQL was never refused (0 of 27 false positives).
 
 ## What it costs
 
@@ -562,65 +579,40 @@ make bench PG_CONFIG=/path/to/pg_config
 
 `tests/bench.py` on the throwaway cluster. "Directly" means an **identical role**
 -- same grants, same statement, same parameters -- that is not registered as an
-agent; never a superuser. Each of 300 iterations runs both paths back to back,
-alternating which goes first. The thresholds were declared before the code.
+agent; never a superuser. Each of `ITER` iterations (300) runs both paths back to
+back, alternating which goes first; the throughput test runs `PAIRS` (7) alternating
+pairs of `pgbench -S` restarts of `SECONDS` (15) each, preloaded and bare, and
+reports the median loss with every pair shown. It prints medians with p25/p75 and
+writes them to `target/bench/result.json`. The thresholds were declared before the
+code, and the run says whether each one holds:
 
-| what | threshold | measured (median) |
-|---|---|---|
-| extra time per read act (`propose` + `commit`) over the same query directly | <= 10 ms | **0.962 ms** |
-| extra time per kept write over the same `UPDATE` directly, which pays its own durable commit | <= 5 ms | **1.366 ms** |
-| throughput lost by sessions that are **not** agents when the library is preloaded (`pgbench -S`, 7 alternating pairs of 15 s) | <= 3% | **1.75%** |
-| extra time per read act with `attempt_durability = durable` | <= 10 ms | **2.821 ms** |
-| the same durable read act in ONE call (`propose_and_commit`) | <= 10 ms | **1.694 ms** |
+| what `make bench` measures | threshold |
+|---|---|
+| extra time per read act (`propose` + `commit`) over the same query directly | <= 10 ms |
+| extra time per kept write over the same `UPDATE` directly, which pays its own durable commit | <= 5 ms |
+| throughput lost by sessions that are **not** agents when the library is preloaded | <= 3% |
+| extra time per read act with `attempt_durability = durable` | <= 10 ms |
+| the same durable read act in ONE call (`propose_and_commit`) | <= 10 ms |
 
-**Where the time goes.** Of the ~1 ms a read act takes end to end, the gate's
-own work inside the server -- parse, plan, the amplification and function checks,
-run, decide -- is about 0.48 ms. Most of the rest is the record: every act is a
-proposal and an execution written to append-only tables, in their own commits.
-That is not overhead to optimize away; it is what makes an agent's actions
-auditable. With `durable` every one of those records pays its own flush, and a
-flush is the disk: `propose` + `commit` pay two, `propose_and_commit` writes both
-records in one commit and pays one (counted by `tests/flushes.sh`). A durable act
-costs about the gate's own work plus one or two flushes, so its number is mostly
-the disk's.
+This README publishes no timing of its own: one machine's numbers are not yours, so
+run it where the gate will run.
 
-**The same disk, two states, the same day.** The table above ran with `fdatasync`
-at 0.79 ms (`pg_test_fsync` on the data directory). Hours earlier, under sustained
-I/O from other work on the machine, the same disk took 3.9-5.1 ms per flush.
-Sampled both times as 20 clean rounds of 300 pairs (CCX-pinned lane, calibration
-before and after every round, the two ways interleaved):
+**Where the time goes.** The gate's own work inside the server -- parse, plan, the
+amplification and function checks, run, decide -- is a part of an act; most of the
+rest is the record: every act is a proposal and an execution written to append-only
+tables, in their own commits. That is not overhead to optimize away; it is what makes
+an agent's actions auditable. With `durable` every one of those records pays its own
+flush, and a flush is the disk: `propose` + `commit` pay two, `propose_and_commit`
+writes both records in one commit and pays one (counted by `tests/flushes.sh`). A
+durable act costs about the gate's own work plus one or two flushes, so its number
+is mostly the disk's, and only as good as the disk it was taken on.
 
-| durable read act | fast disk (0.88 ms per flush) | slow disk (3.9 ms per flush) |
-|---|---|---|
-| two calls (`propose` + `commit`) | 2.65 ms [95% CI 2.62..2.67] | 10.86 ms [95% CI 9.30..12.56] -- crosses the threshold |
-| one call (`propose_and_commit`) | 1.68 ms [95% CI 1.65..1.72] | 5.06 ms [95% CI 4.87..5.36] |
-| one call vs two | -36.7% [95% CI -38.0..-35.0] | -53.4% [95% CI -60.0..-44.3] |
-
-With a healthy disk both ways are far under the threshold; with a slow one the
-two-call act straddles it and the one-call act stays under it with its whole
-interval. The disk has no calibration of its own -- fsync latency is not what the
-sentinel measures -- so a durable number is only as good as the disk it was taken
-on: measure yours.
-
-These numbers are on a small schema. Two of the checks scale with the catalog: the
-commit backstop reads `pg_stat_xact_user_tables` (twice per kept write), and
-`no_amplification` walks the inheritance of the target. On a database with thousands
-of tables, expect the per-act cost to grow; re-run `make bench` against your own schema
-rather than trust these.
-
-**Every pair of the throughput test**, because a median hides how noisy one
-pair is. Loss with the library preloaded, in %: `8.28`, `-3.4`, `1.75`, `-7.57`,
-`2.25`, `1.65`, `1.99`. Single 15-second runs hiccup in both directions -- a -7.6%
-is a `bare` run dropping, not the gate making anything faster -- which is exactly
-why the criterion is the median of several pairs and not any one run: earlier runs
-of this same test reported 0.24%, 0.43%, 0.83% and, uncontrolled, 3.16%.
-
-Measured on 2026-10-08 on PostgreSQL 19beta2 built without assertions (an
-`--enable-cassert` build, such as pgrx's own instance, inflates every number here),
-AMD Ryzen AI 9 HX 370, data directory on Btrfs, `fsync` and `synchronous_commit` on, with the benchmark
-pinned to its own cores and a calibration run before and after to reject any
-measurement taken while the machine was contended. Your numbers will differ;
-`make bench` writes them to `target/bench/result.json`.
+Two of the checks scale with the catalog: the commit backstop reads the transaction's
+tuple statistics (twice per kept write), and `no_amplification` walks the inheritance
+of the target. On a database with thousands of tables, expect the per-act cost to
+grow; run `make bench` against your own schema. Build PostgreSQL without
+`--enable-cassert` for it (pgrx's own instance has assertions on, which inflates
+every number).
 
 ## Upgrading
 
@@ -678,12 +670,16 @@ read a definer function's body or re-decide what a view may show.
 * a proposal runs only after PostgreSQL's parser, planner, analyzer and
   rewriter accept it as one statement of a kind the agent may run;
 * a write that touches more than `max_rows` rows, or breaks a bound assertion,
-  is undone; and its writes over a window stay within its budget (0.4.0);
+  is undone; and its writes over a window stay within its budget (0.4.0); an
+  `allow_ddl` agent's `CREATE TABLE AS` or `SELECT INTO` cannot carry a write
+  (0.4.2);
 * no other role can become it: an agent role has no members, so no session but
   its own login can `SET ROLE` into it (0.4.1) -- connect each agent, or each
   seat of a broker, as its own role;
 * the context its row-level policies read cannot be moved -- not by `SET`, not
-  at connection start, not by `set_config()` inside a proposal;
+  at connection start, not by `set_config()` inside a proposal: in the statement,
+  in SQL passed to a function as text, in a function's body, a constraint or a
+  default (0.4.2), nor by a function's `SET` clause (0.4.2);
 * everything it proposed and did is recorded append-only, including why
   anything was refused.
 
@@ -710,9 +706,16 @@ small `max_rows`, bind assertions that must keep holding, and put a human on
 
 Said here so nobody learns it the hard way:
 
-* **A function that calls `set_config()` in its own body.** The gate refuses
-  `set_config` anywhere in a proposal's query tree, but a function's body is not
-  in that tree. Do not grant an agent `EXECUTE` on such a function.
+* **A function's body is trusted to be what the function is marked.** The gate
+  does not read a body. Since 0.4.2 it stops, wherever reached while the agent's
+  SQL runs, `set_config()`, a function that runs SQL from a text, a function the
+  agent can alter (its marking is then its own claim) and one whose `SET` clause
+  sets a parameter an agent may not set -- `search_path` excepted, which only
+  names where the body looks. What remains is a DBA's function marked `STABLE` or
+  `IMMUTABLE` that writes: it runs, and only the row-count backstop of a write
+  sees what it changed. PostgreSQL grants `EXECUTE` on every new function to
+  `PUBLIC`, so not granting is not enough: `REVOKE EXECUTE ... FROM PUBLIC` on
+  any function an agent must not reach.
 
 * **Without the library loaded before the agent's first statement, the gate
   fails open.** `whoami()` reports `enforced`. Use `shared_preload_libraries`.
@@ -855,9 +858,11 @@ Said here so nobody learns it the hard way:
   secret came through that way. That is PostgreSQL, not the gate -- the gate
   verifies the proposal, it does not re-decide what a view may show. `discover`
   lists the view, because the agent was granted it, and not the table behind.
-* **`EXPLAIN` folds constant calls to immutable functions.** A function falsely
-  marked `IMMUTABLE` could run at `propose`. Marking functions honestly is a
-  prerequisite.
+* **`EXPLAIN` folds constant calls to immutable functions.** A DBA's function
+  falsely marked `IMMUTABLE` runs at `propose` (with the guards above in place:
+  no `set_config()`, no `SECURITY DEFINER` under it). Marking functions honestly
+  is a prerequisite for the DBA's functions; a function the agent can alter is
+  refused whatever it is marked (0.4.2).
 * **The record is transactional.** Inside an explicit transaction that the
   caller rolls back, the record rolls back too; so does a `propose_and_commit`
   that is cancelled, or that fails outside the gate's own subtransaction, where
@@ -881,8 +886,12 @@ Said here so nobody learns it the hard way:
 * **`allow_ddl` is schema power, not a bigger `max_rows`.** An agent allowed DDL runs
   any `CREATE`, `ALTER` or `DROP` its grants permit; the change is verified by running
   it in a rolled-back subtransaction and kept only if that succeeds, but `max_rows`
-  does not bound it -- DDL changes the schema, not a counted set of rows, so a granted
-  `DROP TABLE` is kept. Grant DDL narrowly, and leave `allow_ddl => false` unless a
+  does not bound it, so a granted `DROP TABLE` is kept. The query of a `CREATE TABLE
+  AS`, `SELECT INTO` or `CREATE MATERIALIZED VIEW` is checked like a read before it
+  runs (0.4.2), so it cannot carry a writing CTE, and a function the agent creates is
+  opaque to its own proposals. An expression a DDL evaluates -- a `DEFAULT` filled
+  in by `ALTER TABLE`, a `CHECK`, an index expression -- can still call any function
+  the agent may execute. Grant DDL narrowly, and leave `allow_ddl => false` unless a
   specific agent needs it.
 
 ## License
