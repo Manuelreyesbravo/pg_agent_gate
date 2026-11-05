@@ -128,16 +128,17 @@ make clean-machine                           # the same, in a fresh container th
 | `approvals.sh` | an agent that needs an approver committing its own proposal | 7 |
 | `budget.sh` | a write split into slices that each fit `max_rows` (0.4.0) | 21 |
 | `membership.sh` | another role becoming the agent with `SET ROLE` (0.4.1) | 16 |
-| `audit5.sh` | SQL passed as text, `CREATE TABLE AS` over a writing CTE, functions the agent can alter or with a `SET` clause (0.4.2) | 44 |
+| `audit5.sh` | SQL passed as text, `CREATE TABLE AS` over a writing CTE, functions the agent can alter or with a `SET` clause (0.4.3) | 44 |
+| `audit6.sh` | code the tree does not show: a range type's support function, a domain's `CHECK`, an aggregate, a DDL's `DEFAULT`; large objects; a foreign key over `citext` (0.4.3) | 44 |
 | pgrx unit tests | the verbs, from inside the server | 13 |
 
-On PostgreSQL 18.6 and 19beta2, for 0.4.2, the suites above: **390 checks passed, 0 failed** on both;
+On PostgreSQL 18.6 and 19beta2, for 0.4.3, the suites above: **434 checks passed, 0 failed** on both;
 `make verify` adds the 13 pgrx unit tests. The fresh Debian container receiving only
 what git has committed runs the same suites, with 18 and 19beta4 from PGDG. CI runs the
 same container for 18 and 19 on every push. `VERIFY_DRIVERS=1` adds real pgjdbc and
 node-pg sessions.
 
-Those 390 are the hand-written suites above. The amplification class that `0.2.2` and `0.2.3`
+Those 434 are the hand-written suites above. The amplification class that `0.2.2` and `0.2.3`
 closed -- a writing CTE, a cascading foreign key, a trigger, a rule, an opaque (volatile or
 `SECURITY DEFINER`) function, and the commit-time row-count backstop and per-agent allow-list
 that back them -- is guarded by **`make fuzz`**, not by `make verify`. Its teeth build each of
@@ -271,8 +272,11 @@ Nothing is reimplemented. Each check is PostgreSQL itself:
    tenant's rows. Since 0.4.2 the same holds below the tree: in an agent's session,
    while its SQL runs, `set_config()` does not start wherever it is reached -- the
    SQL a function receives as text, the body of another function, a `CHECK`, a
-   default. The executor asks the gate before it runs any function, built-ins
-   included (`tests/audit5.sh`).
+   default, a domain's `CHECK`, an aggregate's transition function. **Code is judged
+   where it starts (0.4.3):** the executor asks the gate before it runs any function,
+   built-ins included, and the function manager asks for every user function C code
+   calls through a cache -- a range type's support function, an RI check, a trigger
+   (`tests/audit5.sh`, `tests/audit6.sh`).
 6. **no_amplification**, **no_hidden_sql**, **no_opaque_function** -- on the same
    tree: a write whose cascade, trigger or rule the gate cannot vouch for; a call
    to a function that runs SQL it receives as text (`query_to_xml()` and the rest
@@ -280,10 +284,21 @@ Nothing is reimplemented. Each check is PostgreSQL itself:
    `crosstab()` and `connectby()`, dblink), whose query no check sees (0.4.2); and
    a call to a user function that is volatile or `SECURITY DEFINER`, that the agent
    can alter -- its `STABLE` or `IMMUTABLE` is then its own claim -- or whose `SET`
-   clause sets a parameter an agent may not set (both 0.4.2; see "What it does not
-   do"). A function that runs SQL from a text, one the agent can alter and one with
-   such a `SET` clause are also stopped at execution wherever they are reached, as a
-   `SECURITY DEFINER` one is since 0.2.7.
+   clause moves the context a policy reads: a custom parameter such as
+   `app.tenant_id`, `role`, `session_authorization`, `row_security` or
+   `session_replication_role` (`work_mem`, `jit`, `plan_cache_mode` or `search_path`
+   only say how the body runs, and pass). An aggregate is judged by the functions it
+   runs, its transition function first: `pg_proc` marks every aggregate `IMMUTABLE`
+   (0.4.3). A function that runs SQL from a text, one the agent can alter and one with
+   such a `SET` clause are also stopped wherever they are reached while the agent's
+   SQL runs, as a `SECURITY DEFINER` one is since 0.2.7. Whose function it is, is asked
+   of the agent's own role, not of the role PostgreSQL runs an RI check as (0.4.3).
+   **read_changes_nothing** / **changes_only_rows** -- a built-in that changes state
+   outside the rows the gate counts is refused: in a read, any (`nextval()`, advisory
+   locks, large objects, notifications); in a write or a DDL, those that are not how a
+   write numbers its rows (a session advisory lock, a large object, `setval()`; 0.4.3).
+   The same list is stopped wherever it is reached: a domain's `CHECK` that called
+   `nextval()` made a read advance a sequence.
    For an `allow_ddl` agent, the query of a `CREATE TABLE AS`, `SELECT INTO` or
    `CREATE MATERIALIZED VIEW` gets checks 4 to 6 too (0.4.2): up to 0.4.1 it was
    only run, and over a CTE that deletes it deleted rows no limit counted.
@@ -307,7 +322,9 @@ Nothing is reimplemented. Each check is PostgreSQL itself:
    some columns only, withholds the estimate too, although nothing would leak. The agent's SQL
    never runs in a parallel worker (0.2.8): the backend runs the whole plan, where
    the gate's hooks see it. DDL (for agents allowed it) is verified instead by running
-   it in a subtransaction that is rolled back.
+   it in a subtransaction that is rolled back -- as execution, under the same floor,
+   and judged as a read: proposing changes nothing, so a DDL that would advance a
+   sequence while it is only being checked is refused (0.4.3).
 
 Checks 4 and 5 were found by an LLM proposing through the gate against a
 two-tenant database, with a superuser comparing the database before and after
@@ -324,7 +341,9 @@ refused outright.
 * Runs with the **agent's own privileges**. The gate adds verification; `GRANT`
   is still the authorization.
 * Inside a subtransaction, decided **after** it runs:
-  * a write touching more rows than the agent's `max_rows` is undone;
+  * a write touching more rows than the agent's `max_rows` is undone -- counted over
+    everything the statement changed, triggers and functions included; a DDL's count
+    is what it changed in tables that existed before it (0.4.3);
   * deferred constraints are fired **inside the gate** (`SET CONSTRAINTS ALL
     IMMEDIATE`), not at the caller's commit where nobody is watching;
   * assertions bound to the agent (from
@@ -672,14 +691,18 @@ read a definer function's body or re-decide what a view may show.
 * a write that touches more than `max_rows` rows, or breaks a bound assertion,
   is undone; and its writes over a window stay within its budget (0.4.0); an
   `allow_ddl` agent's `CREATE TABLE AS` or `SELECT INTO` cannot carry a write
-  (0.4.2);
+  (0.4.2), and the rows a DDL's default, constraint or index expression changes in
+  other tables are counted like a write's (0.4.3);
+* a read changes nothing the record would not show: no sequence, lock or large
+  object, wherever the code that would change it sits (0.4.3);
 * no other role can become it: an agent role has no members, so no session but
   its own login can `SET ROLE` into it (0.4.1) -- connect each agent, or each
   seat of a broker, as its own role;
 * the context its row-level policies read cannot be moved -- not by `SET`, not
   at connection start, not by `set_config()` inside a proposal: in the statement,
   in SQL passed to a function as text, in a function's body, a constraint or a
-  default (0.4.2), nor by a function's `SET` clause (0.4.2);
+  default (0.4.2), a domain's `CHECK` or a type's support function (0.4.3), nor by a
+  function's `SET` clause (0.4.2);
 * everything it proposed and did is recorded append-only, including why
   anything was refused.
 
@@ -707,15 +730,26 @@ small `max_rows`, bind assertions that must keep holding, and put a human on
 Said here so nobody learns it the hard way:
 
 * **A function's body is trusted to be what the function is marked.** The gate
-  does not read a body. Since 0.4.2 it stops, wherever reached while the agent's
-  SQL runs, `set_config()`, a function that runs SQL from a text, a function the
-  agent can alter (its marking is then its own claim) and one whose `SET` clause
-  sets a parameter an agent may not set -- `search_path` excepted, which only
-  names where the body looks. What remains is a DBA's function marked `STABLE` or
-  `IMMUTABLE` that writes: it runs, and only the row-count backstop of a write
-  sees what it changed. PostgreSQL grants `EXECUTE` on every new function to
+  does not read a body. It judges each function where it starts (0.4.3): wherever
+  reached while the agent's SQL runs, it stops `set_config()`, a function that runs
+  SQL from a text, a built-in that changes state outside counted rows, a function
+  the agent can alter (its marking is then its own claim) and one whose `SET` clause
+  moves the context a policy reads. What remains is a DBA's function marked `STABLE`
+  or `IMMUTABLE` that writes: it runs, and only the row-count backstop of a write or
+  a DDL sees what it changed. PostgreSQL grants `EXECUTE` on every new function to
   `PUBLIC`, so not granting is not enough: `REVOKE EXECUTE ... FROM PUBLIC` on
   any function an agent must not reach.
+* **Built-ins reached from C code are not judged one by one.** PostgreSQL looks a
+  built-in up by a fast path that asks no hook. The executor's hook still sees every
+  built-in an expression calls; what C code calls through a cache (the type cache,
+  an RI check, index support) is chosen by DDL only a superuser runs -- operator
+  classes, base types -- or, for a range type's support function, has a signature no
+  built-in that changes state has.
+* **Code an `allow_ddl` agent plants runs for whoever uses its objects.** Its
+  functions never start while its own (or any agent's) SQL runs, but a human or an
+  application that inserts into its table, casts to its domain or builds on its range
+  type runs them with their own rights -- PostgreSQL's rule for any role that may
+  create objects. Keep agents' schemas out of other roles' paths.
 
 * **Without the library loaded before the agent's first statement, the gate
   fails open.** `whoami()` reports `enforced`. Use `shared_preload_libraries`.
@@ -886,13 +920,16 @@ Said here so nobody learns it the hard way:
 * **`allow_ddl` is schema power, not a bigger `max_rows`.** An agent allowed DDL runs
   any `CREATE`, `ALTER` or `DROP` its grants permit; the change is verified by running
   it in a rolled-back subtransaction and kept only if that succeeds, but `max_rows`
-  does not bound it, so a granted `DROP TABLE` is kept. The query of a `CREATE TABLE
-  AS`, `SELECT INTO` or `CREATE MATERIALIZED VIEW` is checked like a read before it
-  runs (0.4.2), so it cannot carry a writing CTE, and a function the agent creates is
-  opaque to its own proposals. An expression a DDL evaluates -- a `DEFAULT` filled
-  in by `ALTER TABLE`, a `CHECK`, an index expression -- can still call any function
-  the agent may execute. Grant DDL narrowly, and leave `allow_ddl => false` unless a
-  specific agent needs it.
+  does not bound what it does to the agent's own tables: a granted `DROP TABLE` is
+  kept, and an `ALTER COLUMN ... TYPE ... USING` rewrites every row of one with 0 rows
+  counted. The query of a `CREATE TABLE AS`, `SELECT INTO` or `CREATE MATERIALIZED
+  VIEW` is checked like a read before it runs (0.4.2), so it cannot carry a writing
+  CTE, and a function the agent creates never starts while its SQL runs. An expression
+  a DDL evaluates -- a `DEFAULT` filled in by `ALTER TABLE`, a `CHECK`, an index
+  expression -- runs under the same floor, and what it changes in tables that existed
+  before the DDL counts against `max_rows` and the budget (0.4.3). A sequence it
+  advances at commit is not undone. Grant DDL narrowly, and leave `allow_ddl => false`
+  unless a specific agent needs it.
 
 ## License
 Apache License 2.0 -- see [LICENSE](LICENSE). Copyright 2026 Manuel Reyes Bravo.
