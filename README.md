@@ -131,9 +131,10 @@ make clean-machine                           # the same, in a fresh container th
 | `audit5.sh` | SQL passed as text, `CREATE TABLE AS` over a writing CTE, functions the agent can alter or with a `SET` clause (0.4.3) | 44 |
 | `audit6.sh` | code the tree does not show: a range type's support function, a domain's `CHECK`, an aggregate, a DDL's `DEFAULT`; large objects; a foreign key over `citext` (0.4.3) | 44 |
 | `audit7.sh` | a verb's parameter of an agent's domain, a temporary table under a DBA's helper, a `DROP ... CASCADE` or `ALTER TYPE` reaching a DBA's table, a read that ends another session, code handed to a `NOINHERIT` role; and a module's `SET` parameter, an event trigger, `MERGE`, `lo_get()`, intagg, `serial` (0.4.3) | 58 |
+| `audit8.sh` | an extension's C function in an agent's domain `CHECK`, `CREATE OR REPLACE FUNCTION` under a DBA's index, an index or `DETACH` reaching a DBA's partition; a `varchar[]` argument, a read-only transaction (0.4.3) | 43 |
 | pgrx unit tests | the verbs, from inside the server | 13 |
 
-On PostgreSQL 18.6 and 19beta2, for 0.4.3, the suites above: **493 checks passed, 0 failed** on both;
+On PostgreSQL 18.6 and 19beta2, for 0.4.3, the suites above: **536 checks passed, 0 failed** on both;
 `make verify` adds the 13 pgrx unit tests. The fresh Debian container receiving only
 what git has committed runs the same suites, with 18 and 19beta4 from PGDG. CI runs the
 same container for 18 and 19 on every push. `VERIFY_DRIVERS=1` adds real pgjdbc and
@@ -349,7 +350,10 @@ Nothing is reimplemented. Each check is PostgreSQL itself:
    owns** (second review of 0.4.3): every object PostgreSQL drops for it -- by name,
    through a `CASCADE`, or as the owner of the schema -- must be one the agent could drop
    by name; a type it alters must not be what another role's table, domain or function is
-   made of; and it creates no temporary object, because PostgreSQL searches the temporary
+   made of, and a function it redefines must not be what another role's index, constraint,
+   generated column, view or function is built on (third review); what it creates -- an index
+   or a trigger PostgreSQL makes on every partition of its table -- and a table it detaches
+   must be its own; and it creates no temporary object, because PostgreSQL searches the temporary
    schema first for relation and type names and an agent's temporary table answered for a
    name a DBA's policy helper did not qualify.
 
@@ -776,7 +780,18 @@ Said here so nobody learns it the hard way:
   functions never start in its own (or any agent's) session, but a human or an
   application that inserts into its table, casts to its domain or builds on its range
   type runs them with their own rights -- PostgreSQL's rule for any role that may
-  create objects. Keep agents' schemas out of other roles' paths.
+  create objects. Keep agents' schemas out of other roles' paths. In an agent's own
+  session, what its objects call is its code (third review of 0.4.3): a `VOLATILE`
+  function of another role's that an object of the agent's calls -- a domain's `CHECK`, a
+  default, an index, a trigger -- is judged as the statement's own call. Native code (C,
+  an untrusted language) is refused in every statement, so a C trigger function from
+  contrib on an agent's table refuses its writes; SQL and PL/pgSQL are refused in reads
+  and run in writes. Two edges of that: the judgment is by function, not by call site,
+  so once an agent's object calls a DBA's function every call of it in that agent's
+  sessions is judged so; and it knows what PostgreSQL records in `pg_depend` -- a
+  PL/pgSQL body records nothing, so a DBA's function that an agent's PL/pgSQL function
+  calls is never reached that way (the agent's function never starts), and a call the
+  DBA's own PL/pgSQL body makes stays the DBA's.
 * **A persistent object of the agent can still answer for a name a DBA's code does not
   qualify.** An agent creates no temporary object (0.4.3), so `pg_temp` answers for
   nothing; but a schema the agent can create in, searched before the DBA's -- `ALTER ROLE
@@ -836,7 +851,14 @@ Said here so nobody learns it the hard way:
   the allowlist now fails closed: every statement it sends is refused. What the
   drivers send on their own (`client_encoding`, `DateStyle`, `TimeZone`,
   `extra_float_digits`, `application_name`, a `statement_timeout` in `options`)
-  is on the list and keeps working. `search_path` is deliberately not on it, so
+  is on the list and keeps working. `TimeZone` (and `DateStyle`, `IntervalStyle`) are
+  inputs to a policy too: one that compares with `current_date`, or casts to `date` or
+  `timestamp`, reads the session's zone, so an agent that sets `TimeZone` sees what a
+  policy dates in another zone -- measured, a row embargoed until tomorrow, of its own
+  tenant. Write such a policy with `timestamptz` and an explicit zone (`now() AT TIME
+  ZONE 'UTC'`, a `date` column compared in that zone): the allowlist keeps `TimeZone`,
+  because every driver sends it.
+  `search_path` is deliberately not on it, so
   a driver configured with a default schema will be refused: pgjdbc's connection
   code sends `currentSchema` as the startup parameter `search_path` (read in
   the driver, not measured here). Set the agent's schema on its role instead.
@@ -958,7 +980,11 @@ Said here so nobody learns it the hard way:
   `log_min_duration_statement` if configured, which log the `agent_gate.propose(...)`
   call verbatim. A value passed as a parameter shows as `$1` in the statement; a
   literal in the SQL shows as written.
-* **Parameters travel as text.** Cast them in the SQL (`$1::int`).
+* **Parameters travel as text.** Cast them in the SQL (`$1::int`). A `varchar[]` -- what
+  pgjdbc binds for a `String[]` -- is accepted as the parser coerces it (0.4.3).
+* **The verbs do not run in a read-only transaction (0.4.3).** Every proposal, a read too,
+  is written to the record first, so a `READ ONLY` transaction (pgjdbc's `setReadOnly(true)`)
+  and a hot standby are refused, saying so.
 * **A cast that runs a function around a verb's argument is refused (0.2.15).**
   Only the implicit cast the parser inserts to coerce a constant to the verb's own
   parameter type, through a built-in function, passes. An explicit cast, an I/O
