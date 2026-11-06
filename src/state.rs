@@ -100,6 +100,37 @@ pub(crate) fn proposal_running() -> bool {
     PROPOSAL.load(SeqCst) > 0
 }
 
+/// WHERE THE FLOOR STANDS IN AN AGENT SESSION (0.4.3, second review). Up to the first review of
+/// 0.4.3 the floor judged only the PROPOSAL window, and the session ran code outside it: a verb's
+/// argument bound over the extended protocol as a parameter of an agent-made domain ran the
+/// domain's CHECK when it was BOUND -- before any verb started -- and that CHECK moved
+/// app.tenant_id for the rest of the session. So the floor stands for the whole agent session,
+/// and steps aside only for code the gate itself runs on purpose: its own SQL (TRUSTED) and the
+/// DBA's bound assertions (CHECKING). Inside a proposal it always stands, even when the gate's
+/// SQL is nested in it. The caller asks agent_is_set() first: every other session pays nothing.
+pub(crate) fn floor_applies() -> bool {
+    PROPOSAL.load(SeqCst) > 0 || (TRUSTED.load(SeqCst) == 0 && CHECKING.load(SeqCst) == 0)
+}
+
+/// Depth of event-trigger functions running (0.4.3, second review). Only a superuser creates an
+/// event trigger, so its function is the DBA's code even while an agent's DDL fires it: the trial
+/// of that DDL at propose is judged as the DDL it is while that code runs -- a DDL-audit trigger's
+/// bigserial nextval() or pg_notify() refused every DDL of every allow_ddl agent. What it writes is
+/// still counted (the DDL's backstop), and everything else the floor stops is still stopped.
+static EVENT_TRIGGER: AtomicU32 = AtomicU32::new(0);
+
+pub(crate) fn event_trigger_enter() {
+    EVENT_TRIGGER.fetch_add(1, SeqCst);
+}
+
+pub(crate) fn event_trigger_leave() {
+    let _ = EVENT_TRIGGER.fetch_update(SeqCst, SeqCst, |v| Some(v.saturating_sub(1)));
+}
+
+pub(crate) fn in_event_trigger() -> bool {
+    EVENT_TRIGGER.load(SeqCst) > 0
+}
+
 pub(crate) struct Guard(&'static AtomicU32);
 
 impl Drop for Guard {
@@ -223,6 +254,7 @@ fn reset_counters() {
     PROPOSAL.store(0, SeqCst);
     CHECKING.store(0, SeqCst);
     KIND.store(0, SeqCst);
+    EVENT_TRIGGER.store(0, SeqCst);
 }
 
 fn forget_transaction() {

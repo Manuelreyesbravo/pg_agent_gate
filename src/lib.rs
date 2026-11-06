@@ -17,8 +17,10 @@ use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
 use pgrx::prelude::*;
 use std::ffi::CString;
 
+mod context;
 mod exec;
 mod hooks;
+mod reach;
 mod schema;
 mod state;
 mod verbs;
@@ -136,14 +138,6 @@ pub(crate) const SETTABLE_BY_AGENTS: &[&str] = &[
 /// one is an act of administration, and it is the DBA saying "no policy of mine
 /// stands on this".
 pub(crate) static SETTABLE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
-
-/// The parameters a superuser added to `agent_gate.settable`, lower-cased.
-pub(crate) fn settable_extra() -> Vec<String> {
-    match SETTABLE.get().and_then(|c| c.into_string().ok()) {
-        Some(extra) => extra.split(',').map(|p| p.trim().to_lowercase()).filter(|p| !p.is_empty()).collect(),
-        None => Vec::new(),
-    }
-}
 
 pub(crate) fn settable(name: &str) -> bool {
     if SETTABLE_BY_AGENTS.contains(&name) {

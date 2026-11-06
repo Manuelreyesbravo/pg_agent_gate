@@ -135,6 +135,8 @@ fn not_from_inside() {
     if state::proposal_running() || state::checking() {
         error!("pg_agent_gate: a proposal cannot call the gate from inside itself");
     }
+    // Every verb starts on the context the agent session started with (context.rs).
+    crate::context::require(false);
 }
 
 /// Every verb that records starts here: no calls from inside a proposal, and
@@ -314,6 +316,9 @@ fn propose_one(sql: &str, intent: &str, params: Option<Vec<Option<String>>>) -> 
     )
     .expect("pg_agent_gate: the proposal was not recorded");
 
+    // Verification ran the agent's SQL (a DDL's trial, the planner's folding): the context is still
+    // the session's, or the verb refuses and the record of it goes with it (context.rs).
+    crate::context::require(false);
     log!("pg_agent_gate: agent={} proposal={} kind={} ok={}", who.agent, id, kind, verdict.ok);
     state::written_to_record(format!(
         "proposal {id} of agent {} (role {}): kind={kind} ok={} intent={} sql={}",
@@ -672,6 +677,7 @@ fn execute(proposal: i64, mode: Mode) -> Value {
     let args = verify::text_args(&params);
     let bindings = cfg.bindings.clone();
     let max_rows = cfg.max_rows;
+    let judge_alters = verdict.judge_alters;
 
     // THE WRITE BUDGET (0.4.0). max_rows bounds one proposal; an agent that loops split a write
     // it was refused into slices that each fit (agent-gate-demo/compare: a 6-row table emptied
@@ -717,6 +723,7 @@ fn execute(proposal: i64, mode: Mode) -> Value {
                     // The verified statement is itself a utility only when it is DDL (an allow_ddl
                     // agent's CREATE INDEX, ...): exempt that one, so it is not refused as nested.
                     if kind == Kind::Ddl {
+                        crate::reach::begin(judge_alters);
                         state::allow_gate_utility();
                     }
                     match kind {
@@ -730,13 +737,23 @@ fn execute(proposal: i64, mode: Mode) -> Value {
                                 .update(statement.as_str(), Some((cap + 1) as _), &args)
                                 .expect("the read failed");
                         }
-                        _ => {
+                        // A write through SPI directly: a MERGE that RETURNs rows -- the gate adds
+                        // RETURNING to show before and after -- answers SPI_OK_MERGE_RETURNING (19,
+                        // PostgreSQL 17), which pgrx 0.19 does not know, and every MERGE aborted with
+                        // "unrecognized SPI status code: 19" (second review of 0.4.3).
+                        Kind::Write => unsafe { crate::exec::spi_write(statement.as_str(), &args) },
+                        Kind::Ddl => {
                             client.update(statement.as_str(), None, &args).expect("the statement failed");
                         }
                     }
                     unsafe { collect_rows(cap) }
                 })
             };
+            // What the DDL dropped was judged as it went (reach.rs); what it altered and created, now.
+            if kind == Kind::Ddl {
+                let _running = state::proposal();
+                crate::reach::judge_or_refuse();
+            }
 
             let mut abort = None;
             let mut moved_total: Option<i64> = None;
@@ -856,6 +873,10 @@ fn execute(proposal: i64, mode: Mode) -> Value {
                     assertions.push(r);
                 }
             }
+            // Before a row is handed back or a change kept -- after the statement, its deferred
+            // constraints and the DBA's assertions (which run outside the floor): the session's
+            // context is still its own, or this subtransaction goes, and the move with it (context.rs).
+            crate::context::require(true);
             Outcome { rows, abort, assertions, moved: moved_total }
         },
         |o| mode == Mode::Commit && kind != Kind::Read && o.abort.is_none(),

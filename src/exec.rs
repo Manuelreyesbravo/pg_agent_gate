@@ -147,6 +147,30 @@ pub(crate) unsafe fn collect_rows(cap: usize) -> Rows {
     Rows { processed, rows, truncated: available > take || processed as usize > take }
 }
 
+/// Run a write through SPI, inside the caller's SPI connection, and accept every status SPI reports
+/// as success -- MERGE ... RETURNING's SPI_OK_MERGE_RETURNING included. The result is read with
+/// collect_rows(), like any other.
+pub(crate) unsafe fn spi_write(sql: &str, args: &[DatumWithOid]) {
+    let text = std::ffi::CString::new(sql).expect("a verified statement has no NUL byte");
+    let mut types: Vec<pg_sys::Oid> = args.iter().map(|a| a.oid()).collect();
+    let mut values: Vec<pg_sys::Datum> =
+        args.iter().map(|a| a.datum().map(|d| d.sans_lifetime()).unwrap_or(pg_sys::Datum::from(0usize))).collect();
+    let nulls: Vec<std::ffi::c_char> =
+        args.iter().map(|a| if a.datum().is_some() { b' ' } else { b'n' } as std::ffi::c_char).collect();
+    let rc = pg_sys::SPI_execute_with_args(
+        text.as_ptr(),
+        args.len() as i32,
+        if types.is_empty() { std::ptr::null_mut() } else { types.as_mut_ptr() },
+        if values.is_empty() { std::ptr::null_mut() } else { values.as_mut_ptr() },
+        if nulls.is_empty() { std::ptr::null() } else { nulls.as_ptr() },
+        false,
+        0,
+    );
+    if rc < 0 {
+        pgrx::error!("pg_agent_gate: SPI could not run the statement (SPI code {rc})");
+    }
+}
+
 /// Numbers, booleans and JSON keep their type; everything else travels as its
 /// text form. `numeric` stays text on purpose: a JSON number would round it.
 fn typed(type_oid: pg_sys::Oid, text: &str) -> Value {

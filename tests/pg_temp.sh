@@ -13,9 +13,13 @@
 # delete would run it.
 #
 # From 0.2.9 every function of the gate names pg_temp last. Each tooth has its
-# control: the same write without the temporary catalog is refused, and the
-# temporary catalog demonstrably exists in the agent's session, so a green here is
-# the gate refusing and not the scenario failing to set itself up.
+# control: the same write without the temporary catalog is refused.
+#
+# From 0.4.3 (its second review) an agent does not create temporary objects at all: a
+# temporary table answered for a name a DBA's policy helper did not qualify, in the
+# agent's own session (tests/audit7.sh, C2). So the temporary catalog is now refused
+# where it is created, and the checks below hold twice over: the agent cannot make
+# one, and the gate's functions would not read it if it could.
 #
 #   PG_CONFIG=/path/to/pg_config tests/cluster.sh init
 #   PG_CONFIG=/path/to/pg_config tests/cluster.sh start
@@ -92,8 +96,7 @@ equals "  ...and no child row is gone" 3 "$(as_super -c 'select count(*) from sh
 out=$(as_agent \
     -c "$(commit 'create temp table pg_constraint (conname name, confrelid oid, contype "char", confdeltype "char", confupdtype "char")')" \
     -c "$(commit 'delete from shop.parent where id = 2')")
-contains "control: the agent created its temporary pg_constraint (kept, in its session)" '"kind": "ddl", "mode": "commit"' "$(head -1 <<<"$out")"
-contains "  ...kept" '"outcome": "kept"' "$(head -1 <<<"$out")"
+contains "the agent cannot create a temporary pg_constraint" "does not create temporary objects" "$(head -1 <<<"$out")"
 contains "with a temporary pg_constraint, the cascade is still refused" "cascading foreign key" "$out"
 equals "  ...and no child row is gone" 3 "$(as_super -c 'select count(*) from shop.child')"
 
@@ -104,8 +107,7 @@ contains "control: a delete under a rule is refused, naming the rule" "rule keep
 out=$(as_agent \
     -c "$(commit 'create temp table pg_rewrite (rulename name, ev_class oid)')" \
     -c "$(commit 'delete from shop.drafts where id = 2')")
-contains "control: the agent created its temporary pg_rewrite (kept, in its session)" '"kind": "ddl", "mode": "commit"' "$(head -1 <<<"$out")"
-contains "  ...kept" '"outcome": "kept"' "$(head -1 <<<"$out")"
+contains "the agent cannot create a temporary pg_rewrite" "does not create temporary objects" "$(head -1 <<<"$out")"
 contains "with a temporary pg_rewrite, the rule is still refused" "rule keep_tomb" "$out"
 equals "  ...and the rule wrote nothing" 0 "$(as_super -c 'select count(*) from shop.tomb')"
 
@@ -115,14 +117,21 @@ equals "  ...and the rule wrote nothing" 0 "$(as_super -c 'select count(*) from 
 # stood in for the table the check reads. 0.5.5 names it last. The gate runs bound
 # assertions in the agent's session, so from 0.2.9 it refuses to call an older one: a
 # check the agent can answer for is not one that passed.
+#
+# 0.5.5's run() set that path with set_config(..., false) and left it in the session
+# (its own 0.5.6 changelog, F1): after the check, the agent's next unqualified name
+# resolved through the path the assertion's author wrote. From 0.4.3 the gate checks
+# that the agent's context -- search_path among it -- is what the session started with
+# before it keeps a change (src/context.rs), so under 0.5.5 a write with a bound
+# assertion is refused, closed. 0.5.6 applies the path inside its sealed check.
 "$BIN/psql" -X -U "$SUPERUSER" -d "$DB" -v ON_ERROR_STOP=1 -q -v role="$ROLE" >/dev/null <<SQL
 CREATE TABLE shop.accounts (id int PRIMARY KEY, balance int NOT NULL);
 INSERT INTO shop.accounts VALUES (1, 10);
 GRANT SELECT, UPDATE ON shop.accounts TO :"role";
 SQL
-la_round() {  # $1 = pg_living_assertions version to install
+la_round() {  # $1 = pg_living_assertions version to install ('' = the default)
     as_super -q -c "drop extension if exists pg_living_assertions cascade" \
-             -c "create extension pg_living_assertions version '$1'" \
+             -c "create extension pg_living_assertions ${1:+version '$1'}" \
              -c "set search_path = shop" \
              -c "select living_assertions.declare('no_negative_balance', 'no account below zero',
                    \$a\$select not exists (select 1 from accounts where balance < 0) as holds\$a\$)" \
@@ -141,13 +150,22 @@ if [ -n "$(as_super -c "select 1 from pg_available_extension_versions where name
     out=$(la_round 0.5.5)
     equals "with pg_living_assertions 0.5.5, the overdraft is not kept" 10 \
         "$(as_super -c 'select balance from shop.accounts where id = 1')"
+    as_super -q -c "update shop.accounts set balance = 10" >/dev/null
+    out=$(as_agent -c "$(commit 'update shop.accounts set balance = 7 where id = 1')")
+    equals "with 0.5.5, even a write that keeps the assertion is not kept" 10 \
+        "$(as_super -c 'select balance from shop.accounts where id = 1')"
+    contains "  ...because its check left the assertion's search_path in the agent's session" \
+        "search_path is not what the session started with" "$out"
+    out=$(la_round '')
+    equals "with the current pg_living_assertions, the overdraft is not kept" 10 \
+        "$(as_super -c 'select balance from shop.accounts where id = 1')"
     contains "  ...because the assertion read the real table: broken" "broken" "$out"
     as_super -q -c "update shop.accounts set balance = 10" >/dev/null
     out=$(as_agent -c "$(commit 'update shop.accounts set balance = 7 where id = 1')")
-    equals "control: with 0.5.5, a write that keeps the assertion is kept" 7 \
+    equals "control: with the current version, a write that keeps the assertion is kept" 7 \
         "$(as_super -c 'select balance from shop.accounts where id = 1')"
 else
-    echo "  FAIL pg_living_assertions 0.5.4 and 0.5.5 must both be installable here (install 0.5.5 or later)"
+    echo "  FAIL pg_living_assertions 0.5.4 and 0.5.5 must both be installable here (install 0.5.6 or later)"
     failures=$((failures + 1))
 fi
 

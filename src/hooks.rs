@@ -39,6 +39,14 @@
 //! role -- the session's login role -- and never the current user, which PostgreSQL switches to a
 //! table's owner for an RI check.
 //!
+//! THE WHOLE SESSION, NOT ONLY THE PROPOSAL (second review of 0.4.3). The floor stood only while
+//! the agent's SQL ran, and a session runs code outside that window: a verb's parameter of an
+//! agent-made domain ran the domain's CHECK when it was bound, before any verb, and moved the
+//! tenant for the rest of the session. It now stands in every agent session except while the
+//! gate's own SQL or the DBA's assertions run (state::floor_applies); a verb's argument must be of
+//! a built-in type; and the session's context is checked around every verb (context.rs). What an
+//! allow_ddl agent's DDL drops or alters is judged here too, object by object (reach.rs).
+//!
 //! THE COMMON CASE IS FREE. Once preloaded, these run on every statement of
 //! every session, and almost none belong to an agent. Each hook first asks two
 //! questions that allocate nothing -- is the gate's own SQL running, is the
@@ -106,6 +114,7 @@ fn must_judge() -> bool {
     if state::sql_may_run() || !crate::agent_is_set() {
         return false;
     }
+    crate::context::remember();
     if let Some(name) = crate::startup_parameter_not_settable() {
         refuse(&crate::current_agent().unwrap_or_default(), started_with(&name));
     }
@@ -317,7 +326,16 @@ unsafe extern "C-unwind" fn definer_guard(
     flinfo: *mut pg_sys::FmgrInfo,
     private: *mut pg_sys::Datum,
 ) {
-    if event == pg_sys::FmgrHookEventType::FHET_START && state::proposal_running() && !flinfo.is_null() {
+    let agent = crate::agent_is_set();
+    if agent
+        && !flinfo.is_null()
+        && (event == pg_sys::FmgrHookEventType::FHET_END || event == pg_sys::FmgrHookEventType::FHET_ABORT)
+        && returns_event_trigger((*flinfo).fn_oid)
+    {
+        state::event_trigger_leave();
+    }
+    let floor_on = agent && state::floor_applies();
+    if event == pg_sys::FmgrHookEventType::FHET_START && (state::proposal_running() || floor_on) && !flinfo.is_null() {
         if let Some(name) = security_definer_name((*flinfo).fn_oid) {
             ErrorReport::new(
                 PgSqlErrorCode::ERRCODE_INSUFFICIENT_PRIVILEGE,
@@ -341,10 +359,13 @@ unsafe extern "C-unwind" fn definer_guard(
         // at propose it SET the tenant and raised the other tenant's row into the `executes`
         // detail; at commit it deleted 20 rows under a max_rows of 2 (review of 0.4.2). Such a
         // function reaches this hook because needs_floor() asked for it when it was looked up.
-        if crate::agent_is_set() {
+        if floor_on {
             if let Some(what) = floor((*flinfo).fn_oid) {
                 stop(what);
             }
+        }
+        if agent && returns_event_trigger((*flinfo).fn_oid) {
+            state::event_trigger_enter();
         }
     }
     if let Some(prev) = PREV_FMGR {
@@ -365,10 +386,15 @@ unsafe extern "C-unwind" fn needs_floor(oid: pg_sys::Oid) -> bool {
             return true;
         }
     }
-    crate::agent_is_set()
-        && oid.to_u32() >= pg_sys::FirstNormalObjectId
-        && pg_sys::IsTransactionState()
-        && user_verdict(oid).is_some()
+    if !crate::agent_is_set() || oid.to_u32() < pg_sys::FirstNormalObjectId || !pg_sys::IsTransactionState() {
+        return false;
+    }
+    crate::context::remember();
+    // Routed: what the floor stops; an event trigger's function, so that definer_guard knows when
+    // the DBA's event-trigger code runs; and a LANGUAGE internal function, which is a built-in
+    // under another name and is judged as that built-in each time it starts.
+    let j = user_judgment(oid);
+    j.stop.is_some() || j.event_trigger || j.builtin.is_some()
 }
 
 fn stop(what: String) -> ! {
@@ -567,7 +593,8 @@ unsafe fn simple_argument(node: *mut pg_sys::Node) -> Result<(), String> {
         return Err(ARGS.into());
     }
     match (*node).type_ {
-        pg_sys::NodeTag::T_Const | pg_sys::NodeTag::T_Param => Ok(()),
+        pg_sys::NodeTag::T_Const => built_in_type((*(node as *mut pg_sys::Const)).consttype),
+        pg_sys::NodeTag::T_Param => built_in_type((*(node as *mut pg_sys::Param)).paramtype),
         pg_sys::NodeTag::T_RelabelType => {
             simple_argument((*(node as *mut pg_sys::RelabelType)).arg as *mut pg_sys::Node)
         }
@@ -592,6 +619,34 @@ unsafe fn simple_argument(node: *mut pg_sys::Node) -> Result<(), String> {
             Ok(())
         }
         _ => Err(ARGS.into()),
+    }
+}
+
+/// A verb's argument has a built-in type (0.4.3, second review). A value of a type someone created
+/// runs that type's code when it is made: a domain's CHECK, when a parameter `$1::ddl.dtext` is
+/// BOUND over the extended protocol -- before this hook has seen the statement and before any verb
+/// starts. An allow_ddl agent's domain whose CHECK called set_config() moved app.tenant_id there,
+/// and an ordinary agent granted USAGE read the other tenant's rows (review of 0.4.3). The floor now
+/// stands for the whole session and stops that call (state::floor_applies); this refuses the shape
+/// as well, because no verb takes anything but text, integers and text arrays.
+fn built_in_type(t: pg_sys::Oid) -> Result<(), String> {
+    if t.to_u32() < pg_sys::FirstNormalObjectId {
+        Ok(())
+    } else {
+        Err(format!(
+            "an argument of a verb is of type {}, which is not a built-in type: its input function or a domain's \
+             CHECK would run when the value is bound, before the gate judges anything",
+            unsafe { type_name(t) }
+        ))
+    }
+}
+
+unsafe fn type_name(t: pg_sys::Oid) -> String {
+    let p = pg_sys::format_type_be(t);
+    if p.is_null() {
+        format!("{}", t.to_u32())
+    } else {
+        CStr::from_ptr(p).to_string_lossy().into_owned()
     }
 }
 
@@ -623,12 +678,27 @@ unsafe extern "C-unwind" fn object_access(
     // Since 0.4.3 this is one of the floor's two paths (see the module comment and floor()): a
     // domain's CHECK and an aggregate's transition function come here too, and what C code calls
     // through a cache comes to definer_guard.
-    if access == pg_sys::ObjectAccessType::OAT_FUNCTION_EXECUTE
-        && state::proposal_running()
-        && crate::agent_is_set()
-    {
-        if let Some(what) = floor(object_id) {
-            stop(what);
+    if access == pg_sys::ObjectAccessType::OAT_FUNCTION_EXECUTE && crate::agent_is_set() {
+        crate::context::remember();
+        if state::floor_applies() {
+            if let Some(what) = floor(object_id) {
+                stop(what);
+            }
+        }
+    }
+    // WHAT AN AGENT'S DDL REACHES (0.4.3, second review): see reach.rs. A DROP ... CASCADE is judged
+    // object by object as PostgreSQL removes it, while it still exists; what an ALTER changed and
+    // what the DDL created are noted, and judged when the DDL has run.
+    if crate::agent_is_set() && crate::reach::watching() {
+        match access {
+            pg_sys::ObjectAccessType::OAT_DROP => {
+                if let Some(why) = crate::reach::dropped(class_id, object_id, sub_id) {
+                    crate::reach::refuse(why);
+                }
+            }
+            pg_sys::ObjectAccessType::OAT_POST_ALTER => crate::reach::altered(class_id, object_id),
+            pg_sys::ObjectAccessType::OAT_POST_CREATE => crate::reach::created(class_id, object_id),
+            _ => {}
         }
     }
     if access == pg_sys::ObjectAccessType::OAT_FUNCTION_EXECUTE && fastpath_call() && must_judge() {
@@ -645,44 +715,65 @@ unsafe extern "C-unwind" fn object_access(
     }
 }
 
-/// WHAT THE FLOOR STOPS (0.4.3), named, or None. While the agent's SQL runs, a function that starts:
+/// WHAT THE FLOOR STOPS (0.4.3), named, or None. Wherever a function starts in an agent session
+/// (state::floor_applies: the whole session but the gate's own SQL and the DBA's assertions):
 ///   * set_config(), which moves a parameter the agent's row-level policies may read;
 ///   * one that runs SQL from a text (verify::SQL_FROM_TEXT), built-in or not;
-///   * a built-in that changes state outside the rows the gate counts (verify::state_change):
-///     a session advisory lock, a large object, setval(), the WAL -- in any statement; and
-///     nextval(), a transaction advisory lock or a notification in a read, which changes nothing;
-///   * a user function the agent can alter (owned by a role whose privileges the AGENT'S role
-///     has) -- what it is marked is the adversary's own claim -- or whose SET clause sets a
-///     parameter that carries the context a policy reads (verify::set_clause_allowed).
+///   * a built-in that changes state outside the rows the gate counts (verify::state_change): since
+///     the second review of 0.4.3 every VOLATILE built-in that is not on a reviewed list of those
+///     that change nothing, so a signal or an administration function nobody named -- 0.4.3 let
+///     pg_terminate_backend() through a read -- is stopped by default. nextval(), a transaction
+///     advisory lock and a notification are a write's business and stopped only in a read;
+///   * a user function the agent can alter (owned by a role the AGENT'S role is a member of, with
+///     or without INHERIT) -- what it is marked is the adversary's own claim -- or whose SET clause
+///     sets a parameter that carries the context a policy reads (verify::set_clause_allowed);
+///   * a LANGUAGE internal user function is judged as the built-in its C symbol names.
 /// A volatile user function of the DBA's is not stopped here: one reached through a body is the
 /// call the DBA placed there, and what it writes is counted (the backstop in verbs.rs, for a DDL
 /// too since 0.4.3); the floor under SECURITY DEFINER is definer_guard. Read from the syscache:
 /// this runs inside the executor and the function manager, where SPI is not an option.
 unsafe fn floor(oid: pg_sys::Oid) -> Option<String> {
-    if oid == pg_sys::Oid::from(pg_sys::F_SET_CONFIG) {
-        return Some(
-            "pg_catalog.set_config(), which would change a parameter the agent's row-level policies may read".into(),
-        );
+    let target = if oid.to_u32() >= pg_sys::FirstNormalObjectId {
+        let j = user_judgment(oid);
+        if j.stop.is_some() {
+            return j.stop;
+        }
+        match j.builtin {
+            Some(b) => b,
+            None => return None,
+        }
+    } else {
+        oid
+    };
+    if target == pg_sys::Oid::from(pg_sys::F_SET_CONFIG) {
+        return Some(format!(
+            "{}, which would change a parameter the agent's row-level policies may read",
+            function_name(oid)
+        ));
     }
-    if oid.to_u32() >= pg_sys::FirstNormalObjectId {
-        return user_verdict(oid);
-    }
-    match builtin_class(oid) {
+    let kind = state::running_kind();
+    match builtin_class(target) {
         Builtin::Plain => None,
         Builtin::SqlFromText => {
             Some(format!("{}, which runs SQL it receives as text where no check of the gate sees it", function_name(oid)))
         }
         Builtin::ChangesState(crate::verify::StateChange::InARead)
-            if matches!(state::running_kind(), state::RUNNING_WRITE | state::RUNNING_DDL) =>
+            if matches!(kind, state::RUNNING_WRITE | state::RUNNING_DDL) =>
         {
             None
         }
-        Builtin::ChangesState(crate::verify::StateChange::InARead) if state::running_kind() == state::RUNNING_TRIAL => {
-            Some(format!(
-                "{}, which changes state, and proposing changes nothing: what a sequence gives out is not \
-                 rolled back (an identity column numbers the rows of a new column without it)",
-                function_name(oid)
-            ))
+        Builtin::ChangesState(crate::verify::StateChange::InARead) if kind == state::RUNNING_TRIAL => {
+            // The DBA's event-trigger code is judged as the DDL that fired it (state::in_event_trigger),
+            // and a sequence the trial itself created vanishes with it: serial numbers the rows of a
+            // new column the way an identity column does (reach::nextval_in_trial checks, after the
+            // trial, that no sequence that existed before it was taken).
+            if state::in_event_trigger()
+                || (target == pg_sys::Oid::from(pg_sys::F_NEXTVAL) && crate::reach::nextval_in_trial())
+            {
+                None
+            } else {
+                Some(format!("{}, which changes state, and proposing changes nothing", function_name(oid)))
+            }
         }
         Builtin::ChangesState(crate::verify::StateChange::InARead) => Some(format!(
             "{}, which changes state, and a read changes nothing",
@@ -722,12 +813,14 @@ unsafe fn builtin_class(oid: pg_sys::Oid) -> Builtin {
     let form = pg_sys::heap_tuple_get_struct::<pg_sys::FormData_pg_proc>(tup);
     let lang = (*form).prolang.to_u32();
     let in_catalog = (*form).pronamespace == pg_sys::Oid::from(pg_sys::PG_CATALOG_NAMESPACE);
+    let volatile = (*form).provolatile as u8 == b'v';
+    let system_only = crate::verify::called_by_the_system_only((*form).prorettype.to_u32());
     let name = CStr::from_ptr((*form).proname.data.as_ptr()).to_string_lossy().into_owned();
     let from_text = (lang == 12 || lang == 13) && prosrc_runs_sql(tup, lang);
     pg_sys::ReleaseSysCache(tup);
     let b = if from_text {
         Builtin::SqlFromText
-    } else if let Some(c) = in_catalog.then(|| crate::verify::state_change(&name)).flatten() {
+    } else if let Some(c) = in_catalog.then(|| crate::verify::state_change(&name, volatile, system_only)).flatten() {
         Builtin::ChangesState(c)
     } else {
         Builtin::Plain
@@ -739,6 +832,13 @@ unsafe fn builtin_class(oid: pg_sys::Oid) -> Builtin {
 /// The C entry point of an internal or C function, compared with SQL_FROM_TEXT. Only those two
 /// languages name a C symbol in prosrc, so only they are read: a plpgsql body can be megabytes.
 unsafe fn prosrc_runs_sql(tup: pg_sys::HeapTuple, lang: u32) -> bool {
+    match prosrc(tup) {
+        Some(src) => crate::verify::runs_sql_from_text(lang, &src),
+        None => false,
+    }
+}
+
+unsafe fn prosrc(tup: pg_sys::HeapTuple) -> Option<String> {
     let mut isnull = false;
     let src = pg_sys::SysCacheGetAttr(
         pg_sys::SysCacheIdentifier::PROCOID as _,
@@ -747,33 +847,58 @@ unsafe fn prosrc_runs_sql(tup: pg_sys::HeapTuple, lang: u32) -> bool {
         &mut isnull,
     );
     if isnull {
-        return false;
+        return None;
     }
     let c = pg_sys::text_to_cstring(src.cast_mut_ptr::<pg_sys::text>());
-    let runs = crate::verify::runs_sql_from_text(lang, &CStr::from_ptr(c).to_string_lossy());
+    let s = CStr::from_ptr(c).to_string_lossy().into_owned();
     pg_sys::pfree(c.cast());
-    runs
+    Some(s)
 }
 
 /// The floor's verdict on a USER function (OID >= FirstNormalObjectId): what it is, not where it
-/// was reached. Used by both paths and by needs_floor, so it allocates nothing on a function it
-/// lets through, except to read a C function's entry point or a SET clause that is there.
-unsafe fn user_verdict(oid: pg_sys::Oid) -> Option<String> {
+/// was reached. Used by both paths and by needs_floor, so it allocates nothing on a plain function it
+/// lets through, except to read a C or internal function's entry point or a SET clause that is there.
+struct Judgment {
+    /// Stop it, saying why.
+    stop: Option<String>,
+    /// A LANGUAGE internal function: the built-in its C symbol names, judged in its place. Only a
+    /// superuser creates one, and it is that built-in under another name and marking -- intagg's
+    /// int_agg_state() is array_agg_transfn() marked VOLATILE (second review of 0.4.3).
+    builtin: Option<pg_sys::Oid>,
+    /// It returns event_trigger: a superuser's event-trigger function (state::in_event_trigger).
+    event_trigger: bool,
+}
+
+unsafe fn user_judgment(oid: pg_sys::Oid) -> Judgment {
+    let mut j = Judgment { stop: None, builtin: None, event_trigger: false };
     let tup = pg_sys::SearchSysCache1(pg_sys::SysCacheIdentifier::PROCOID as _, pg_sys::Datum::from(oid));
     if tup.is_null() {
-        return None;
+        return j;
     }
     let form = pg_sys::heap_tuple_get_struct::<pg_sys::FormData_pg_proc>(tup);
     let lang = (*form).prolang.to_u32();
     let owner = (*form).proowner;
-    let from_text = (lang == 12 || lang == 13) && prosrc_runs_sql(tup, lang);
+    j.event_trigger = (*form).prorettype.to_u32() == EVENT_TRIGGER_TYPE;
+    let plain_function = (*form).prokind as u8 == b'f';
+    let src = if lang == 12 || lang == 13 { prosrc(tup) } else { None };
+    let from_text = src.as_deref().is_some_and(|s| crate::verify::runs_sql_from_text(lang, s));
+    if lang == 12 && plain_function && !from_text {
+        if let Some(s) = src.as_deref() {
+            j.builtin = builtin_named(s);
+        }
+    }
     // THE AGENT'S ROLE, not GetUserId() (0.4.3). An RI check runs as the referenced table's owner
     // (SetUserIdAndSecContext), and 0.4.2 asked whether THAT role could alter the function: a
     // superuser owner can alter every function, so citext's equality operator was "the agent's"
     // and every write to a table with a citext foreign key was refused (review of 0.4.2). The
     // agent is the session's login role: an agent session can SET neither ROLE nor SESSION
     // AUTHORIZATION (the allowlist), and an agent role has no members (0.4.1).
-    let alterable = pg_sys::has_privs_of_role(pg_sys::GetSessionUserId(), owner);
+    // MEMBERSHIP, not inherited privileges (second review of 0.4.3): an agent that belongs to a
+    // role WITHOUT INHERIT may still hand its function to it (ALTER FUNCTION ... OWNER TO needs only
+    // SET), and has_privs_of_role then called the agent's own STABLE wrapper over a DELETE "the
+    // DBA's". What the agent wrote stays its own claim whoever owns it now: is_member_of_role
+    // ignores INHERIT, and ADMIN OPTION is a membership too since PostgreSQL 16.
+    let alterable = pg_sys::is_member_of_role(pg_sys::GetSessionUserId(), owner);
     let bad_set = if from_text || alterable
         || pg_sys::heap_attisnull(tup, pg_sys::Anum_pg_proc_proconfig as _, std::ptr::null_mut())
     {
@@ -799,12 +924,51 @@ unsafe fn user_verdict(oid: pg_sys::Oid) -> Option<String> {
     };
     pg_sys::ReleaseSysCache(tup);
     if from_text {
-        return Some(format!("{}, which runs SQL it receives as text where no check of the gate sees it", function_name(oid)));
+        j.stop = Some(format!("{}, which runs SQL it receives as text where no check of the gate sees it", function_name(oid)));
+    } else if alterable {
+        j.stop = Some(format!("{}, a function this agent can alter, so what it is marked is its own claim", function_name(oid)));
+    } else if let Some(p) = bad_set {
+        j.stop = Some(format!("{}, whose SET clause sets {p}, which carries the context a policy may read", function_name(oid)));
     }
-    if alterable {
-        return Some(format!("{}, a function this agent can alter, so what it is marked is its own claim", function_name(oid)));
+    j
+}
+
+thread_local! {
+    /// The built-in each C symbol of LANGUAGE internal names. fmgr_internal_function() scans the
+    /// whole built-in table, and an internal function used as an aggregate's transition function
+    /// is judged on every row.
+    static ALIASES: std::cell::RefCell<std::collections::HashMap<String, Option<pg_sys::Oid>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+unsafe fn builtin_named(symbol: &str) -> Option<pg_sys::Oid> {
+    if let Some(b) = ALIASES.with(|m| m.borrow().get(symbol).copied()) {
+        return b;
     }
-    bad_set.map(|p| format!("{}, whose SET clause sets {p}, which carries the context a policy may read", function_name(oid)))
+    let b = std::ffi::CString::new(symbol)
+        .ok()
+        .map(|c| pg_sys::fmgr_internal_function(c.as_ptr()))
+        .filter(|b| *b != pg_sys::InvalidOid);
+    ALIASES.with(|m| m.borrow_mut().insert(symbol.to_string(), b));
+    b
+}
+
+/// pg_type.dat: event_trigger. Fixed since PostgreSQL 9.3.
+const EVENT_TRIGGER_TYPE: u32 = 3838;
+
+/// Whether a function returns event_trigger: only a superuser creates an event trigger.
+unsafe fn returns_event_trigger(oid: pg_sys::Oid) -> bool {
+    if oid.to_u32() < pg_sys::FirstNormalObjectId {
+        return false;
+    }
+    let tup = pg_sys::SearchSysCache1(pg_sys::SysCacheIdentifier::PROCOID as _, pg_sys::Datum::from(oid));
+    if tup.is_null() {
+        return false;
+    }
+    let form = pg_sys::heap_tuple_get_struct::<pg_sys::FormData_pg_proc>(tup);
+    let r = (*form).prorettype.to_u32() == EVENT_TRIGGER_TYPE;
+    pg_sys::ReleaseSysCache(tup);
+    r
 }
 
 /// `schema.name()` of a function, for a refusal.

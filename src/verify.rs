@@ -70,6 +70,10 @@ pub(crate) struct Verdict {
     pub append_returning: bool,
     pub estimated_rows: Option<f64>,
     pub checks: Vec<Check>,
+    /// A DDL whose ALTER of a type is judged by what depends on the type (reach.rs): every schema
+    /// change but a GRANT, an ALTER ... OWNER or a COMMENT, which change who may use a type and
+    /// not what its values are.
+    pub judge_alters: bool,
 }
 
 impl Verdict {
@@ -121,6 +125,7 @@ pub(crate) fn verify(
         append_returning: false,
         estimated_rows: None,
         checks: Vec::new(),
+        judge_alters: false,
     };
     // Everything below runs SQL the agent wrote.
     let _running = state::proposal();
@@ -237,6 +242,10 @@ pub(crate) fn verify(
     // in a subtransaction that is rolled back.
     let runs_a_query =
         kind == Kind::Ddl && (tag == pg_sys::NodeTag::T_CreateTableAsStmt || parsed.select_into);
+    v.judge_alters = !matches!(
+        tag,
+        pg_sys::NodeTag::T_GrantStmt | pg_sys::NodeTag::T_AlterOwnerStmt | pg_sys::NodeTag::T_CommentStmt
+    );
     let mut tree_relations: Vec<pg_sys::Oid> = Vec::new();
     if kind != Kind::Ddl || runs_a_query {
         let n_params = params.as_ref().map_or(0, |p| p.len());
@@ -453,14 +462,22 @@ pub(crate) fn verify(
         // the agent's own rights and tenant can read, and the detail can be returned.
         // At propose (`estimate`) the run is a trial that is rolled back, and the floor judges it as
         // such: nextval() is stopped there as in a read. Re-verified at commit, it runs as a DDL.
+        //
+        // WHAT IT REACHES (second review of 0.4.3, reach.rs): an object it drops -- by name, through a
+        // CASCADE or as the owner of the schema -- that is not the agent's own, a temporary object,
+        // and an ALTER of a type that another role's table or function is made of stop the trial,
+        // and with it the proposal: the same judgment runs again when the commit runs it for real.
         let as_kind = if estimate { state::RUNNING_TRIAL } else { state::RUNNING_DDL };
+        let judge_alters = v.judge_alters;
         match in_subxact(
             || {
                 let _kind = state::kind_scope();
                 state::set_running_kind(as_kind);
                 let _executing = state::executing_verified();
+                crate::reach::begin(judge_alters);
                 state::allow_gate_utility();
-                run_statement(&v.statement)
+                run_statement(&v.statement);
+                crate::reach::judge_or_refuse();
             },
             |_| false,
         ) {
@@ -676,9 +693,42 @@ pub(crate) const CONTEXT_PARAMETERS: &[&str] = &["role", "session_authorization"
 /// built-in parameter sets is how the body runs -- work_mem, jit, plan_cache_mode, search_path --
 /// and 0.4.2, which allowed only what an agent may set itself, refused every read of a table whose
 /// policy function pinned plan_cache_mode (review of 0.4.2). An agent's own allowlist still passes.
+///
+/// A DOTTED NAME IS NOT ALWAYS CONTEXT (second review of 0.4.3). 0.4.3 refused every name with a
+/// dot, and with it the tuning parameters modules define -- `pg_trgm.similarity_threshold`,
+/// `hnsw.ef_search`, `plpgsql.print_strict_params` -- so a policy function that pinned one refused
+/// every agent read of its table. What carries an application's context is a PLACEHOLDER: a
+/// custom parameter no loaded module defines, which is what `app.tenant_id` is. So a dotted name
+/// passes when a loaded module defines it (it is not a placeholder), or when its prefix is the name
+/// of an installed extension, whose module defines it on load (pg_trgm is loaded only when the body
+/// that pins it runs). `agent_gate.*` never passes. A module's parameter that is not loaded and
+/// does not carry its extension's name (`hnsw.*` before vector is loaded) is still refused: closed.
 pub(crate) fn set_clause_allowed(name: &str) -> bool {
     let name = name.trim().to_lowercase();
-    crate::settable(&name) || !(name.contains('.') || CONTEXT_PARAMETERS.contains(&name.as_str()))
+    if crate::settable(&name) {
+        return true;
+    }
+    if CONTEXT_PARAMETERS.contains(&name.as_str()) {
+        return false;
+    }
+    match name.split_once('.') {
+        None => true,
+        Some((prefix, _)) => prefix != "agent_gate" && unsafe { defined_by_a_module(&name, prefix) },
+    }
+}
+
+/// A module's own parameter, not a placeholder (see set_clause_allowed). Asks GUC and the catalog,
+/// not SPI: the floor calls this from the executor and the function manager.
+unsafe fn defined_by_a_module(name: &str, prefix: &str) -> bool {
+    let (Ok(n), Ok(p)) = (CString::new(name), CString::new(prefix)) else {
+        return false;
+    };
+    if !pg_sys::GetConfigOption(n.as_ptr(), true, false).is_null()
+        && (pg_sys::GetConfigOptionFlags(n.as_ptr(), true) as u32 & pg_sys::GUC_CUSTOM_PLACEHOLDER) == 0
+    {
+        return true;
+    }
+    pg_sys::IsTransactionState() && pg_sys::get_extension_oid(p.as_ptr(), true) != pg_sys::InvalidOid
 }
 
 /// How a built-in changes state outside the rows the gate counts.
@@ -694,46 +744,92 @@ pub(crate) enum StateChange {
     InARead,
 }
 
-/// What a pg_catalog function does to state outside rows, by name (0.2.14; split by statement in
-/// 0.4.3, when the same list became the floor's: hooks::floor).
-pub(crate) fn state_change(proname: &str) -> Option<StateChange> {
-    const IN_A_READ: &[&str] = &[
-        "nextval",
-        "pg_advisory_xact_lock",
-        "pg_advisory_xact_lock_shared",
-        "pg_try_advisory_xact_lock",
-        "pg_try_advisory_xact_lock_shared",
-        "pg_notify",
-    ];
-    const ALWAYS: &[&str] = &[
-        "setval",
-        "setseed",
-        "pg_logical_emit_message",
-        "pg_switch_wal",
-        "pg_create_restore_point",
-        "pg_create_physical_replication_slot",
-        "pg_create_logical_replication_slot",
-        "pg_drop_replication_slot",
-        "pg_replication_origin_create",
-        "pg_replication_origin_drop",
-        "loread",
-        "lowrite",
-    ];
+/// What a pg_catalog function does to state outside rows (0.2.14; split by statement in 0.4.3, when
+/// the same rule became the floor's: hooks::floor).
+///
+/// A CLASSIFICATION, NOT A LIST OF WHAT IS FORBIDDEN (second review of 0.4.3). Up to 0.4.3 this
+/// named the built-ins that change state, and a list of what is forbidden misses what nobody named:
+/// pg_terminate_backend() ended another session from a "read" in which nothing changed. Now the
+/// rule is PostgreSQL's own marking: a built-in that is not VOLATILE changes nothing (the planner
+/// relies on that much), and a VOLATILE one changes state unless it is on READS_ONLY, the reviewed
+/// list of those that only read, wait or draw a random number. So a new signal or administration
+/// function -- PostgreSQL 19 brings pg_enable_data_checksums() -- is refused by default.
+///
+/// The derivation, on PostgreSQL 18.6 and 19beta2:
+///   select proname from pg_proc where oid < 16384 and provolatile = 'v'
+///      and prorettype not in ('trigger', 'event_trigger', 'internal', the handler types)
+/// gives 280 names (PG 19: 288). Each was read in the documentation or the source, and sorted into
+/// READS_ONLY, IN_A_READ, or neither -- a state change in any statement. Those returning trigger,
+/// event_trigger, internal or a handler type are called by the server, never by a statement
+/// (a function returning internal must take internal), so they are not judged here.
+pub(crate) fn state_change(proname: &str, volatile: bool, system_only: bool) -> Option<StateChange> {
     if IN_A_READ.contains(&proname) {
         Some(StateChange::InARead)
-    } else if ALWAYS.contains(&proname)
-        || proname.starts_with("pg_advisory_")
-        || proname.starts_with("pg_try_advisory_")
-        || proname.starts_with("pg_stat_reset")
-        || proname.starts_with("lo_")
-    {
-        Some(StateChange::Always)
-    } else {
+    } else if !volatile || system_only || READS_ONLY.contains(&proname) || proname.starts_with("pg_stat_get_") {
         None
+    } else {
+        Some(StateChange::Always)
     }
 }
 
-/// The functions a statement calls ($1), with what an AGGREGATE among them runs (0.4.3).
+/// How a write numbers its rows, takes a lock until it commits, or tells a listener it committed:
+/// a write's business, and a change in a read.
+const IN_A_READ: &[&str] = &[
+    "nextval",
+    "pg_advisory_xact_lock",
+    "pg_advisory_xact_lock_shared",
+    "pg_try_advisory_xact_lock",
+    "pg_try_advisory_xact_lock_shared",
+    "pg_notify",
+];
+
+/// VOLATILE built-ins that change nothing outside the statement (reviewed; see state_change).
+/// Volatile because each call may answer differently, not because it writes.
+const READS_ONLY: &[&str] = &[
+    // a random number or the clock
+    "random", "random_normal", "array_sample", "array_shuffle", "gen_random_uuid", "uuidv4", "uuidv7",
+    "clock_timestamp", "timeofday",
+    // waiting
+    "pg_sleep", "pg_sleep_for", "pg_sleep_until",
+    // what this session last drew from a sequence, and a sequence's state, read
+    "currval", "lastval", "pg_sequence_last_value", "pg_get_sequence_data",
+    // reading a large object: a descriptor lives as long as the transaction (lo_open, lo_close)
+    "lo_get", "loread", "lo_open", "lo_close", "lo_lseek", "lo_lseek64", "lo_tell", "lo_tell64",
+    // sizes, locks, recovery, the WAL position, the control file, commit timestamps
+    "pg_database_size", "pg_relation_size", "pg_table_size", "pg_indexes_size", "pg_total_relation_size",
+    "pg_tablespace_size", "pg_stat_have_stats", "pg_stat_clear_snapshot", "pg_lock_status", "pg_blocking_pids",
+    "pg_safe_snapshot_blocking_pids", "pg_isolation_test_session_is_blocked", "pg_is_in_recovery",
+    "pg_is_wal_replay_paused", "pg_get_wal_replay_pause_state", "pg_last_wal_receive_lsn",
+    "pg_last_wal_replay_lsn", "pg_last_xact_replay_timestamp", "pg_last_committed_xact",
+    "pg_current_wal_lsn", "pg_current_wal_insert_lsn", "pg_current_wal_flush_lsn", "pg_control_checkpoint",
+    "pg_control_init", "pg_control_recovery", "pg_control_system", "pg_jit_available",
+    "pg_xact_commit_timestamp", "pg_xact_commit_timestamp_origin", "pg_xact_status", "txid_status",
+    "pg_notification_queue_usage", "pg_partition_tree", "pg_partition_ancestors",
+    "pg_collation_actual_version", "pg_database_collation_actual_version",
+    // the server's own state, read
+    "pg_get_aios", "pg_get_backend_memory_contexts", "pg_get_loaded_modules", "pg_get_multixact_members",
+    "pg_get_multixact_stats", "pg_get_shmem_allocations", "pg_get_shmem_allocations_numa",
+    "pg_get_dsm_registry_allocations", "pg_get_wait_events", "pg_get_wal_resource_managers",
+    "pg_get_wal_summarizer_state", "pg_available_wal_summaries", "pg_wal_summary_contents",
+    "pg_hba_file_rules", "pg_ident_file_mappings", "pg_show_all_file_settings",
+    "pg_show_replication_origin_status", "pg_replication_origin_session_is_setup", "pg_prepared_xact",
+    "pg_current_logfile", "current_query", "currtid2", "amvalidate", "plpgsql_validator",
+    // files and decoded changes, read -- what a role may read is its privileges' business
+    "pg_ls_dir", "pg_ls_logdir", "pg_ls_waldir", "pg_ls_archive_statusdir", "pg_ls_tmpdir",
+    "pg_ls_logicalmapdir", "pg_ls_logicalsnapdir", "pg_ls_replslotdir", "pg_ls_summariesdir",
+    "pg_read_file", "pg_read_binary_file", "pg_stat_file", "pg_logical_slot_peek_changes",
+    "pg_logical_slot_peek_binary_changes",
+];
+
+/// A function the server calls and a statement cannot: it returns trigger, event_trigger, internal
+/// (and so takes internal) or a handler type. pg_type.dat; fixed since PostgreSQL 9.x.
+pub(crate) fn called_by_the_system_only(rettype: u32) -> bool {
+    matches!(rettype, 2279 | 3838 | 2281 | 2280 | 3115 | 325 | 269 | 3310)
+}
+
+/// The functions a statement calls ($1), with what an AGGREGATE among them runs (0.4.3). Read by
+/// index from the called OIDs (`= any (array(...))`, a LATERAL kept apart by OFFSET 0): the generic
+/// plan of `in (select ...)` scanned all of pg_proc, twice once a join was added -- 3 ms a verb.
 /// AggregateCreate stores every aggregate as IMMUTABLE, so an aggregate over a DBA's volatile
 /// transition function passed no_opaque_function and advanced a sequence 25 times from a read
 /// (review of 0.4.2). Its code is its support functions; they are judged as if called.
@@ -777,9 +873,6 @@ fn opaque_function(funcs: &[pg_sys::Oid]) -> Result<Option<Opaque>, String> {
     }
     let ids: Vec<i64> = funcs.iter().map(|o| o.to_u32() as i64).collect();
     let symbols: Vec<String> = SQL_FROM_TEXT.iter().map(|s| s.to_string()).collect();
-    let mut settable: Vec<String> = crate::SETTABLE_BY_AGENTS.iter().map(|s| s.to_string()).collect();
-    settable.extend(crate::settable_extra());
-    let context: Vec<String> = CONTEXT_PARAMETERS.iter().map(|s| s.to_string()).collect();
     let found = crate::exec::get_one_prepared::<String>(
         concat!(called_cte!(), "select (
            select case when x.from_text then 'T' else 'B' end ||
@@ -793,18 +886,11 @@ fn opaque_function(funcs: &[pg_sys::Oid]) -> Result<Option<Opaque>, String> {
                       case
                         when p.oid < 16384 then null
                         when p.prosecdef then 'security definer'
-                        when p.provolatile = 'v' then 'volatile'
-                        when $3 and pg_catalog.pg_has_role(session_user, p.proowner, 'USAGE')
+                        when p.provolatile = 'v' and p.prolang <> 12 then 'volatile'
+                        when $3 and pg_catalog.pg_has_role(session_user, p.proowner, 'MEMBER')
                           then 'this agent can alter it, so what it is marked is its own claim'
-                        else (select 'its SET clause sets ' || k.n ||
-                                     ', which carries the context a policy may read'
-                                from pg_catalog.unnest(p.proconfig) c
-                                cross join lateral (select pg_catalog.lower(pg_catalog.split_part(c, '=', 1)) n) k
-                               where not (k.n = any($4::text[])
-                                          or (pg_catalog.strpos(k.n, '.') = 0 and k.n <> all($5::text[])))
-                               limit 1)
                       end as why) x
-            where p.oid in (select oid from called)
+            where p.oid = any (array(select oid from called))
               and (x.from_text or x.why is not null)
             order by x.from_text desc
             limit 1
@@ -813,14 +899,32 @@ fn opaque_function(funcs: &[pg_sys::Oid]) -> Result<Option<Opaque>, String> {
             PgOid::BuiltIn(PgBuiltInOids::INT8ARRAYOID),
             PgOid::BuiltIn(PgBuiltInOids::TEXTARRAYOID),
             PgOid::BuiltIn(PgBuiltInOids::BOOLOID),
-            PgOid::BuiltIn(PgBuiltInOids::TEXTARRAYOID),
-            PgOid::BuiltIn(PgBuiltInOids::TEXTARRAYOID),
         ],
-        &[ids.into(), symbols.into(), crate::agent_is_set().into(), settable.into(), context.into()],
+        &[ids.clone().into(), symbols.into(), crate::agent_is_set().into()],
     )?;
-    Ok(found.map(|f| match f.split_at(1) {
-        ("T", rest) => Opaque::SqlFromText(rest.to_string()),
-        (_, rest) => Opaque::Body(rest.to_string()),
+    if let Some(f) = found {
+        return Ok(Some(match f.split_at(1) {
+            ("T", rest) => Opaque::SqlFromText(rest.to_string()),
+            (_, rest) => Opaque::Body(rest.to_string()),
+        }));
+    }
+    // The SET clauses, judged by the rule the floor uses (set_clause_allowed): whether a dotted name
+    // is a module's parameter is a question for GUC and the catalog, not for this query.
+    let clauses = crate::exec::get_one_prepared::<Vec<String>>(
+        concat!(called_cte!(), "select coalesce(pg_catalog.array_agg(n.nspname || '.' || p.proname || '()' || chr(1) ||
+                    pg_catalog.split_part(c, '=', 1)), '{}')
+             from pg_catalog.pg_proc p
+             join pg_catalog.pg_namespace n on n.oid = p.pronamespace
+             cross join lateral pg_catalog.unnest(p.proconfig) c
+            where p.oid = any (array(select oid from called)) and p.oid >= 16384"),
+        &[PgOid::BuiltIn(PgBuiltInOids::INT8ARRAYOID)],
+        &[ids.into()],
+    )?;
+    Ok(clauses.unwrap_or_default().into_iter().find_map(|c| {
+        let (f, p) = c.split_once('\u{1}')?;
+        (!set_clause_allowed(p)).then(|| {
+            Opaque::Body(format!("{f} (its SET clause sets {}, which carries the context a policy may read)", p.to_lowercase()))
+        })
     }))
 }
 
@@ -833,19 +937,36 @@ fn stateful_builtin(funcs: &[pg_sys::Oid], kind: Kind) -> Result<Option<String>,
         return Ok(None);
     }
     let ids: Vec<i64> = funcs.iter().map(|o| o.to_u32() as i64).collect();
+    // A LANGUAGE internal user function is the built-in its C symbol names (intagg's int_agg_state()
+    // is array_agg_transfn()): judged as that built-in, by its marking and its name.
     let names = crate::exec::get_one_prepared::<Vec<String>>(
-        concat!(called_cte!(), "select coalesce(array_agg(p.proname::text), '{}')
+        concat!(called_cte!(), "select coalesce(pg_catalog.array_agg(b.proname::text || chr(1) || b.provolatile::text || chr(1) ||
+                    b.prorettype::int8::text), '{}')
              from pg_catalog.pg_proc p
-            where p.oid in (select oid from called)
-              and p.pronamespace = 'pg_catalog'::regnamespace"),
+             cross join lateral (
+               select y.proname, y.provolatile, y.prorettype from pg_catalog.pg_proc y
+                where y.oid = case
+                        when p.oid >= 16384 and p.prolang = 12 and p.prokind = 'f'
+                          then (select x.oid from pg_catalog.pg_proc x
+                                 where x.oid < 16384 and x.prolang = 12 and x.prosrc = p.prosrc
+                                 order by x.oid limit 1)
+                        else p.oid end
+                  and y.pronamespace = 'pg_catalog'::regnamespace
+               offset 0) b
+            where p.oid = any (array(select oid from called))"),
         &[PgOid::BuiltIn(PgBuiltInOids::INT8ARRAYOID)],
         &[ids.into()],
     )?;
-    Ok(names.unwrap_or_default().into_iter().find(|n| match state_change(n) {
-        Some(StateChange::Always) => true,
-        Some(StateChange::InARead) => kind == Kind::Read,
-        None => false,
-    }).map(|n| format!("{n}()")))
+    Ok(names.unwrap_or_default().into_iter().find_map(|row| {
+        let mut f = row.split('\u{1}');
+        let (n, vol, ret) = (f.next()?, f.next()?, f.next()?.parse::<u32>().ok()?);
+        let refuse = match state_change(n, vol == "v", called_by_the_system_only(ret)) {
+            Some(StateChange::Always) => true,
+            Some(StateChange::InARead) => kind == Kind::Read,
+            None => false,
+        };
+        refuse.then(|| format!("{n}()"))
+    }))
 }
 
 /// Whether the current role could NOT read in full some relation the statement touches -- in the
