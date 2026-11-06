@@ -77,6 +77,9 @@ pub(crate) struct Verdict {
     /// A DDL whose ALTER of a function is judged by what is built on the function (reach.rs): one
     /// that changes what it computes -- not a RENAME or a SET SCHEMA, which change only its name.
     pub judge_redefinitions: bool,
+    /// The statement is an UPDATE of a partitioned table (its root): one that can move a row to
+    /// another partition, which the backstop's tuple counters see as a delete and an insert.
+    pub partitioned_update: Option<pg_sys::Oid>,
 }
 
 impl Verdict {
@@ -130,6 +133,7 @@ pub(crate) fn verify(
         checks: Vec::new(),
         judge_alters: false,
         judge_redefinitions: false,
+        partitioned_update: None,
     };
     // Everything below runs SQL the agent wrote.
     let _running = state::proposal();
@@ -264,6 +268,7 @@ pub(crate) fn verify(
                 return v;
             }
         };
+        v.partitioned_update = tree.partitioned_update;
         if tree.modifies && kind == Kind::Read {
             // A SELECT whose CTE writes is a write.
             kind = Kind::Write;
@@ -582,6 +587,13 @@ struct Tree {
     /// rows of one of them from this role -- and the plan's estimate, which counts them all, is
     /// withheld.
     relations: Vec<pg_sys::Oid>,
+    /// The column DEFAULTs the rewriter wrote into the statement from the catalog of a table the
+    /// agent cannot alter (catalog_defaults): the owner's code, not the agent's call, so the walker
+    /// does not judge them as the statement's own. The floor judges them when they run.
+    owners_defaults: std::collections::HashSet<usize>,
+    /// The statement itself (the rewritten query that sets the command tag) is an UPDATE whose
+    /// target is a partitioned table: Verdict::partitioned_update.
+    partitioned_update: Option<pg_sys::Oid>,
 }
 
 /// Record a Query's result relation. A data-modifying command sets `modifies`; a locking read does
@@ -1049,14 +1061,34 @@ unsafe fn analyze_tree(statement: &str, n_params: usize) -> Tree {
     let raw = pg_sys::list_nth(raws, 0) as *mut pg_sys::RawStmt;
     assert!(!(*raw).stmt.is_null(), "the verified statement re-parses to a non-empty node");
     let types = vec![pg_sys::TEXTOID; n_params];
-    let queries = pg_sys::pg_analyze_and_rewrite_fixedparams(
+    // pg_analyze_and_rewrite_fixedparams, in its two steps: what the AGENT wrote is read between
+    // them, before the rewriter adds what the catalog attaches (see catalog_defaults).
+    let analyzed = pg_sys::parse_analyze_fixedparams(
         raw,
         text.as_ptr(),
         types.as_ptr(),
         n_params as i32,
         std::ptr::null_mut(),
     );
+    let written = agent_written(analyzed);
+    let queries = pg_sys::pg_rewrite_query(analyzed);
     let mut tree = Tree::default();
+    for i in 0..list_len(queries) {
+        let q = pg_sys::list_nth(queries, i) as *mut pg_sys::Query;
+        catalog_defaults(q, &written, &mut tree);
+        if (*q).canSetTag
+            && (*q).commandType == pg_sys::CmdType::CMD_UPDATE
+            && (*q).resultRelation > 0
+            && (*q).resultRelation <= list_len((*q).rtable)
+        {
+            let rte = pg_sys::list_nth((*q).rtable, (*q).resultRelation - 1) as *mut pg_sys::RangeTblEntry;
+            if (*rte).rtekind == pg_sys::RTEKind::RTE_RELATION
+                && (*rte).relkind as u8 == pg_sys::RELKIND_PARTITIONED_TABLE
+            {
+                tree.partitioned_update = Some((*rte).relid);
+            }
+        }
+    }
     for i in 0..list_len(queries) {
         let q = pg_sys::list_nth(queries, i) as *mut pg_sys::Query;
         // A CREATE TABLE AS (SELECT INTO is analyzed into one) is a utility whose query the
@@ -1088,6 +1120,142 @@ unsafe fn analyze_tree(statement: &str, n_params: usize) -> Tree {
     tree
 }
 
+/// THE OWNER'S DEFAULTS ARE THE OWNER'S CODE (fourth review of 0.4.3). For an INSERT -- and an
+/// UPDATE's or a MERGE's `SET c = DEFAULT` -- the rewriter writes each column DEFAULT the catalog
+/// holds into the statement's target list, and the walker took it for a call the agent wrote: a
+/// DBA's `DEFAULT encode(gen_random_bytes(12), 'hex')` (pgcrypto) or `DEFAULT next_order_no()` (a
+/// plpgsql order-number generator) refused every agent INSERT that relied on it, as
+/// no_opaque_function. What the catalog attaches is judged where the catalog's code is judged: by
+/// the floor, when it runs (hooks::floor and definer_guard -- a SECURITY DEFINER default, one that
+/// runs SQL from a text, one whose SET clause moves a context parameter or that the agent can alter
+/// is stopped there, and the rows it writes are counted by the backstop), like a CHECK, a trigger
+/// or a generated column, which the rewriter does not write into the statement either.
+///
+/// A default is set apart only when all of this holds; anything else is walked as the agent's:
+///   * the target-list entry (or multi-row VALUES item) is not one the agent wrote -- its node was
+///     not in the analyzed statement, or was a `DEFAULT` there (agent_written, read before the
+///     rewriter ran);
+///   * its expression is exactly the column's DEFAULT in the catalog (build_column_default, the
+///     rewriter's own source), so an entry the rewriter merged from the agent's assignments
+///     (`SET a[1] = f(), a[2] = g()`) or a view's own default is never taken for one;
+///   * the table is not the agent's to alter (owned by a role its login role is a member of, the
+///     floor's rule): a default the agent set on its own table is code the agent planted, and stays
+///     judged as if the statement called it.
+unsafe fn agent_written(q: *mut pg_sys::Query) -> std::collections::HashSet<usize> {
+    let mut written = std::collections::HashSet::new();
+    for l in assignment_lists(q) {
+        for i in 0..list_len(l) {
+            let te = pg_sys::list_nth(l, i) as *mut pg_sys::TargetEntry;
+            if !is_set_to_default((*te).expr as *mut pg_sys::Node) {
+                written.insert(te as usize);
+            }
+        }
+    }
+    for i in 0..list_len((*q).rtable) {
+        let rte = pg_sys::list_nth((*q).rtable, i) as *mut pg_sys::RangeTblEntry;
+        if (*rte).rtekind != pg_sys::RTEKind::RTE_VALUES {
+            continue;
+        }
+        for r in 0..list_len((*rte).values_lists) {
+            let row = pg_sys::list_nth((*rte).values_lists, r) as *mut pg_sys::List;
+            for c in 0..list_len(row) {
+                let item = pg_sys::list_nth(row, c) as *mut pg_sys::Node;
+                if !is_set_to_default(item) {
+                    written.insert(item as usize);
+                }
+            }
+        }
+    }
+    written
+}
+
+/// The lists where the rewriter writes a column's DEFAULT: the target list, ON CONFLICT DO UPDATE's
+/// SET, and each MERGE action's.
+unsafe fn assignment_lists(q: *mut pg_sys::Query) -> Vec<*mut pg_sys::List> {
+    let mut lists = vec![(*q).targetList];
+    if !(*q).onConflict.is_null() {
+        lists.push((*(*q).onConflict).onConflictSet);
+    }
+    for i in 0..list_len((*q).mergeActionList) {
+        lists.push((*(pg_sys::list_nth((*q).mergeActionList, i) as *mut pg_sys::MergeAction)).targetList);
+    }
+    lists
+}
+
+unsafe fn is_set_to_default(node: *mut pg_sys::Node) -> bool {
+    !node.is_null() && (*node).type_ == pg_sys::NodeTag::T_SetToDefault
+}
+
+/// Records in `tree.owners_defaults` the column DEFAULTs the rewriter wrote into `q` from the
+/// catalog of a table the agent cannot alter (see agent_written for the rule).
+unsafe fn catalog_defaults(q: *mut pg_sys::Query, written: &std::collections::HashSet<usize>, tree: &mut Tree) {
+    if !matches!(
+        (*q).commandType,
+        pg_sys::CmdType::CMD_INSERT | pg_sys::CmdType::CMD_UPDATE | pg_sys::CmdType::CMD_MERGE
+    ) || (*q).resultRelation <= 0
+        || (*q).resultRelation > list_len((*q).rtable)
+    {
+        return;
+    }
+    let rte = pg_sys::list_nth((*q).rtable, (*q).resultRelation - 1) as *mut pg_sys::RangeTblEntry;
+    if rte.is_null() || (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION {
+        return;
+    }
+    // Locked by the analyzer already.
+    let rel = pg_sys::table_open((*rte).relid, pg_sys::NoLock as _);
+    if pg_sys::is_member_of_role(pg_sys::GetSessionUserId(), (*(*rel).rd_rel).relowner) {
+        pg_sys::table_close(rel, pg_sys::NoLock as _);
+        return;
+    }
+    let natts = (*(*rel).rd_att).natts as i32;
+    let is_default = |attno: i32, expr: *mut pg_sys::Node| -> bool {
+        if attno < 1 || attno > natts || expr.is_null() {
+            return false;
+        }
+        let d = pg_sys::build_column_default(rel, attno);
+        !d.is_null() && pg_sys::equal(d as *const c_void, expr as *const c_void)
+    };
+    // A multi-row VALUES: which of its columns feeds which column of the table.
+    let mut values_columns: Vec<(i32, i32, i32)> = Vec::new(); // (rtindex, its column, attno)
+    for l in assignment_lists(q) {
+        for i in 0..list_len(l) {
+            let te = pg_sys::list_nth(l, i) as *mut pg_sys::TargetEntry;
+            if (*te).resjunk {
+                continue;
+            }
+            let expr = (*te).expr as *mut pg_sys::Node;
+            if !written.contains(&(te as usize)) && is_default((*te).resno as i32, expr) {
+                tree.owners_defaults.insert(expr as usize);
+            } else if !expr.is_null() && (*expr).type_ == pg_sys::NodeTag::T_Var {
+                let v = expr as *mut pg_sys::Var;
+                if (*v).varlevelsup == 0 && (*v).varno > 0 {
+                    values_columns.push(((*v).varno, (*v).varattno as i32, (*te).resno as i32));
+                }
+            }
+        }
+    }
+    for (rti, col, attno) in values_columns {
+        if rti > list_len((*q).rtable) {
+            continue;
+        }
+        let vrte = pg_sys::list_nth((*q).rtable, rti - 1) as *mut pg_sys::RangeTblEntry;
+        if (*vrte).rtekind != pg_sys::RTEKind::RTE_VALUES {
+            continue;
+        }
+        for r in 0..list_len((*vrte).values_lists) {
+            let row = pg_sys::list_nth((*vrte).values_lists, r) as *mut pg_sys::List;
+            if col < 1 || col > list_len(row) {
+                continue;
+            }
+            let item = pg_sys::list_nth(row, col - 1) as *mut pg_sys::Node;
+            if !written.contains(&(item as usize)) && is_default(attno, item) {
+                tree.owners_defaults.insert(item as usize);
+            }
+        }
+    }
+    pg_sys::table_close(rel, pg_sys::NoLock as _);
+}
+
 /// Tree walker: stops (returns true) at the first set_config(); records a writing CTE in
 /// any nested query and keeps walking, because set_config may still be further down.
 #[pg_guard]
@@ -1096,6 +1264,9 @@ unsafe extern "C-unwind" fn walk(node: *mut pg_sys::Node, context: *mut c_void) 
         return false;
     }
     let tree = &mut *(context as *mut Tree);
+    if tree.owners_defaults.contains(&(node as usize)) {
+        return false;
+    }
     match (*node).type_ {
         pg_sys::NodeTag::T_FuncExpr => {
             let fe = node as *mut pg_sys::FuncExpr;

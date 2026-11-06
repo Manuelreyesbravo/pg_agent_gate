@@ -514,6 +514,71 @@ fn xact_tuples() -> Option<i64> {
     .flatten()
 }
 
+/// A ROW MOVED TO ANOTHER PARTITION IS ONE ROW (fourth review of 0.4.3). An UPDATE that changes a
+/// partition key deletes the row from one partition and inserts it into another, and the tuple
+/// counters record exactly that: a delete and an insert, and no update. 0.4.3 counted each such row
+/// twice -- an UPDATE of 6 rows from October into November was aborted under a max_rows of 10, the
+/// refusal blaming a trigger, cascade, rule or function the table did not have -- so any UPDATE of
+/// a partition key was refused above half the limit.
+///
+/// How many rows the statement moved is not counted anywhere, so it is bounded from what is: each
+/// row the UPDATE named (`processed`) was either updated in place -- one update in the counters --
+/// or moved; so it moved at most `processed - updates`, the updates of every table in the
+/// transaction since the statement started (more updates, from a trigger, only lower the bound).
+/// A move is also a delete and an insert in the leaves of the target's partition tree, so at most
+/// as many as those. The smallest of the three is subtracted: never more than the rows that really
+/// moved, so whatever else changed is still counted. Only when every leaf is a heap table: an update
+/// of a foreign partition is not in the counters, and the bound would not hold. Anything that cannot
+/// be read subtracts nothing (the safe side).
+struct Relocation {
+    updated: i64,
+    inserted: i64,
+    deleted: i64,
+}
+
+fn relocation(root: pg_sys::Oid) -> Option<Relocation> {
+    let _running = state::proposal();
+    let found = crate::exec::get_one_prepared::<JsonB>(
+        "select pg_catalog.jsonb_build_object( \
+            'updated', (select coalesce(sum(pg_catalog.pg_stat_get_xact_tuples_updated(c.oid)), 0) \
+                          from pg_catalog.pg_class c \
+                         where c.relkind in ('r', 'm', 'p') \
+                           and c.relnamespace not in (select n.oid from pg_catalog.pg_namespace n \
+                                where n.nspname in ('pg_catalog', 'information_schema', \
+                                                    'agent_gate', 'agent_gate_internal'))), \
+            'inserted', (select coalesce(sum(pg_catalog.pg_stat_get_xact_tuples_inserted(t.relid)), 0) \
+                           from pg_catalog.pg_partition_tree($1) t where t.isleaf), \
+            'deleted', (select coalesce(sum(pg_catalog.pg_stat_get_xact_tuples_deleted(t.relid)), 0) \
+                          from pg_catalog.pg_partition_tree($1) t where t.isleaf), \
+            'heap_leaves', (select pg_catalog.bool_and(c.relkind = 'r' and a.amname = 'heap') \
+                              from pg_catalog.pg_partition_tree($1) t \
+                              join pg_catalog.pg_class c on c.oid = t.relid \
+                              left join pg_catalog.pg_am a on a.oid = c.relam \
+                             where t.isleaf))",
+        &[PgOid::BuiltIn(PgBuiltInOids::OIDOID)],
+        &[root.into()],
+    )
+    .ok()
+    .flatten()?;
+    let j = found.0;
+    if j["heap_leaves"].as_bool() != Some(true) {
+        return None;
+    }
+    Some(Relocation {
+        updated: j["updated"].as_i64()?,
+        inserted: j["inserted"].as_i64()?,
+        deleted: j["deleted"].as_i64()?,
+    })
+}
+
+/// The rows the statement can only have moved between partitions (see Relocation), 0 or more.
+fn relocated_rows(before: &Relocation, after: &Relocation, processed: i64) -> i64 {
+    let updated = after.updated.saturating_sub(before.updated);
+    let inserted = after.inserted.saturating_sub(before.inserted);
+    let deleted = after.deleted.saturating_sub(before.deleted);
+    processed.saturating_sub(updated).min(inserted).min(deleted).max(0)
+}
+
 /// THE SAME BACKSTOP FOR A DDL (0.4.3), per relation. A schema change runs code over rows -- a
 /// DEFAULT or a CHECK added to a table that has some, an index expression, a range type's
 /// support function in an index build -- and up to 0.4.2 nothing it changed was counted: an
@@ -690,6 +755,7 @@ fn execute(proposal: i64, mode: Mode) -> Value {
     let bindings = cfg.bindings.clone();
     let max_rows = cfg.max_rows;
     let (judge_alters, judge_redefinitions) = (verdict.judge_alters, verdict.judge_redefinitions);
+    let partitioned_update = if kind == Kind::Write { verdict.partitioned_update } else { None };
 
     // THE WRITE BUDGET (0.4.0). max_rows bounds one proposal; an agent that loops split a write
     // it was refused into slices that each fit (agent-gate-demo/compare: a 6-row table emptied
@@ -721,6 +787,7 @@ fn execute(proposal: i64, mode: Mode) -> Value {
             let _kind = state::kind_scope();
             state::set_running_kind(verify::running(kind));
             let tup_before = xact_tuples();   // the backstop's starting point, inside this subxact
+            let relocation_before = partitioned_update.and_then(relocation);
             let ddl_before = if kind == Kind::Ddl { xact_tuples_by_relation() } else { None };
             // Hold the executing window across BOTH the verified statement and the gate's own SET
             // CONSTRAINTS below (where deferred constraint triggers fire): any utility a trigger,
@@ -816,12 +883,19 @@ fn execute(proposal: i64, mode: Mode) -> Value {
                     // CLOSED: if a snapshot could not be read, abort rather than assume zero.
                     match (tup_before, xact_tuples()) {
                         (Some(before), Some(after)) => {
-                            let moved = after.saturating_sub(before);
+                            let relocated = match (&relocation_before, partitioned_update) {
+                                (Some(b), Some(root)) => relocation(root)
+                                    .map_or(0, |a| relocated_rows(b, &a, rows.processed as i64)),
+                                _ => 0,
+                            };
+                            let moved = after.saturating_sub(before).saturating_sub(relocated);
                             moved_total = Some(moved.max(rows.processed as i64));
                             if moved > max_rows {
+                                let more = moved.saturating_sub(rows.processed as i64);
                                 abort = Some(format!(
-                                    "it changed {moved} rows in all -- {} named plus more from a trigger, \
-                                     cascade, rule or function -- more than this agent may change in one statement",
+                                    "it changed {moved} rows in all -- the {} it named and {more} more that a \
+                                     trigger, cascade, rule or function changed -- more than this agent may \
+                                     change in one statement",
                                     rows.processed
                                 ));
                             }

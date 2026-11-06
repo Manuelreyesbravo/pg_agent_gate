@@ -500,6 +500,16 @@ unsafe fn utility_allowed(stmt: *mut pg_sys::Node) -> Result<(), String> {
                 ))
             }
         }
+        // A CONNECTION POOL'S RESET (fourth review of 0.4.3). DISCARD ALL is PgBouncer's
+        // server_reset_query and what Npgsql's pool sends when a connection is handed back, and an
+        // agent's pooled connection failed it on every reuse. What it resets is the session's own
+        // and nothing else: its parameters go back to what the ROLE was given (RESET ALL, which
+        // passes), SESSION AUTHORIZATION to the role it logged in as -- the agent -- and it drops
+        // the session's prepared statements, plans, temporary tables, LISTENs and advisory locks.
+        // It reads and writes no row, cannot run inside a transaction (so not inside a verb), and
+        // a temporary table it drops is the agent's own. DEALLOCATE drops the session's own
+        // prepared statements, which is what a driver's statement cache sends.
+        pg_sys::NodeTag::T_DiscardStmt | pg_sys::NodeTag::T_DeallocateStmt => Ok(()),
         other => Err(format!("{other:?} is not one of the gate's verbs ({})", VERBS.join(", "))),
     }
 }
