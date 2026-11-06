@@ -12,9 +12,12 @@ does not reproduce there), and those of a second review, of 0.4.3 itself before 
 `tests/audit7.sh` (58 checks: against that first build of 0.4.3, 38 fail on both 18.6 and
 19beta2 -- the other 20 are controls and effects that hold either way), and those of a third
 review in `tests/audit8.sh` (43 checks: against the second build of 0.4.3, 26 fail on both 18.6
-and 19beta2 -- the other 17 are controls and effects that hold either way). Against 0.4.3, on 18.6
-and 19beta2, the suites of `make verify`: 536 passed, 0 failed on both, each suite in a fresh
-cluster (the pgrx unit tests could not run in this environment).
+and 19beta2 -- the other 17 are controls and effects that hold either way), and those of a fourth
+review in `tests/audit9.sh` (44 checks: against the third build of 0.4.3, 23 fail on 18.6; on
+19beta2, whose build has no pgcrypto, 42 checks and 21 fail -- the others are controls and effects
+that hold either way). Against 0.4.3, the suites of `make verify`: 580 passed, 0 failed on 18.6 and
+578 passed, 0 failed on 19beta2, each suite in a fresh cluster (the pgrx unit tests could not run
+in this environment).
 
 0.4.3 had not been released when the second and third reviews ran, so what they found is closed in
 0.4.3 and not in a 0.4.4: no object of the schema changes, and there is no installation of a 0.4.3 that
@@ -250,6 +253,46 @@ into its record with PostgreSQL's error; the gate now refuses it first, saying w
 finding is a limit, said in the README: `TimeZone` is on the allowlist, and a DBA's policy that
 compares with `current_date` or a `timestamp` cast reads the session's zone, so an agent moving it
 saw a row embargoed until tomorrow (no other tenant's).
+
+**A fourth review, of 0.4.3 before its release** (`tests/audit9.sh`). It found no isolation or
+accounting bypass. Two findings were false refusals of ordinary work, closed by a principle each:
+
+* **The owner's DEFAULT is the owner's code.** A volatile function in the column `DEFAULT` of a
+  DBA's table -- pgcrypto's `encode(gen_random_bytes(12), 'hex')`, a PL/pgSQL order-number
+  generator -- refused every agent `INSERT` that relied on it, as `no_opaque_function`. The
+  rewriter writes the catalog's `DEFAULT` into the statement, and the walker took it for the
+  agent's own call; the README said it did not follow a column `DEFAULT`.
+  The analysis is now split around the rewriter (`parse_analyze_fixedparams`, then
+  `pg_rewrite_query`), and what the agent wrote is read in between. An entry the rewriter added
+  -- an `INSERT`'s omitted column or `DEFAULT` (a multi-row `VALUES` too, through a view too), an
+  `UPDATE`'s `SET c = DEFAULT`, a `MERGE`'s `INSERT` -- is set apart from the walk when it is
+  exactly the column's `DEFAULT` in the catalog (`build_column_default`, the rewriter's own
+  source) and the table is not the agent's to alter (`verify::catalog_defaults`). It is judged
+  where a `CHECK` or a trigger is, by the floor when it runs. A `SECURITY DEFINER` `DEFAULT`, one
+  that calls `set_config()`, and one over a function the agent can alter are still stopped there,
+  before they run. The rows such a `DEFAULT` writes are counted by the backstop. A call the agent writes itself, even the same
+  expression, and a `DEFAULT` on the agent's own table stay judged as the agent's call.
+* **A row moved to another partition is one row.** An `UPDATE` that changes a partition key
+  deletes the row in one partition and inserts it in another, and the backstop, which reads the
+  transaction's tuple counters, counted both: 6 rows moved from October to November were aborted
+  under a `max_rows` of 10, the refusal blaming "a trigger, cascade, rule or function" the table did
+  not have. How many rows moved is not counted anywhere, so it is bounded from what is. Each row
+  the `UPDATE` named was either updated in place or moved, so at most `processed - updates` moved,
+  and at most as many as the inserts and deletes in the leaves of the target's partition tree. The
+  smallest is subtracted, never more than really moved, so a trigger's rows are still counted
+  (`verbs::relocated_rows`). Only for an `UPDATE` of a partitioned table whose leaves are all heap
+  tables: a foreign partition's update is not in the counters. The refusal now says how many rows
+  the statement named and how many more something else changed.
+
+One low finding, fixed because it was cheap: `DISCARD ALL` -- PgBouncer's `server_reset_query`
+in session mode and Npgsql's pool reset -- and `DEALLOCATE` were refused in an agent's session, so
+a pooled agent connection failed every reuse. They reset only the session's own state (its
+parameters to what its role was given, as `RESET ALL`, which passed; its prepared statements,
+plans, temporary tables, `LISTEN`s and advisory locks), and pass. The other low finding is a limit,
+said in the README: `lastval()` in an agent's session names the gate's own record sequence, drawn
+after the agent's statement, and is refused for lack of privilege on it; `RETURNING` and
+`currval()` give the agent's value. A `MERGE` that moves rows between partitions is still counted
+twice.
 
 ## 0.4.1 -- 2026-10-31
 

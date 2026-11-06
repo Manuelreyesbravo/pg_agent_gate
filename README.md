@@ -132,9 +132,11 @@ make clean-machine                           # the same, in a fresh container th
 | `audit6.sh` | code the tree does not show: a range type's support function, a domain's `CHECK`, an aggregate, a DDL's `DEFAULT`; large objects; a foreign key over `citext` (0.4.3) | 44 |
 | `audit7.sh` | a verb's parameter of an agent's domain, a temporary table under a DBA's helper, a `DROP ... CASCADE` or `ALTER TYPE` reaching a DBA's table, a read that ends another session, code handed to a `NOINHERIT` role; and a module's `SET` parameter, an event trigger, `MERGE`, `lo_get()`, intagg, `serial` (0.4.3) | 58 |
 | `audit8.sh` | an extension's C function in an agent's domain `CHECK`, `CREATE OR REPLACE FUNCTION` under a DBA's index, an index or `DETACH` reaching a DBA's partition; a `varchar[]` argument, a read-only transaction (0.4.3) | 43 |
+| `audit9.sh` | a volatile function in a DBA's column `DEFAULT`, an `UPDATE` that moves rows between partitions, a pool's `DISCARD ALL` (0.4.3) | 44 |
 | pgrx unit tests | the verbs, from inside the server | 13 |
 
-On PostgreSQL 18.6 and 19beta2, for 0.4.3, the suites above: **536 checks passed, 0 failed** on both;
+On PostgreSQL 18.6 and 19beta2, for 0.4.3, the suites above: **580 checks passed, 0 failed** on
+18.6 and **578 passed, 0 failed** on 19beta2, which has no pgcrypto for two of `audit9.sh`'s checks;
 `make verify` adds the 13 pgrx unit tests. The fresh Debian container receiving only
 what git has committed runs the same suites, with 18 and 19beta4 from PGDG. CI runs the
 same container for 18 and 19 on every push. `VERIFY_DRIVERS=1` adds real pgjdbc and
@@ -786,7 +788,10 @@ Said here so nobody learns it the hard way:
   default, an index, a trigger -- is judged as the statement's own call. Native code (C,
   an untrusted language) is refused in every statement, so a C trigger function from
   contrib on an agent's table refuses its writes; SQL and PL/pgSQL are refused in reads
-  and run in writes. Two edges of that: the judgment is by function, not by call site,
+  and run in writes -- but a `DEFAULT` of the agent's own table that an `INSERT` relies on
+  is written into the statement by the rewriter, and is judged there as the statement's own
+  call: `no_opaque_function` refuses a volatile user function in it. Two more edges: the
+  judgment is by function, not by call site,
   so once an agent's object calls a DBA's function every call of it in that agent's
   sessions is judged so; and it knows what PostgreSQL records in `pg_depend` -- a
   PL/pgSQL body records nothing, so a DBA's function that an agent's PL/pgSQL function
@@ -830,7 +835,8 @@ Said here so nobody learns it the hard way:
   client formatting and time limits, which is what a driver sets on its own
   (`application_name`, `client_encoding`, `DateStyle`, `statement_timeout`,
   the transaction characteristics, and a few more). `SHOW` and transaction
-  control pass; everything else is refused, including `role`,
+  control pass, and so do `DISCARD` and `DEALLOCATE` (a pool's reset, which puts the
+  session's own state back); everything else is refused, including `role`,
   `session_authorization`, every `agent_gate.*` setting even if someone granted
   `SET ON PARAMETER` on it, and -- the reason it is an allowlist and not a list
   of forbidden names -- whatever the application decides with. A row-level
@@ -892,6 +898,10 @@ Said here so nobody learns it the hard way:
   is refused in an agent session.
 * **With `attempt_durability = fast`, a crash can lose records of attempts**
   that changed nothing. Never of changes.
+* **`lastval()` names the gate's own sequence in an agent's session.** Each verb draws from
+  the record's sequences after the agent's statement, so `SELECT lastval()` (PHP PDO's
+  `lastInsertId()` with no sequence name) is refused for lack of privilege on the gate's
+  sequence. `INSERT ... RETURNING` and `currval('the_sequence')` give the agent's own value.
 * **`dry_run` is a rollback, not a sandbox.** Sequence values, session advisory
   locks, and anything outside the transaction (`dblink`, untrusted languages)
   are not undone.
@@ -916,7 +926,13 @@ Said here so nobody learns it the hard way:
   any other way: through a row comparison (`RowCompareExpr`), an aggregate's own transition or
   final functions, an I/O or user cast, or a function the *catalog* attaches rather than the
   statement -- a column `DEFAULT`, a `CHECK` or domain constraint, a generated column, an
-  expression index, or the body of a view or another function the statement touches. For ordinary
+  expression index, or the body of a view or another function the statement touches. (The
+  rewriter does write a column `DEFAULT` into an `INSERT`, or an `UPDATE`'s `SET c = DEFAULT`; since
+  the fourth review of 0.4.3 the walker sets it apart when it is exactly the catalog's `DEFAULT` of
+  a table the agent cannot alter and not something the agent wrote, so a DBA's
+  `gen_random_bytes()` or order-number `DEFAULT` no longer refuses the agent's `INSERT`. That is
+  the owner's code, judged by the floor when it runs, like a `CHECK`. A `DEFAULT` of the agent's
+  own table is still walked as its call.) For ordinary
   DML done this way the commit backstop still counts the rows against `max_rows` (bounded in COUNT,
   though not in tenant or privilege -- like an allow-listed trigger, a row written this way is
   counted but not tenant-filtered). A nested UTILITY is worse than uncounted: `pg_stat_xact`
@@ -950,7 +966,12 @@ Said here so nobody learns it the hard way:
   `SECURITY DEFINER`. A cascade and a rule are NOT allow-listable in 0.2.3 (making some
   cascades safe needs a recursive closure over the cascade edges, and lands in 0.2.4),
   and a SECURITY DEFINER trigger never is. The commit backstop still counts every
-  amplified row against `max_rows` (it over-counts, the safe side). It reads
+  amplified row against `max_rows` (it over-counts, the safe side). A row an `UPDATE` moves to
+  another partition is a delete and an insert in those counters. Since the fourth review of 0.4.3
+  it is counted once: no more rows than the statement can only have moved -- what it named minus
+  the updates, and no more than the inserts and deletes in its target's leaves -- are taken off.
+  Before, an `UPDATE` of a partition key was refused above half of `max_rows`. A `MERGE` that moves
+  rows, and a tree with a foreign or non-heap leaf, are still counted twice. It reads
   `pg_stat_xact_user_tables`, which counts USER TABLES only -- not foreign tables, large
   objects, sequences, or effects outside the transaction; a `TRUNCATE` it does not count is
   instead refused as a nested utility (0.2.4). "What the gate can check" is the honest bound: a non-SECURITY DEFINER
