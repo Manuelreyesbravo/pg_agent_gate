@@ -167,6 +167,18 @@ fn begin_verb() {
              snapshot older than other sessions' commits"
         );
     }
+    // NOT IN A READ-ONLY TRANSACTION (third review of 0.4.3). Every verb writes its proposal and its
+    // outcome to the record before anything else, so in a transaction opened READ ONLY -- pgjdbc's
+    // setReadOnly(true), Spring's @Transactional(readOnly = true), a hot standby -- even a read
+    // failed on the gate's own INSERT, with PostgreSQL's error about a table the agent never named.
+    // The gate says so itself: a proposal that cannot be recorded is not made.
+    if unsafe { pg_sys::XactReadOnly } {
+        error!(
+            "pg_agent_gate: the verbs do not run in a read-only transaction: every proposal, a read \
+             too, is written to the gate's record before it runs. Call the verb outside READ ONLY \
+             (with pgjdbc, setReadOnly(false)); a hot standby cannot hold the record"
+        );
+    }
     if !state::txn_seen() {
         let already_wrote = unsafe { pg_sys::GetTopTransactionIdIfAny() } != pg_sys::TransactionId::INVALID;
         state::mark_txn_seen(already_wrote);
@@ -677,7 +689,7 @@ fn execute(proposal: i64, mode: Mode) -> Value {
     let args = verify::text_args(&params);
     let bindings = cfg.bindings.clone();
     let max_rows = cfg.max_rows;
-    let judge_alters = verdict.judge_alters;
+    let (judge_alters, judge_redefinitions) = (verdict.judge_alters, verdict.judge_redefinitions);
 
     // THE WRITE BUDGET (0.4.0). max_rows bounds one proposal; an agent that loops split a write
     // it was refused into slices that each fit (agent-gate-demo/compare: a 6-row table emptied
@@ -723,7 +735,7 @@ fn execute(proposal: i64, mode: Mode) -> Value {
                     // The verified statement is itself a utility only when it is DDL (an allow_ddl
                     // agent's CREATE INDEX, ...): exempt that one, so it is not refused as nested.
                     if kind == Kind::Ddl {
-                        crate::reach::begin(judge_alters);
+                        crate::reach::begin(judge_alters, judge_redefinitions);
                         state::allow_gate_utility();
                     }
                     match kind {

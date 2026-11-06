@@ -391,10 +391,11 @@ unsafe extern "C-unwind" fn needs_floor(oid: pg_sys::Oid) -> bool {
     }
     crate::context::remember();
     // Routed: what the floor stops; an event trigger's function, so that definer_guard knows when
-    // the DBA's event-trigger code runs; and a LANGUAGE internal function, which is a built-in
-    // under another name and is judged as that built-in each time it starts.
+    // the DBA's event-trigger code runs; a LANGUAGE internal function, which is a built-in under
+    // another name and is judged as that built-in each time it starts; and a volatile function an
+    // object of the agent's calls, judged by the statement running each time it starts.
     let j = user_judgment(oid);
-    j.stop.is_some() || j.event_trigger || j.builtin.is_some()
+    j.stop.is_some() || j.event_trigger || j.builtin.is_some() || j.planted.is_some()
 }
 
 fn stop(what: String) -> ! {
@@ -607,10 +608,7 @@ unsafe fn simple_argument(node: *mut pg_sys::Node) -> Result<(), String> {
         }
         pg_sys::NodeTag::T_FuncExpr => {
             let f = &*(node as *mut pg_sys::FuncExpr);
-            let catalog = pg_sys::get_namespace_oid(c"pg_catalog".as_ptr(), false);
-            if f.funcformat != pg_sys::CoercionForm::COERCE_IMPLICIT_CAST
-                || pg_sys::get_func_namespace(f.funcid) != catalog
-            {
+            if !implicit_catalog_cast(f) {
                 return Err(ARGS.into());
             }
             for i in 0..list_len(f.args) {
@@ -618,7 +616,55 @@ unsafe fn simple_argument(node: *mut pg_sys::Node) -> Result<(), String> {
             }
             Ok(())
         }
+        // AN ARRAY COERCED ELEMENT BY ELEMENT (third review of 0.4.3). pgjdbc binds a String[] as
+        // varchar[], and the parser coerces it to the verb's text[] with an ArrayCoerceExpr whose
+        // per-element step is a relabel: no code of anyone's runs. 0.4.3 had no arm for it, so every
+        // Java client passing parameters as a String[] was refused. Accepted only as the parser's
+        // implicit coercion to a built-in array type, whose step is a relabel or the parser's own
+        // implicit cast through a pg_catalog function -- the rules a scalar argument is held to.
+        pg_sys::NodeTag::T_ArrayCoerceExpr => {
+            let a = &*(node as *mut pg_sys::ArrayCoerceExpr);
+            if a.coerceformat != pg_sys::CoercionForm::COERCE_IMPLICIT_CAST {
+                return Err(ARGS.into());
+            }
+            element_step(a.elemexpr as *mut pg_sys::Node)?;
+            built_in_type(a.resulttype)?;
+            simple_argument(a.arg as *mut pg_sys::Node)
+        }
         _ => Err(ARGS.into()),
+    }
+}
+
+/// The cast the parser inserts on its own, through a built-in function.
+unsafe fn implicit_catalog_cast(f: &pg_sys::FuncExpr) -> bool {
+    let catalog = pg_sys::get_namespace_oid(c"pg_catalog".as_ptr(), false);
+    f.funcformat == pg_sys::CoercionForm::COERCE_IMPLICIT_CAST && pg_sys::get_func_namespace(f.funcid) == catalog
+}
+
+/// The per-element step of an ArrayCoerceExpr: the element itself (CaseTestExpr), relabelled or
+/// passed through the parser's implicit cast of a built-in function, with built-in constants
+/// beside it (a typmod, an explicit flag). Anything else -- an I/O conversion, a cast through a
+/// user function -- is code, and refused.
+unsafe fn element_step(node: *mut pg_sys::Node) -> Result<(), String> {
+    const STEP: &str = "arguments of a verb must be literals or parameters, not expressions that run code";
+    if node.is_null() {
+        return Err(STEP.into());
+    }
+    match (*node).type_ {
+        pg_sys::NodeTag::T_CaseTestExpr => Ok(()),
+        pg_sys::NodeTag::T_RelabelType => element_step((*(node as *mut pg_sys::RelabelType)).arg as *mut pg_sys::Node),
+        pg_sys::NodeTag::T_Const => built_in_type((*(node as *mut pg_sys::Const)).consttype),
+        pg_sys::NodeTag::T_FuncExpr => {
+            let f = &*(node as *mut pg_sys::FuncExpr);
+            if !implicit_catalog_cast(f) {
+                return Err(STEP.into());
+            }
+            for i in 0..list_len(f.args) {
+                element_step(nth::<pg_sys::Node>(f.args, i))?;
+            }
+            Ok(())
+        }
+        _ => Err(STEP.into()),
     }
 }
 
@@ -727,10 +773,15 @@ unsafe extern "C-unwind" fn object_access(
 ///   * a user function the agent can alter (owned by a role the AGENT'S role is a member of, with
 ///     or without INHERIT) -- what it is marked is the adversary's own claim -- or whose SET clause
 ///     sets a parameter that carries the context a policy reads (verify::set_clause_allowed);
-///   * a LANGUAGE internal user function is judged as the built-in its C symbol names.
-/// A volatile user function of the DBA's is not stopped here: one reached through a body is the
-/// call the DBA placed there, and what it writes is counted (the backstop in verbs.rs, for a DDL
-/// too since 0.4.3); the floor under SECURITY DEFINER is definer_guard. Read from the syscache:
+///   * a LANGUAGE internal user function is judged as the built-in its C symbol names;
+///   * a VOLATILE user function of another role's that THE AGENT PLACED (third review of 0.4.3):
+///     one that an object the agent can alter calls -- its domain's CHECK, a default, a generated
+///     column, an index, a constraint, a policy, a trigger, a view, an operator, a type's support
+///     function. Code the agent planted is the agent's code, judged as if the statement called it
+///     (see planted_verdict).
+/// A volatile user function of the DBA's that only the DBA's objects call is not stopped here: it
+/// is the call the DBA placed there, and what it writes is counted (the backstop in verbs.rs, for a
+/// DDL too since 0.4.3); the floor under SECURITY DEFINER is definer_guard. Read from the syscache:
 /// this runs inside the executor and the function manager, where SPI is not an option.
 unsafe fn floor(oid: pg_sys::Oid) -> Option<String> {
     let target = if oid.to_u32() >= pg_sys::FirstNormalObjectId {
@@ -740,7 +791,7 @@ unsafe fn floor(oid: pg_sys::Oid) -> Option<String> {
         }
         match j.builtin {
             Some(b) => b,
-            None => return None,
+            None => return j.planted.and_then(|c| planted_verdict(oid, c)),
         }
     } else {
         oid
@@ -781,6 +832,32 @@ unsafe fn floor(oid: pg_sys::Oid) -> Option<String> {
         )),
         Builtin::ChangesState(crate::verify::StateChange::Always) => Some(format!(
             "{}, which changes state outside the rows the gate counts",
+            function_name(oid)
+        )),
+    }
+}
+
+/// A volatile function of another role's that an object of the agent's calls (Judgment::planted):
+/// judged as the statement's own call would be. A function whose body PostgreSQL's executor runs
+/// (SQL, PL/pgSQL) is judged like nextval(): its own statements meet the floor one by one and its
+/// rows are counted, so a write may run it and a read or a proposal may not. Any other -- C, an
+/// untrusted language -- is native code like a built-in, and an unreviewed volatile built-in
+/// changes state outside the rows the gate counts: stopped in every statement. pg_trgm's
+/// set_limit() in an agent's domain CHECK moved the session's similarity threshold from a write,
+/// and pg_prewarm's autoprewarm_dump_now() there wrote a file on the server from a read (third
+/// review of 0.4.3), both "the call the DBA placed" in 0.4.3.
+unsafe fn planted_verdict(oid: pg_sys::Oid, c: crate::verify::StateChange) -> Option<String> {
+    const PLACED: &str = "a volatile function that an object of this agent's calls -- a domain's CHECK, a \
+                          default, a generated column, an index, a constraint, a policy, a trigger, a \
+                          view, a type -- and code the agent placed is judged as the agent's own";
+    let kind = state::running_kind();
+    match c {
+        crate::verify::StateChange::InARead if matches!(kind, state::RUNNING_WRITE | state::RUNNING_DDL) => None,
+        crate::verify::StateChange::InARead => {
+            Some(format!("{}, {PLACED}: it may change state, and a read or a proposal changes nothing", function_name(oid)))
+        }
+        crate::verify::StateChange::Always => Some(format!(
+            "{}, {PLACED}: it is native code whose changes fall outside the rows the gate counts",
             function_name(oid)
         )),
     }
@@ -867,10 +944,13 @@ struct Judgment {
     builtin: Option<pg_sys::Oid>,
     /// It returns event_trigger: a superuser's event-trigger function (state::in_event_trigger).
     event_trigger: bool,
+    /// A VOLATILE function of another role's that an object of the agent's calls (planted_verdict):
+    /// how it is judged -- InARead for a body the executor runs, Always for native code.
+    planted: Option<crate::verify::StateChange>,
 }
 
 unsafe fn user_judgment(oid: pg_sys::Oid) -> Judgment {
-    let mut j = Judgment { stop: None, builtin: None, event_trigger: false };
+    let mut j = Judgment { stop: None, builtin: None, event_trigger: false, planted: None };
     let tup = pg_sys::SearchSysCache1(pg_sys::SysCacheIdentifier::PROCOID as _, pg_sys::Datum::from(oid));
     if tup.is_null() {
         return j;
@@ -880,6 +960,7 @@ unsafe fn user_judgment(oid: pg_sys::Oid) -> Judgment {
     let owner = (*form).proowner;
     j.event_trigger = (*form).prorettype.to_u32() == EVENT_TRIGGER_TYPE;
     let plain_function = (*form).prokind as u8 == b'f';
+    let volatile = (*form).provolatile as u8 == b'v';
     let src = if lang == 12 || lang == 13 { prosrc(tup) } else { None };
     let from_text = src.as_deref().is_some_and(|s| crate::verify::runs_sql_from_text(lang, s));
     if lang == 12 && plain_function && !from_text {
@@ -929,9 +1010,21 @@ unsafe fn user_judgment(oid: pg_sys::Oid) -> Judgment {
         j.stop = Some(format!("{}, a function this agent can alter, so what it is marked is its own claim", function_name(oid)));
     } else if let Some(p) = bad_set {
         j.stop = Some(format!("{}, whose SET clause sets {p}, which carries the context a policy may read", function_name(oid)));
+    } else if volatile && lang != 12 && crate::reach::called_by_agent_object(oid) {
+        // Only a volatile function pays for the lookup, and only in an agent's session.
+        let executor_runs_it = lang == SQL_LANGUAGE
+            || pg_sys::get_language_oid(c"plpgsql".as_ptr(), true).to_u32() == lang;
+        j.planted = Some(if executor_runs_it {
+            crate::verify::StateChange::InARead
+        } else {
+            crate::verify::StateChange::Always
+        });
     }
     j
 }
+
+/// pg_language.dat: sql. Fixed since PostgreSQL 7.x.
+const SQL_LANGUAGE: u32 = 14;
 
 thread_local! {
     /// The built-in each C symbol of LANGUAGE internal names. fmgr_internal_function() scans the

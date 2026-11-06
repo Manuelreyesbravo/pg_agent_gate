@@ -10,12 +10,14 @@ hold either way), those of the review of 0.4.2 in `tests/audit6.sh` (44 checks: 
 PostgreSQL 18.6, 31 fail -- the other 13 are controls; on 19beta2, 29, as the citext case below
 does not reproduce there), and those of a second review, of 0.4.3 itself before its release, in
 `tests/audit7.sh` (58 checks: against that first build of 0.4.3, 38 fail on both 18.6 and
-19beta2 -- the other 20 are controls and effects that hold either way). Against 0.4.3, on 18.6
-and 19beta2, the suites of `make verify`: 493 passed, 0 failed on both (the pgrx unit tests could
-not run in this environment).
+19beta2 -- the other 20 are controls and effects that hold either way), and those of a third
+review in `tests/audit8.sh` (43 checks: against the second build of 0.4.3, 26 fail on both 18.6
+and 19beta2 -- the other 17 are controls and effects that hold either way). Against 0.4.3, on 18.6
+and 19beta2, the suites of `make verify`: 536 passed, 0 failed on both, each suite in a fresh
+cluster (the pgrx unit tests could not run in this environment).
 
-0.4.3 had not been released when the second review ran, so what it found is closed in 0.4.3 and
-not in a 0.4.4: no object of the schema changes, and there is no installation of a 0.4.3 that
+0.4.3 had not been released when the second and third reviews ran, so what they found is closed in
+0.4.3 and not in a 0.4.4: no object of the schema changes, and there is no installation of a 0.4.3 that
 behaves the other way for a version number to tell apart.
 
 **The principle: code is judged where it starts.** Every finding of both reviews was code the
@@ -203,6 +205,51 @@ code an agent plants that other roles later run, and why `REVOKE EXECUTE ... FRO
 since the second review also an agent's schema searched before a DBA's, the reviewed list of
 built-ins, what the context is, a module's parameter before it loads, and what a DDL's trial can
 still draw from a sequence.
+
+**A third review, of 0.4.3 before its release** (`tests/audit8.sh`). No finding crossed a tenant.
+Three were of medium weight, closed by a principle each:
+
+* **Code the agent planted is the agent's code.** The floor let a `VOLATILE` function of another
+  role's through whenever a body reached it, as "the call the DBA placed there" -- and an
+  `allow_ddl` agent placed one itself, in its own domain's `CHECK`: pg_trgm's `set_limit()` moved
+  the session's similarity threshold from a write, and pg_prewarm's `autoprewarm_dump_now()` wrote
+  `autoprewarm.blocks` on the server from a read, both refused when called directly. Now a
+  `VOLATILE` function of another role's that an object the agent can alter calls -- a domain's or a
+  table's `CHECK`, a default, a generated column, an index, a policy, a trigger, a view, an
+  operator, an aggregate, a range type, an SQL-body function: whatever records a dependency on it
+  in `pg_depend` -- is judged as the statement's own call would be (`reach::called_by_agent_object`,
+  `hooks::planted_verdict`). Native code (C, an untrusted language) is like an unreviewed
+  `VOLATILE` built-in and is stopped in every statement; a body PostgreSQL's executor runs (SQL,
+  PL/pgSQL) is like `nextval()`: stopped in a read and at propose, and run in a write, where each
+  statement in it meets the floor and its rows are counted. "The call the DBA placed" now means
+  one only the DBA's objects make.
+* **An agent's DDL changes only what the agent owns -- a function's meaning too.** `CREATE OR
+  REPLACE FUNCTION` of an agent's `IMMUTABLE` function, after a DBA built on it, left the DBA's
+  unique expression index unable to find its rows, its generated column computing a value no row
+  stored, and the DBA's own `INSERT`s failing its `CHECK`; `reach.rs` judged only a type's alters.
+  A function the DDL redefines (`CREATE OR REPLACE`, `ALTER FUNCTION` but a `RENAME` or `SET
+  SCHEMA`) is now judged by what is built on it, directly or through the agent's SQL-body
+  functions: an index, constraint, default, view, policy, trigger, operator, function, statistics
+  object or operator family of another role stops it. The same judgment now covers what a DDL
+  creates and what it takes out of a tree, two of the low findings: an index (or trigger) on an
+  agent's partitioned table is made on every partition, and one made on a DBA's partition broke the
+  DBA's inserts; `DETACH PARTITION` took a DBA's table out of the agent's. Each created relation,
+  trigger, constraint, policy or rule must be the agent's (a foreign key's internal triggers on the
+  table it references are how a `REFERENCES` grant works, and pass), and a table taken out of its
+  parent must be.
+* **A false refusal of every Java client passing a `String[]`.** pgjdbc binds one as `varchar[]`,
+  and the parser coerces it to the verbs' `text[]` with an `ArrayCoerceExpr` whose per-element step
+  is a relabel: no code runs, but the argument check had no arm for it. It is accepted now as the
+  parser's implicit coercion to a built-in array type whose element step is a relabel or an
+  implicit cast through a `pg_catalog` function; an explicit or I/O-conversion element cast is
+  still refused.
+
+And one low finding, fixed because it was cheap: a verb in a `READ ONLY` transaction (pgjdbc's
+`setReadOnly(true)`, Spring's `readOnly = true`, a hot standby) failed on the gate's own `INSERT`
+into its record with PostgreSQL's error; the gate now refuses it first, saying why. The last low
+finding is a limit, said in the README: `TimeZone` is on the allowlist, and a DBA's policy that
+compares with `current_date` or a `timestamp` cast reads the session's zone, so an agent moving it
+saw a row embargoed until tomorrow (no other tenant's).
 
 ## 0.4.1 -- 2026-10-31
 

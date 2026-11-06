@@ -74,6 +74,9 @@ pub(crate) struct Verdict {
     /// change but a GRANT, an ALTER ... OWNER or a COMMENT, which change who may use a type and
     /// not what its values are.
     pub judge_alters: bool,
+    /// A DDL whose ALTER of a function is judged by what is built on the function (reach.rs): one
+    /// that changes what it computes -- not a RENAME or a SET SCHEMA, which change only its name.
+    pub judge_redefinitions: bool,
 }
 
 impl Verdict {
@@ -126,6 +129,7 @@ pub(crate) fn verify(
         estimated_rows: None,
         checks: Vec::new(),
         judge_alters: false,
+        judge_redefinitions: false,
     };
     // Everything below runs SQL the agent wrote.
     let _running = state::proposal();
@@ -246,6 +250,8 @@ pub(crate) fn verify(
         tag,
         pg_sys::NodeTag::T_GrantStmt | pg_sys::NodeTag::T_AlterOwnerStmt | pg_sys::NodeTag::T_CommentStmt
     );
+    v.judge_redefinitions =
+        !matches!(tag, pg_sys::NodeTag::T_RenameStmt | pg_sys::NodeTag::T_AlterObjectSchemaStmt);
     let mut tree_relations: Vec<pg_sys::Oid> = Vec::new();
     if kind != Kind::Ddl || runs_a_query {
         let n_params = params.as_ref().map_or(0, |p| p.len());
@@ -468,13 +474,13 @@ pub(crate) fn verify(
         // and an ALTER of a type that another role's table or function is made of stop the trial,
         // and with it the proposal: the same judgment runs again when the commit runs it for real.
         let as_kind = if estimate { state::RUNNING_TRIAL } else { state::RUNNING_DDL };
-        let judge_alters = v.judge_alters;
+        let (judge_alters, judge_redefinitions) = (v.judge_alters, v.judge_redefinitions);
         match in_subxact(
             || {
                 let _kind = state::kind_scope();
                 state::set_running_kind(as_kind);
                 let _executing = state::executing_verified();
-                crate::reach::begin(judge_alters);
+                crate::reach::begin(judge_alters, judge_redefinitions);
                 state::allow_gate_utility();
                 run_statement(&v.statement);
                 crate::reach::judge_or_refuse();
