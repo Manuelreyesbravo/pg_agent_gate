@@ -119,7 +119,7 @@ make clean-machine                           # the same, in a fresh container th
 | `upgrade.sh` | an installation of the oldest schema, upgraded | 13 |
 | `flushes.sh` | the WAL flushes each act pays against its durability | 8 |
 | `plan_time.sh` | what runs while the gate verifies and plans | 45 |
-| `pg_temp.sh` | a temporary catalog of the agent hiding what a write sets off | 17 |
+| `pg_temp.sh` | a temporary catalog of the agent hiding what a write sets off; an assertion's path left in the session | 18 |
 | `rollback.sh` | what a rollback takes from the record | 12 |
 | `audit3.sh` | the third audit: fast-path, the gate's path, foreign proposals, DDL, roles, 2PC, dump | 18 |
 | `audit4.sh` | the rest of it: settings between dry_run and commit, side effects of a read, a reused name, record size | 18 |
@@ -130,15 +130,16 @@ make clean-machine                           # the same, in a fresh container th
 | `membership.sh` | another role becoming the agent with `SET ROLE` (0.4.1) | 16 |
 | `audit5.sh` | SQL passed as text, `CREATE TABLE AS` over a writing CTE, functions the agent can alter or with a `SET` clause (0.4.3) | 44 |
 | `audit6.sh` | code the tree does not show: a range type's support function, a domain's `CHECK`, an aggregate, a DDL's `DEFAULT`; large objects; a foreign key over `citext` (0.4.3) | 44 |
+| `audit7.sh` | a verb's parameter of an agent's domain, a temporary table under a DBA's helper, a `DROP ... CASCADE` or `ALTER TYPE` reaching a DBA's table, a read that ends another session, code handed to a `NOINHERIT` role; and a module's `SET` parameter, an event trigger, `MERGE`, `lo_get()`, intagg, `serial` (0.4.3) | 58 |
 | pgrx unit tests | the verbs, from inside the server | 13 |
 
-On PostgreSQL 18.6 and 19beta2, for 0.4.3, the suites above: **434 checks passed, 0 failed** on both;
+On PostgreSQL 18.6 and 19beta2, for 0.4.3, the suites above: **493 checks passed, 0 failed** on both;
 `make verify` adds the 13 pgrx unit tests. The fresh Debian container receiving only
 what git has committed runs the same suites, with 18 and 19beta4 from PGDG. CI runs the
 same container for 18 and 19 on every push. `VERIFY_DRIVERS=1` adds real pgjdbc and
 node-pg sessions.
 
-Those 434 are the hand-written suites above. The amplification class that `0.2.2` and `0.2.3`
+Those 493 are the hand-written suites above. The amplification class that `0.2.2` and `0.2.3`
 closed -- a writing CTE, a cascading foreign key, a trigger, a rule, an opaque (volatile or
 `SECURITY DEFINER`) function, and the commit-time row-count backstop and per-agent allow-list
 that back them -- is guarded by **`make fuzz`**, not by `make verify`. Its teeth build each of
@@ -276,7 +277,15 @@ Nothing is reimplemented. Each check is PostgreSQL itself:
    where it starts (0.4.3):** the executor asks the gate before it runs any function,
    built-ins included, and the function manager asks for every user function C code
    calls through a cache -- a range type's support function, an RI check, a trigger
-   (`tests/audit5.sh`, `tests/audit6.sh`).
+   (`tests/audit5.sh`, `tests/audit6.sh`). **In the whole session, and the context is the
+   gate's (second review of 0.4.3):** a verb's parameter bound as an agent's domain ran the
+   domain's `CHECK` before any verb started and switched the tenant for the rest of the session.
+   The floor now stands in every agent session, not only while its SQL runs; a verb's argument
+   must be of a built-in type; and the session's context -- `role`, `session_authorization`,
+   `row_security`, `session_replication_role`, `search_path` and every placeholder parameter
+   such as `app.tenant_id` -- is remembered when the session starts and checked when every verb
+   starts, after the agent's SQL ran, and before a row is returned or a change kept. If it moved,
+   the verb refuses (`tests/audit7.sh`).
 6. **no_amplification**, **no_hidden_sql**, **no_opaque_function** -- on the same
    tree: a write whose cascade, trigger or rule the gate cannot vouch for; a call
    to a function that runs SQL it receives as text (`query_to_xml()` and the rest
@@ -284,21 +293,30 @@ Nothing is reimplemented. Each check is PostgreSQL itself:
    `crosstab()` and `connectby()`, dblink), whose query no check sees (0.4.2); and
    a call to a user function that is volatile or `SECURITY DEFINER`, that the agent
    can alter -- its `STABLE` or `IMMUTABLE` is then its own claim -- or whose `SET`
-   clause moves the context a policy reads: a custom parameter such as
-   `app.tenant_id`, `role`, `session_authorization`, `row_security` or
-   `session_replication_role` (`work_mem`, `jit`, `plan_cache_mode` or `search_path`
-   only say how the body runs, and pass). An aggregate is judged by the functions it
+   clause moves the context a policy reads: a placeholder -- a custom parameter no loaded
+   module defines, such as `app.tenant_id` --, `agent_gate.*`, `role`,
+   `session_authorization`, `row_security` or `session_replication_role` (`work_mem`, `jit`,
+   `plan_cache_mode`, `search_path`, and a module's own parameter -- `pg_trgm.*`, `hnsw.*`,
+   `plpgsql.*`: defined by a loaded module, or named after an installed extension -- only say
+   how the body runs, and pass). An aggregate is judged by the functions it
    runs, its transition function first: `pg_proc` marks every aggregate `IMMUTABLE`
    (0.4.3). A function that runs SQL from a text, one the agent can alter and one with
-   such a `SET` clause are also stopped wherever they are reached while the agent's
-   SQL runs, as a `SECURITY DEFINER` one is since 0.2.7. Whose function it is, is asked
-   of the agent's own role, not of the role PostgreSQL runs an RI check as (0.4.3).
-   **read_changes_nothing** / **changes_only_rows** -- a built-in that changes state
-   outside the rows the gate counts is refused: in a read, any (`nextval()`, advisory
-   locks, large objects, notifications); in a write or a DDL, those that are not how a
-   write numbers its rows (a session advisory lock, a large object, `setval()`; 0.4.3).
-   The same list is stopped wherever it is reached: a domain's `CHECK` that called
-   `nextval()` made a read advance a sequence.
+   such a `SET` clause are also stopped wherever they are reached in an agent's session,
+   as a `SECURITY DEFINER` one is since 0.2.7. Whose function it is, is asked of the
+   agent's own role, not of the role PostgreSQL runs an RI check as (0.4.3), and by
+   membership: a function the agent handed to a role it belongs to without `INHERIT` is
+   still its own. **read_changes_nothing** / **changes_only_rows** -- a built-in that
+   changes state outside the rows the gate counts is refused: in a read, any; in a write
+   or a DDL, those that are not how a write numbers its rows, locks them until commit or
+   tells a listener (`nextval()`, transaction advisory locks, `pg_notify()`). Which
+   built-ins change state is PostgreSQL's own marking, not a list of what is forbidden:
+   a `VOLATILE` built-in changes state unless it is on a reviewed list of those that only
+   read, wait or draw a random number (`random()`, `clock_timestamp()`, `pg_sleep()`,
+   `currval()`, `lo_get()`, sizes and statistics, ...), so a signal or administration
+   function nobody named is refused by default -- `pg_terminate_backend()` passed as a
+   read before (second review of 0.4.3). A `LANGUAGE internal` function is the built-in
+   it names, and is judged as that one. The same rule stops them wherever they are
+   reached: a domain's `CHECK` that called `nextval()` made a read advance a sequence.
    For an `allow_ddl` agent, the query of a `CREATE TABLE AS`, `SELECT INTO` or
    `CREATE MATERIALIZED VIEW` gets checks 4 to 6 too (0.4.2): up to 0.4.1 it was
    only run, and over a CTE that deletes it deleted rows no limit counted.
@@ -324,7 +342,16 @@ Nothing is reimplemented. Each check is PostgreSQL itself:
    the gate's hooks see it. DDL (for agents allowed it) is verified instead by running
    it in a subtransaction that is rolled back -- as execution, under the same floor,
    and judged as a read: proposing changes nothing, so a DDL that would advance a
-   sequence while it is only being checked is refused (0.4.3).
+   sequence while it is only being checked is refused (0.4.3). A sequence the DDL itself
+   creates may number its new column (`serial`, like an identity column: the rollback
+   takes the sequence with it), one that existed before may not; a DBA's event-trigger
+   code is judged as the DDL it runs for. **An agent's DDL changes only what the agent
+   owns** (second review of 0.4.3): every object PostgreSQL drops for it -- by name,
+   through a `CASCADE`, or as the owner of the schema -- must be one the agent could drop
+   by name; a type it alters must not be what another role's table, domain or function is
+   made of; and it creates no temporary object, because PostgreSQL searches the temporary
+   schema first for relation and type names and an agent's temporary table answered for a
+   name a DBA's policy helper did not qualify.
 
 Checks 4 and 5 were found by an LLM proposing through the gate against a
 two-tenant database, with a superuser comparing the database before and after
@@ -731,7 +758,7 @@ Said here so nobody learns it the hard way:
 
 * **A function's body is trusted to be what the function is marked.** The gate
   does not read a body. It judges each function where it starts (0.4.3): wherever
-  reached while the agent's SQL runs, it stops `set_config()`, a function that runs
+  reached in an agent's session, it stops `set_config()`, a function that runs
   SQL from a text, a built-in that changes state outside counted rows, a function
   the agent can alter (its marking is then its own claim) and one whose `SET` clause
   moves the context a policy reads. What remains is a DBA's function marked `STABLE`
@@ -746,10 +773,33 @@ Said here so nobody learns it the hard way:
   classes, base types -- or, for a range type's support function, has a signature no
   built-in that changes state has.
 * **Code an `allow_ddl` agent plants runs for whoever uses its objects.** Its
-  functions never start while its own (or any agent's) SQL runs, but a human or an
+  functions never start in its own (or any agent's) session, but a human or an
   application that inserts into its table, casts to its domain or builds on its range
   type runs them with their own rights -- PostgreSQL's rule for any role that may
   create objects. Keep agents' schemas out of other roles' paths.
+* **A persistent object of the agent can still answer for a name a DBA's code does not
+  qualify.** An agent creates no temporary object (0.4.3), so `pg_temp` answers for
+  nothing; but a schema the agent can create in, searched before the DBA's -- `ALTER ROLE
+  agent SET search_path = agent_schema, public`, or a schema named after the agent's role
+  under the default `"$user", public` -- puts the agent's table or type ahead of the DBA's
+  in the agent's own session, and a policy helper that names `tenant_of` unqualified reads
+  the agent's. A function is not affected (one the agent can alter never starts). Name
+  tables in policy helpers with their schema, or pin `SET search_path = public, pg_temp` on
+  them, and put an agent's schema after the DBA's.
+* **The built-ins are classified by PostgreSQL's marking and one reviewed list.** A
+  `VOLATILE` built-in that a later PostgreSQL adds is refused until it is reviewed (closed);
+  the list was derived on 18.6 and 19beta2 (`verify.rs`, `state_change`). A built-in that
+  PostgreSQL marks `STABLE` or `IMMUTABLE` is trusted not to change state.
+* **The context is what the session started with.** The placeholders and the named
+  parameters; a module's own parameter is not part of it (a value the role gives one before
+  the module loads may be respelled when it does). The gate refuses rather than resets: a
+  session whose context moved is refused until it `RESET`s or reconnects.
+  pg_living_assertions 0.5.5's `run()` left the assertion's `search_path` in the session
+  (fixed in its 0.5.6), so under 0.5.5 a write with a bound assertion is refused.
+* **A module's parameter in a DBA's `SET` clause passes once the module defines it**, or
+  when it is named after an installed extension (`pg_trgm.*`, `plpgsql.*`). One that is
+  neither when the function is judged -- `hnsw.*` before anything loaded `vector` in that
+  session -- is refused as a placeholder would be (closed).
 
 * **Without the library loaded before the agent's first statement, the gate
   fails open.** `whoami()` reports `enforced`. Use `shared_preload_libraries`.
@@ -924,12 +974,20 @@ Said here so nobody learns it the hard way:
   kept, and an `ALTER COLUMN ... TYPE ... USING` rewrites every row of one with 0 rows
   counted. The query of a `CREATE TABLE AS`, `SELECT INTO` or `CREATE MATERIALIZED
   VIEW` is checked like a read before it runs (0.4.2), so it cannot carry a writing
-  CTE, and a function the agent creates never starts while its SQL runs. An expression
+  CTE, and a function the agent creates never starts in an agent's session. An expression
   a DDL evaluates -- a `DEFAULT` filled in by `ALTER TABLE`, a `CHECK`, an index
   expression -- runs under the same floor, and what it changes in tables that existed
   before the DDL counts against `max_rows` and the budget (0.4.3). A sequence it
-  advances at commit is not undone. Grant DDL narrowly, and leave `allow_ddl => false`
-  unless a specific agent needs it.
+  advances at commit is not undone. What PostgreSQL drops or alters for it is judged by
+  owner, not counted: an object of a role whose privileges the agent has is its own, and
+  an object with no owner of its own that a type's drop takes with it (a cast, a
+  transform) is not judged. A DDL that creates a sequence may draw from it at propose; if
+  it also draws from one that existed before (`ADD COLUMN s serial, ADD COLUMN n bigint
+  DEFAULT nextval('public.s')`) it is refused after the trial, and the values it drew are
+  gone, as any rolled-back `nextval()` leaves them -- and so is the value a DBA's DDL-audit
+  event trigger draws for each trial. That judgment reads the sequences the transaction
+  holds locked, so one locked earlier in the same transaction refuses a `serial` (closed).
+  Grant DDL narrowly, and leave `allow_ddl => false` unless a specific agent needs it.
 
 ## License
 Apache License 2.0 -- see [LICENSE](LICENSE). Copyright 2026 Manuel Reyes Bravo.
