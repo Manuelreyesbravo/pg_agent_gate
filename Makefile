@@ -8,7 +8,18 @@
 
 PG_CONFIG ?= pg_config
 
-.PHONY: verify clean-machine demo contrast transfer bench mcp docker-demo fuzz
+.PHONY: help verify clean-machine demo contrast transfer bench mcp docker-demo fuzz
+
+# The default target only prints this list. It used to be bench, so a bare `make` (what a
+# PGXN client runs) started a benchmark against a throwaway cluster.
+help:
+	@echo "pg_agent_gate is built with cargo-pgrx, not with make:"
+	@echo "  cargo pgrx init --pg18 /path/to/pg_config"
+	@echo "  cargo pgrx install --release --pg-config /path/to/pg_config"
+	@echo "Targets (each takes PG_CONFIG=/path/to/pg_config):"
+	@echo "  make verify          every suite and the pgrx unit tests on a throwaway cluster"
+	@echo "  make clean-machine   the same in a fresh container (PG_MAJOR=18|19)"
+	@echo "  make demo | contrast | transfer | bench | fuzz | mcp | docker-demo"
 
 # Container engine for docker-demo: docker, or override with DOCKER=podman.
 DOCKER ?= docker
