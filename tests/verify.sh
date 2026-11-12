@@ -15,7 +15,10 @@
 # Exit 0 only if everything passed. A suite that could not RUN counts as failed: a skip
 # that reads like a pass is how a security claim goes stale without anybody noticing.
 # The one exception is the driver suite, which needs java, node and the network, and is
-# therefore opt-in -- and the summary says it was not run.
+# therefore opt-in -- and the summary says it was not run. A case that needs a contrib
+# module this PostgreSQL lacks (pgcrypto, citext, vector, ...) prints "did not run"; it
+# does not fail the run, but it is counted apart and the summary names it: "N passed,
+# M skipped" is a smaller claim than "N passed", and has to read like one.
 #
 # Prerequisites, checked before anything runs (each failure says how to fix it):
 #   * cargo-pgrx 0.19.2;
@@ -32,6 +35,15 @@ export PG_CONFIG=${PG_CONFIG:-pg_config}
 # clean-machine run (2026-10-06): the first unit test panicked on it and the other nine
 # died on the mutex it left behind -- 0/10 on a machine where every suite passed.
 export USER=${USER:-$(id -un)}
+# The suites connect through PGHOST/PGPORT; tests/cluster.sh starts the throwaway cluster
+# from GATE_CLUSTER/GATE_PORT. They must name the same server, whatever the environment
+# carries: GATE_PORT alone used to move the cluster while the suites still went to 5499
+# (found in the 0.4.3 package review, 2026-11-11), and an ambient PGPORT pointed them at
+# somebody else's server. The cluster's values win.
+export GATE_PORT=${GATE_PORT:-5499}
+export GATE_CLUSTER=${GATE_CLUSTER:-$ROOT/.testcluster}
+export PGPORT=$GATE_PORT
+export PGHOST=$GATE_CLUSTER
 
 LOG=$ROOT/target/verify
 PGRX_VERSION=0.19.2
@@ -59,6 +71,7 @@ fi
 mkdir -p "$LOG"
 echo "pg_agent_gate $(sed -nE 's/^version = "([^"]+)"/\1/p' Cargo.toml | head -1) against $("$PG_CONFIG" --version)"
 echo "logs: $LOG"
+echo "throwaway cluster: $GATE_CLUSTER, port $GATE_PORT"
 
 echo -n "building the release artifact ... "
 if ! bash tests/cluster.sh package >"$LOG/package.log" 2>&1; then
@@ -72,12 +85,14 @@ bash tests/cluster.sh init >"$LOG/cluster.log" 2>&1 \
     || { echo "the throwaway cluster did not start:"; tail -20 "$LOG/cluster.log"; exit 1; }
 
 declare -a ROWS
+declare -a SKIPPED
 total_ok=0
 total_fail=0
+total_skip=0
 failed=0
 
-record() {  # name status checks_ok checks_failed summary
-    ROWS+=("$(printf '  %-14s %-7s %5s %6s   %s' "$1" "$2" "$3" "$4" "$5")")
+record() {  # name status checks_ok checks_failed cases_skipped summary
+    ROWS+=("$(printf '  %-15s %-7s %5s %6s %7s   %s' "$1" "$2" "$3" "$4" "$5" "$6")")
 }
 
 # Each step says it started and how it ended. The first version printed nothing between
@@ -93,13 +108,18 @@ for s in "${SUITES[@]}"; do
 
     ok=$(grep -cE '^[[:space:]]+ok[[:space:]]' "$out")
     bad=$(grep -cE '^[[:space:]]+FAIL[[:space:]]' "$out")
+    skip=$(grep -cE '^[[:space:]]+--[[:space:]].*did not run' "$out")
     total_ok=$((total_ok + ok))
     total_fail=$((total_fail + bad))
+    total_skip=$((total_skip + skip))
+    while IFS= read -r line; do
+        SKIPPED+=("$s: $(echo "$line" | sed -E 's/^[[:space:]]+--[[:space:]]+//')")
+    done < <(grep -E '^[[:space:]]+--[[:space:]].*did not run' "$out")
     if [ "$rc" -eq 0 ] && [ "$bad" -eq 0 ]; then
-        record "$s" ok "$ok" "$bad" "$(tail -1 "$out" | cut -c1-80)"
+        record "$s" ok "$ok" "$bad" "$skip" "$(tail -1 "$out" | cut -c1-80)"
     else
         failed=$((failed + 1))
-        record "$s" FAILED "$ok" "$bad" "exit $rc -- see $out"
+        record "$s" FAILED "$ok" "$bad" "$skip" "exit $rc -- see $out"
     fi
 done
 
@@ -119,26 +139,37 @@ if cargo pgrx info pg-config "pg$MAJOR" >/dev/null 2>&1; then
     total_ok=$((total_ok + ${passed:-0}))
     total_fail=$((total_fail + ${nfail:-0}))
     if [ "$rc" -eq 0 ]; then
-        record "unit (pgrx)" ok "${passed:-0}" "${nfail:-0}" "pg$MAJOR via $(cargo pgrx info pg-config "pg$MAJOR")"
+        record "unit (pgrx)" ok "${passed:-0}" "${nfail:-0}" 0 "pg$MAJOR via $(cargo pgrx info pg-config "pg$MAJOR")"
     else
         failed=$((failed + 1))
-        record "unit (pgrx)" FAILED "${passed:-0}" "${nfail:-?}" "exit $rc -- see $unit"
+        record "unit (pgrx)" FAILED "${passed:-0}" "${nfail:-?}" 0 "exit $rc -- see $unit"
     fi
 else
     failed=$((failed + 1))
-    record "unit (pgrx)" FAILED 0 0 "pgrx has no pg$MAJOR: cargo pgrx init --pg$MAJOR $PG_CONFIG"
+    record "unit (pgrx)" FAILED 0 0 0 "pgrx has no pg$MAJOR: cargo pgrx init --pg$MAJOR $PG_CONFIG"
 fi
 
 if [ "${VERIFY_DRIVERS:-0}" != 1 ]; then
-    record "drivers" "not run" - - "opt-in: VERIFY_DRIVERS=1 (needs java, node, network)"
+    record "drivers" "not run" - - - "opt-in: VERIFY_DRIVERS=1 (needs java, node, network)"
 fi
 
 echo
-printf '  %-14s %-7s %5s %6s   %s\n' suite result ok failed ""
+printf '  %-15s %-7s %5s %6s %7s   %s\n' suite result ok failed skipped ""
 for r in "${ROWS[@]}"; do echo "$r"; done
 echo
+if [ "$total_skip" -gt 0 ]; then
+    echo "skipped: $total_skip case(s) did not run, because this PostgreSQL lacks a module:"
+    for k in "${SKIPPED[@]}"; do echo "  $k"; done
+    echo "install those modules (contrib, pgvector) to run them; until then the count below"
+    echo "is smaller than on a build that has them, and says so."
+    echo
+fi
 if [ "$failed" -eq 0 ]; then
-    echo "verified: $total_ok checks passed, 0 failed"
+    if [ "$total_skip" -gt 0 ]; then
+        echo "verified: $total_ok checks passed, 0 failed, $total_skip case(s) skipped"
+    else
+        echo "verified: $total_ok checks passed, 0 failed, 0 skipped"
+    fi
     exit 0
 fi
 # What failed is printed here and not only named: on a container run with --rm the log
@@ -153,6 +184,7 @@ for f in "$LOG"/*.log; do
     fi
 done
 echo
-echo "NOT verified: $failed suite(s) failed -- $total_ok checks passed, $total_fail failed"
+echo "NOT verified: $failed suite(s) failed -- $total_ok checks passed, $total_fail failed," \
+     "$total_skip case(s) skipped"
 exit 1
 
