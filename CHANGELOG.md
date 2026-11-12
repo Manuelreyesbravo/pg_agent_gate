@@ -16,8 +16,19 @@ and 19beta2 -- the other 17 are controls and effects that hold either way), and 
 review in `tests/audit9.sh` (44 checks: against the third build of 0.4.3, 23 fail on 18.6; on
 19beta2, whose build has no pgcrypto, 42 checks and 21 fail -- the others are controls and effects
 that hold either way). Against 0.4.3, the suites of `make verify`: 580 passed, 0 failed on 18.6 and
-578 passed, 0 failed on 19beta2, each suite in a fresh cluster (the pgrx unit tests could not run
-in this environment).
+578 passed, 0 failed on 19beta2, each suite in a fresh cluster. The pgrx unit tests were not run
+for that count; they pass, 13 of 13, on 18.6, 19beta2 and 19rc1 (package review, 2026-11-11, and
+again on 2026-11-12).
+
+**The `v0.4.3` tag was moved.** It was first set, as a lightweight tag, on `4c0f6a0`
+(2026-11-10), whose CI went red (4 of 592) because the CI pinned pg_living_assertions 0.5.5,
+whose `run()` leaks the assertion's `search_path` -- the gate detects that and refuses the write,
+as the notes on pg_living_assertions in the README say. `856cbcf` raised the CI's pin to 0.5.10
+(the version the images ship) and its run was green; on 2026-11-11 the tag was moved to
+`856cbcf`. Between the two commits only the CI's Containerfile and a document changed
+(`7cf5c06`, Red Hat Enterprise Linux notes): the gate's code and SQL are the same, so a build
+of either is the same 0.4.3. If you fetched the tag before 2026-11-11, `git fetch --tags --force`
+updates it. Release tags from here on are annotated and are not moved.
 
 0.4.3 had not been released when the second and third reviews ran, so what they found is closed in
 0.4.3 and not in a 0.4.4: no object of the schema changes, and there is no installation of a 0.4.3 that

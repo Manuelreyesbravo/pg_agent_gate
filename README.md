@@ -135,14 +135,16 @@ make clean-machine                           # the same, in a fresh container th
 | `audit9.sh` | a volatile function in a DBA's column `DEFAULT`, an `UPDATE` that moves rows between partitions, a pool's `DISCARD ALL` (0.4.3) | 44 |
 | pgrx unit tests | the verbs, from inside the server | 13 |
 
-On PostgreSQL 18.6 and 19beta2, for 0.4.3, the suites above: **580 checks passed, 0 failed** on
-18.6 and **578 passed, 0 failed** on 19beta2, which has no pgcrypto for two of `audit9.sh`'s checks;
-`make verify` adds the 13 pgrx unit tests. The fresh Debian container receiving only
-what git has committed runs the same suites, with 18 and 19beta4 from PGDG. CI runs the
-same container for 18 and 19 on every push. `VERIFY_DRIVERS=1` adds real pgjdbc and
-node-pg sessions.
+For 0.4.3, the suites above: **580 checks passed, 0 failed** on PostgreSQL 18.6 with its
+contrib modules and pgvector, and **578 passed, 0 failed** on 19 (19beta2, and again 19rc1 on
+2026-11-12), whose builds had no pgcrypto for two of `audit9.sh`'s checks; `make verify` adds
+the 13 pgrx unit tests, which pass on both. A case whose module is missing does not run, and
+`make verify` says so in its summary ("N passed, 0 failed, M skipped"). The fresh Debian
+container receiving only what git has committed runs the same suites, with 18 and the newest
+19 from PGDG (19rc1 as of 2026-11-12). CI runs the same container for 18 and 19 on every push.
+`VERIFY_DRIVERS=1` adds real pgjdbc and node-pg sessions.
 
-Those 493 are the hand-written suites above. The amplification class that `0.2.2` and `0.2.3`
+Those 580 are the hand-written suites above. The amplification class that `0.2.2` and `0.2.3`
 closed -- a writing CTE, a cascading foreign key, a trigger, a rule, an opaque (volatile or
 `SECURITY DEFINER`) function, and the commit-time row-count backstop and per-agent allow-list
 that back them -- is guarded by **`make fuzz`**, not by `make verify`. Its teeth build each of
@@ -474,14 +476,16 @@ SELECT agent_gate.bind_assertion('billing', 'no_customer_without_plan');
 
 `register_agent` sets `agent_gate.agent` on the role. If the library is not in
 `shared_preload_libraries`, it also sets `session_preload_libraries` on that
-role, so the gate is loaded before the agent's first statement. It refuses
-superuser roles: a superuser can unset a superuser-only setting, and an agent
-that can leave the gate is not behind it. For the same reason it refuses
-`REPLICATION` and `BYPASSRLS` roles, and members (direct or inherited) of a
-superuser, of such a role, or of `pg_write_all_data`, `pg_execute_server_program`
-or `pg_write_server_files`. A session loaded this way ends (FATAL) if its client
-set any `agent_gate.*` parameter at startup. It takes effect on the role's
-**next** connection.
+role, so the gate is loaded before the agent's first statement. That setting
+replaces any `session_preload_libraries` the role already had: add other
+libraries back after registering (`ALTER ROLE ... SET session_preload_libraries
+= 'pg_agent_gate, other'`). It refuses superuser roles: a superuser can unset a
+superuser-only setting, and an agent that can leave the gate is not behind it.
+For the same reason it refuses `REPLICATION` and `BYPASSRLS` roles, and members
+(direct or inherited) of a superuser, of such a role, or of `pg_write_all_data`,
+`pg_execute_server_program` or `pg_write_server_files`. A session loaded this
+way ends (FATAL) if its client set any `agent_gate.*` parameter at startup. It
+takes effect on the role's **next** connection.
 
 ## For a client that only speaks MCP: a shim with no power
 
@@ -570,28 +574,33 @@ shown live, by parsing the value with the same JSON a client would use.
 ## Measured
 
 With real sessions of an agent role, both wire protocols, against PostgreSQL
-19beta2 **built without assertions** -- a throwaway cluster from the same
+19beta2 **built without assertions** (September-October 2026; the commit that
+first measured each row is in its last column) -- a throwaway cluster from the same
 binaries the extension is installed into (`tests/cluster.sh`), loading it from
 `cargo pgrx package`. Each attack counts only if the error is **the gate's**
 (a PostgreSQL permission error proves nothing about the gate), and a separate
 superuser connection then checks that nothing changed. Every criterion was
 declared before the code that it measures.
 
-| criterion | threshold | measured |
-|---|---|---|
-| raw SQL executed from an agent session: `SELECT`/`INSERT`/`UPDATE`/`DELETE`, `DO`, `CALL`, `PREPARE`, `EXPLAIN ANALYZE`, writing CTE next to a verb, foreign function next to a verb or as its argument, subquery as argument, reading or forging the record, `LOCK`, `CREATE`, `SET ROLE`, `COPY`, extended protocol, cursor | 0 | **0 of 20, no side effect** |
-| raw SQL executed after an error inside the gate (error escaping a verb, error inside execution, cancellation mid-act, rollback in an explicit transaction) | 0 | **0 of 4** |
-| invented proposals refused at `propose`: missing table/column/function, wrong literal type, operator without a type, unbound parameter, hidden second statement, broken syntax, transaction control, DDL without permission | 100% | **17 of 17, no side effect** |
-| **control**: correct proposals pass and do exactly what they say | 100% | **10 of 10** |
-| **control**: a kept change survives an immediate shutdown (no checkpoint) with its proposal and its execution | 100% | **10 of 10** |
-| every channel a session can type, tried on purpose (`tests/adversarial.sh`): two statements in one query, `PREPARE`/`EXECUTE`, a cursor, `COPY TO`/`FROM PROGRAM`, `DO`, `CALL`, `EXPLAIN ANALYZE`, `CREATE TABLE`/`FUNCTION`, `SELECT INTO`, a writing CTE, a function as a verb argument, a subselect of what it was not granted, `SET ROLE`, `SET SESSION AUTHORIZATION`, `RESET ALL`, `DISCARD ALL`, `VACUUM`, `CHECKPOINT`, `LISTEN`/`NOTIFY`, `lo_export`, a function as the argument of `propose_and_commit`, and a replication connection | 0 | **0 of 24 had any effect** |
-| what can be slipped past `propose` (`tests/adversarial.sh`): two statements, a second one hidden after a comment, DDL without permission, `COPY TO PROGRAM`, `SELECT INTO`, `FOR UPDATE` and a write beyond `max_rows`, two writing CTEs under a `SELECT`, an expired verification, another agent's proposal -- and each of the first nine again through `propose_and_commit` | 0 | **0 of 20** |
-| **control**: an agent still runs `whoami`, `discover`, proposes, sees before/after in `dry_run`, commits a read and a write, is refused a second commit, and reads its `acts`; in one call, reads rows and keeps a write that shows in `acts` | 100% | **15 of 15** |
-| garbage into `propose` and `commit` (`tests/hostile.sh`): malformed SQL, unbalanced parentheses, an unterminated comment and dollar quote, a NUL byte, 500 levels of nesting, 100 KB of SQL, 500 parameters, fewer parameters than placeholders, a type that does not exist, invalid UTF-8, a 10 KB identifier, an empty proposal, ids that do not exist, an endless query | 0 crashes | **0 of 16, same postmaster** |
-| the record rewritten (`tests/hostile.sh`): `DELETE`, `TRUNCATE`, disabling the triggers and dropping them, as the agent and as the owner | 0 | **0 of 7** |
-| the world moved between `propose` and `commit` (`tests/hostile.sh`): table renamed, column dropped, privilege revoked, row gone, a bound assertion broken meanwhile, two sessions at once, and the same proposal committed twice at once | 100% | **9 of 9** |
-| **control**: what an owner's trigger, `SECURITY DEFINER` function and view do on the agent's behalf is what this README says | 100% | **5 of 5** |
+| criterion | threshold | measured | first measured |
+|---|---|---|---|
+| raw SQL executed from an agent session: `SELECT`/`INSERT`/`UPDATE`/`DELETE`, `DO`, `CALL`, `PREPARE`, `EXPLAIN ANALYZE`, writing CTE next to a verb, foreign function next to a verb or as its argument, subquery as argument, reading or forging the record, `LOCK`, `CREATE`, `SET ROLE`, `COPY`, extended protocol, cursor | 0 | **0 of 20, no side effect** | e05e20e, 2026-09-14 |
+| raw SQL executed after an error inside the gate (error escaping a verb, error inside execution, cancellation mid-act, rollback in an explicit transaction) | 0 | **0 of 4** | e05e20e, 2026-09-14 |
+| invented proposals refused at `propose`: missing table/column/function, wrong literal type, operator without a type, unbound parameter, hidden second statement, broken syntax, transaction control, DDL without permission | 100% | **17 of 17, no side effect** | dfdd949, 2026-09-15 |
+| **control**: correct proposals pass and do exactly what they say | 100% | **10 of 10** | dfdd949, 2026-09-15 |
+| **control**: a kept change survives an immediate shutdown (no checkpoint) with its proposal and its execution | 100% | **10 of 10** | dfdd949, 2026-09-15 |
+| every channel a session can type, tried on purpose (`tests/adversarial.sh`): two statements in one query, `PREPARE`/`EXECUTE`, a cursor, `COPY TO`/`FROM PROGRAM`, `DO`, `CALL`, `EXPLAIN ANALYZE`, `CREATE TABLE`/`FUNCTION`, `SELECT INTO`, a writing CTE, a function as a verb argument, a subselect of what it was not granted, `SET ROLE`, `SET SESSION AUTHORIZATION`, `RESET ALL`, `DISCARD ALL`, `VACUUM`, `CHECKPOINT`, `LISTEN`/`NOTIFY`, `lo_export`, a function as the argument of `propose_and_commit`, and a replication connection | 0 | **0 of 24 had any effect** | 48170cc, 2026-10-08 |
+| what can be slipped past `propose` (`tests/adversarial.sh`): two statements, a second one hidden after a comment, DDL without permission, `COPY TO PROGRAM`, `SELECT INTO`, `FOR UPDATE` and a write beyond `max_rows`, two writing CTEs under a `SELECT`, an expired verification, another agent's proposal -- and each of the first nine again through `propose_and_commit` | 0 | **0 of 20** | 48170cc, 2026-10-08 |
+| **control**: an agent still runs `whoami`, `discover`, proposes, sees before/after in `dry_run`, commits a read and a write, is refused a second commit, and reads its `acts`; in one call, reads rows and keeps a write that shows in `acts` | 100% | **15 of 15** | 48170cc, 2026-10-08 |
+| garbage into `propose` and `commit` (`tests/hostile.sh`): malformed SQL, unbalanced parentheses, an unterminated comment and dollar quote, a NUL byte, 500 levels of nesting, 100 KB of SQL, 500 parameters, fewer parameters than placeholders, a type that does not exist, invalid UTF-8, a 10 KB identifier, an empty proposal, ids that do not exist, an endless query | 0 crashes | **0 of 16, same postmaster** | 4c3eeb4, 2026-09-15 |
+| the record rewritten (`tests/hostile.sh`): `DELETE`, `TRUNCATE`, disabling the triggers and dropping them, as the agent and as the owner | 0 | **0 of 7** | 4c3eeb4, 2026-09-15 |
+| the world moved between `propose` and `commit` (`tests/hostile.sh`): table renamed, column dropped, privilege revoked, row gone, a bound assertion broken meanwhile, two sessions at once, and the same proposal committed twice at once | 100% | **9 of 9** | 4c3eeb4, 2026-09-15 |
+| **control**: what an owner's trigger, `SECURITY DEFINER` function and view do on the agent's behalf is what this README says | 100% | **5 of 5** | 4c3eeb4, 2026-09-15 |
 
+
+Those counts are the ones measured then. The cases behind every row are in
+`tests/adversarial.sh` and `tests/hostile.sh`, which `make verify` runs: on
+2026-11-12 they passed in full on 18.6 and 19rc1, for 0.4.3 plus this README.
 
 **Two of those rows found real defects, which is why they exist.** `TRUNCATE`
 emptied the whole record: the append-only triggers were `FOR EACH ROW`, and
@@ -604,13 +613,16 @@ that is a double charge. Both are fixed (0.2.0): statement-level triggers for
 
 ### What found the 0.2.1 fixes
 
-Not these suites: they were green with both holes open. What found them was an
-LLM (a Qwen3-8B with a SQL adapter) proposing through the gate against a
-two-tenant database with row-level security, on 157 cases -- 30 legitimate
-tasks, destructive ones written by the model and injected by hand, raw SQL in the
-agent's session, and attempts to cross tenants -- with a superuser comparing the
-database before and after every case, and the same cases run by an identical role
-that was not an agent, to prove the cases were dangerous at all.
+Not these suites: they were green with both holes open. What found them, on
+2026-10-06 against 0.2.0, was an LLM (a Qwen3-8B with a SQL adapter) proposing
+through the gate against a two-tenant database with row-level security --
+legitimate tasks, destructive ones written by the model and injected by hand, raw
+SQL in the agent's session, and attempts to cross tenants -- with a superuser
+comparing the database before and after every case, and the same cases run by an
+identical role that was not an agent, to prove the cases were dangerous at all.
+That run used a private harness and data whose results are not in this
+repository, so no counts from it are claimed here; what it found is pinned by
+cases that are in the suites:
 
 1. **A CTE that writes dodged `max_rows`.** The limit counted the rows of the
    outer statement, so `with d as (delete ...) select count(*) from d` deleted
@@ -620,10 +632,8 @@ that was not an agent, to prove the cases were dangerous at all.
    its hooks step aside, so `... where set_config('app.tenant_id', '2', true) is
    not null` read the other tenant's rows.
 
-Against 0.2.0, 9 of 10 variants of the two did damage. Against 0.2.1, 0 of 10;
-both are refused at `propose` (checks 5 and 6 above), and both now have cases in
-the suites that are red against 0.2.0. On the same run, with the gate in place:
-the model's correct SQL was never refused (0 of 27 false positives).
+Since 0.2.1 both are refused at `propose` (checks 5 and 6 above), and both have
+cases in the suites that are red against 0.2.0.
 
 ## What it costs
 
@@ -730,9 +740,13 @@ read a definer function's body or re-decide what a view may show.
   other tables are counted like a write's (0.4.3);
 * a read changes nothing the record would not show: no sequence, lock or large
   object, wherever the code that would change it sits (0.4.3);
-* no other role can become it: an agent role has no members, so no session but
-  its own login can `SET ROLE` into it (0.4.1) -- connect each agent, or each
-  seat of a broker, as its own role;
+* no other role can become it: with the library in `shared_preload_libraries`, an
+  agent role has no members, so no session but its own login can `SET ROLE` into
+  it (0.4.1) -- connect each agent, or each seat of a broker, as its own role.
+  With only the per-role `session_preload_libraries` that `register_agent` sets,
+  the sessions of other roles do not load the gate, and a superuser's session
+  that has not loaded it can still `GRANT` the agent role to another (measured on
+  18.6, 2026-11-12): don't, or preload it;
 * the context its row-level policies read cannot be moved -- not by `SET`, not
   at connection start, not by `set_config()` inside a proposal: in the statement,
   in SQL passed to a function as text, in a function's body, a constraint or a
