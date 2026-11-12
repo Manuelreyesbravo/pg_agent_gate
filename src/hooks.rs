@@ -35,6 +35,7 @@
 //!     calls `fmgr_hook` each time it starts. A built-in is looked up by the fast path that asks
 //!     no hook; on these paths it is chosen by DDL only a superuser runs (operator classes, base
 //!     types), or has a signature no built-in that changes state has (a range's subtype_diff).
+//!
 //! What the floor stops is said in `floor()`; whose function it is, is judged against the AGENT'S
 //! role -- the session's login role -- and never the current user, which PostgreSQL switches to a
 //! table's owner for an RI check.
@@ -789,6 +790,7 @@ unsafe extern "C-unwind" fn object_access(
 ///     column, an index, a constraint, a policy, a trigger, a view, an operator, a type's support
 ///     function. Code the agent planted is the agent's code, judged as if the statement called it
 ///     (see planted_verdict).
+///
 /// A volatile user function of the DBA's that only the DBA's objects call is not stopped here: it
 /// is the call the DBA placed there, and what it writes is counted (the backstop in verbs.rs, for a
 /// DDL too since 0.4.3); the floor under SECURITY DEFINER is definer_guard. Read from the syscache:

@@ -40,6 +40,7 @@
 //!     column, numbers a new column from a new sequence that the rollback of the trial takes with
 //!     it -- and a sequence that existed before the DDL may not: what was taken from one is not
 //!     given back (judged by the locks nextval() takes, see judge()).
+//!
 //! The DBA's event-trigger code is not the agent's DDL (state::in_event_trigger): it is not watched.
 
 use crate::state;

@@ -665,6 +665,7 @@ fn amplifying_object(targets: &[pg_sys::Oid], allowed: &[u32]) -> Result<Option<
 ///   * src/backend/utils/adt/tsquery_rewrite.c: tsquery_rewrite_query (ts_rewrite(tsquery, query)).
 ///   * contrib, installed as an extension: tablefunc's crosstab, crosstab_hash, connectby_text,
 ///     connectby_text_serial; xml2's xpath_table; every dblink_* entry point (already volatile).
+///
 /// The other users of SPI in the server are triggers (ri_triggers.c, tsvector_update_trigger, the
 /// spi/tcn/lo contribs), which no statement calls, and ruleutils.c, whose queries are fixed catalog
 /// reads (pg_get_ruledef, pg_get_viewdef). Checked against pg_proc of PostgreSQL 18.6 and 19beta2:
@@ -884,6 +885,7 @@ pub(crate) enum Opaque {
 ///         so it is opaque whatever it says, or
 ///       - one whose SET clause sets a parameter an agent may not set (0.4.2): the clause applies
 ///         while the body runs, so `SET app.tenant_id = '2'` reads the other tenant's rows.
+///
 /// Err = the lookup failed (refuse, fail closed).
 fn opaque_function(funcs: &[pg_sys::Oid]) -> Result<Option<Opaque>, String> {
     if funcs.is_empty() {
