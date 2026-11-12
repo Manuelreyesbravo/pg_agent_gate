@@ -443,7 +443,8 @@ first verb ran: those writes are not the gate's to relax.
 
 PostgreSQL **18 or later** (`dry_run` uses `RETURNING old/new`). Built with
 [pgrx](https://github.com/pgcentralfoundation/pgrx) 0.19.2; the test suite
-passes on 18 and 19 (tested on 18.6 and 19rc1).
+passes on 18 and 19 (tested on 18.6 and 19rc1). `Cargo.lock` is committed, so a build
+from a tag uses the crates its suites ran against.
 
 ```sh
 cargo install cargo-pgrx --version 0.19.2 --locked
