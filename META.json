@@ -4,7 +4,7 @@
    "description": "With pg_agent_gate an LLM agent proposes one SQL statement instead of running it; PostgreSQL checks it against its own parser, catalog and privileges, shows the exact before/after of every affected row, runs it under the agent's own rights, and records every proposal and refusal append-only. Session-level hooks make the gate the only way in.",
    "version": "0.4.3",
    "maintainer": [
-      "Manuel Reyes <manuelreyesbravo@gmail.com>"
+      "Manuel Reyes Bravo <manuelreyesbravo@gmail.com>"
    ],
    "license": "apache_2_0",
    "provides": {
@@ -21,7 +21,7 @@
             "PostgreSQL": "18.0.0"
          },
          "recommends": {
-            "pg_living_assertions": "0.5.5"
+            "pg_living_assertions": "0.5.6"
          }
       }
    },
@@ -35,7 +35,7 @@
          "type": "git"
       }
    },
-   "generated_by": "Manuel Reyes",
+   "generated_by": "Manuel Reyes Bravo",
    "meta-spec": {
       "version": "1.0.0",
       "url": "https://pgxn.org/meta/spec.txt"
