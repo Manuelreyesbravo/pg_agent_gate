@@ -75,7 +75,10 @@ thread_local! {
 pub(crate) fn watching() -> bool {
     state::proposal_running()
         && state::executing()
-        && matches!(state::running_kind(), state::RUNNING_DDL | state::RUNNING_TRIAL)
+        && matches!(
+            state::running_kind(),
+            state::RUNNING_DDL | state::RUNNING_TRIAL
+        )
         && !state::in_event_trigger()
 }
 
@@ -132,11 +135,20 @@ const DEPEND_REFERENCE_INDEX: u32 = 2674;
 /// Read by an index scan, not SPI: the floor asks it inside the executor and the function manager.
 pub(crate) unsafe fn called_by_agent_object(func: pg_sys::Oid) -> bool {
     let mut dependents: Vec<(pg_sys::Oid, pg_sys::Oid)> = Vec::new();
-    let rel = pg_sys::table_open(pg_sys::Oid::from(DEPEND_RELATION), pg_sys::AccessShareLock as _);
+    let rel = pg_sys::table_open(
+        pg_sys::Oid::from(DEPEND_RELATION),
+        pg_sys::AccessShareLock as _,
+    );
     let mut keys: [pg_sys::ScanKeyData; 2] = std::mem::zeroed();
     let oideq = pg_sys::Oid::from(pg_sys::F_OIDEQ);
     let equal = pg_sys::BTEqualStrategyNumber as pg_sys::StrategyNumber;
-    pg_sys::ScanKeyInit(&mut keys[0], 4, equal, oideq, pg_sys::Datum::from(pg_sys::ProcedureRelationId));
+    pg_sys::ScanKeyInit(
+        &mut keys[0],
+        4,
+        equal,
+        oideq,
+        pg_sys::Datum::from(pg_sys::ProcedureRelationId),
+    );
     pg_sys::ScanKeyInit(&mut keys[1], 5, equal, oideq, pg_sys::Datum::from(func));
     let scan = pg_sys::systable_beginscan(
         rel,
@@ -153,23 +165,27 @@ pub(crate) unsafe fn called_by_agent_object(func: pg_sys::Oid) -> bool {
             break;
         }
         let mut isnull = false;
-        let class = pg_sys::Oid::from(pg_sys::heap_getattr(tup, 1, desc, &mut isnull).value() as u32);
-        let object = pg_sys::Oid::from(pg_sys::heap_getattr(tup, 2, desc, &mut isnull).value() as u32);
+        let class =
+            pg_sys::Oid::from(pg_sys::heap_getattr(tup, 1, desc, &mut isnull).value() as u32);
+        let object =
+            pg_sys::Oid::from(pg_sys::heap_getattr(tup, 2, desc, &mut isnull).value() as u32);
         dependents.push((class, object));
     }
     pg_sys::systable_endscan(scan);
     pg_sys::table_close(rel, pg_sys::AccessShareLock as _);
     let agent = pg_sys::GetSessionUserId();
-    dependents
-        .into_iter()
-        .any(|(class, object)| object_owner(class, object, 0).is_some_and(|owner| pg_sys::is_member_of_role(agent, owner)))
+    dependents.into_iter().any(|(class, object)| {
+        object_owner(class, object, 0).is_some_and(|owner| pg_sys::is_member_of_role(agent, owner))
+    })
 }
 
 /// The floor asks this when nextval() starts in the trial of a DDL (hooks::floor): allowed when the
 /// trial created a sequence, and then judge() checks that no sequence that existed before was taken.
 pub(crate) fn nextval_in_trial() -> bool {
     let created_sequence = CREATED.with(|c| {
-        c.borrow().iter().any(|o| unsafe { pg_sys::get_rel_relkind(pg_sys::Oid::from(*o)) } as u8 == b'S')
+        c.borrow()
+            .iter()
+            .any(|o| unsafe { pg_sys::get_rel_relkind(pg_sys::Oid::from(*o)) } as u8 == b'S')
     });
     if created_sequence {
         NEXTVAL_ON_NEW.with(|n| *n.borrow_mut() = true);
@@ -178,16 +194,32 @@ pub(crate) fn nextval_in_trial() -> bool {
 }
 
 /// An object PostgreSQL is about to drop for the agent's DDL: None if it is the agent's to drop.
-pub(crate) unsafe fn dropped(class: pg_sys::Oid, object: pg_sys::Oid, sub: std::ffi::c_int) -> Option<String> {
+pub(crate) unsafe fn dropped(
+    class: pg_sys::Oid,
+    object: pg_sys::Oid,
+    sub: std::ffi::c_int,
+) -> Option<String> {
     let owner = object_owner(class, object, 0)?;
     if pg_sys::has_privs_of_role(pg_sys::GetSessionUserId(), owner) {
         return None;
     }
-    let address = pg_sys::ObjectAddress { classId: class, objectId: object, objectSubId: sub };
+    let address = pg_sys::ObjectAddress {
+        classId: class,
+        objectId: object,
+        objectSubId: sub,
+    };
     let what = pg_sys::getObjectDescription(&address, true);
-    let what = if what.is_null() { "an object".into() } else { CStr::from_ptr(what).to_string_lossy().into_owned() };
+    let what = if what.is_null() {
+        "an object".into()
+    } else {
+        CStr::from_ptr(what).to_string_lossy().into_owned()
+    };
     let who = pg_sys::GetUserNameFromId(owner, true);
-    let who = if who.is_null() { format!("{}", owner.to_u32()) } else { CStr::from_ptr(who).to_string_lossy().into_owned() };
+    let who = if who.is_null() {
+        format!("{}", owner.to_u32())
+    } else {
+        CStr::from_ptr(who).to_string_lossy().into_owned()
+    };
     Some(format!("it would drop {what}, which belongs to {who}"))
 }
 
@@ -288,14 +320,22 @@ macro_rules! foreign_dependent_sql {
                  select pg_catalog.unnest($1::int8[]::oid[])
                  union
                  select d.objid from pg_catalog.pg_depend d join t on d.refobjid = t.oid
-                  where d.refclassid = 'pg_catalog.", $class, "'::pg_catalog.regclass
-                    and d.classid = 'pg_catalog.", $class, "'::pg_catalog.regclass)
+                  where d.refclassid = 'pg_catalog.",
+            $class,
+            "'::pg_catalog.regclass
+                    and d.classid = 'pg_catalog.",
+            $class,
+            "'::pg_catalog.regclass)
              select coalesce((
                select pg_catalog.pg_describe_object(d.classid, d.objid, d.objsubid)
                       || ' (which belongs to ' || pg_catalog.pg_get_userbyid(o.owner) || ')'
                  from pg_catalog.pg_depend d
-                 join t on d.refclassid = 'pg_catalog.", $class, "'::pg_catalog.regclass and d.refobjid = t.oid
-                 cross join lateral (select ", owner_of!(), " as owner) o
+                 join t on d.refclassid = 'pg_catalog.",
+            $class,
+            "'::pg_catalog.regclass and d.refobjid = t.oid
+                 cross join lateral (select ",
+            owner_of!(),
+            " as owner) o
                 where o.owner is not null
                   and not pg_catalog.pg_has_role(session_user, o.owner, 'USAGE')
                 limit 1), '')"
@@ -362,7 +402,12 @@ fn judge() -> Result<(), String> {
     let mut classes: Vec<i64> = Vec::new();
     let mut objects: Vec<i64> = Vec::new();
     for (c, o) in CREATED
-        .with(|c| c.borrow().iter().map(|o| (pg_sys::RelationRelationId.to_u32(), *o)).collect::<Vec<_>>())
+        .with(|c| {
+            c.borrow()
+                .iter()
+                .map(|o| (pg_sys::RelationRelationId.to_u32(), *o))
+                .collect::<Vec<_>>()
+        })
         .into_iter()
         .chain(ATTACHED.with(|a| a.borrow().clone()))
     {
@@ -396,7 +441,8 @@ fn judge() -> Result<(), String> {
             ));
         }
     }
-    let disinherited: Vec<i64> = DISINHERITED.with(|d| d.borrow().iter().map(|o| *o as i64).collect());
+    let disinherited: Vec<i64> =
+        DISINHERITED.with(|d| d.borrow().iter().map(|o| *o as i64).collect());
     if !disinherited.is_empty() {
         let foreign = crate::exec::get_one_prepared::<String>(
             "select coalesce((select c.oid::pg_catalog.regclass::text

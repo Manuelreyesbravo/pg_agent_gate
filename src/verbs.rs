@@ -58,8 +58,16 @@ fn identity() -> Identity {
         CStr::from_ptr(name).to_string_lossy().into_owned()
     };
     match crate::current_agent() {
-        Some(agent) => Identity { agent, is_agent: true, role },
-        None => Identity { agent: format!("role:{role}"), is_agent: false, role },
+        Some(agent) => Identity {
+            agent,
+            is_agent: true,
+            role,
+        },
+        None => Identity {
+            agent: format!("role:{role}"),
+            is_agent: false,
+            role,
+        },
     }
 }
 
@@ -91,26 +99,38 @@ fn call_internal<T: FromDatum + IntoDatum>(query: &str, args: &[DatumWithOid]) -
 /// The gate's own SQL that only READS. Read-only SPI: no transaction id, so no
 /// commit record and no flush. The record functions called this way are
 /// VOLATILE plpgsql, and read with a fresh snapshot inside.
-pub(crate) fn read_internal<T: FromDatum + IntoDatum>(query: &str, args: &[DatumWithOid]) -> Option<T> {
+pub(crate) fn read_internal<T: FromDatum + IntoDatum>(
+    query: &str,
+    args: &[DatumWithOid],
+) -> Option<T> {
     let _gate = state::trusted();
-    crate::exec::with_gate_search_path(|| Spi::connect(|client| {
-        client
-            .select(query, Some(1), args)
-            .expect("pg_agent_gate: internal read failed")
-            .first()
-            .get::<T>(1)
-            .expect("pg_agent_gate: internal read returned an unexpected type")
-    }))
+    crate::exec::with_gate_search_path(|| {
+        Spi::connect(|client| {
+            client
+                .select(query, Some(1), args)
+                .expect("pg_agent_gate: internal read failed")
+                .first()
+                .get::<T>(1)
+                .expect("pg_agent_gate: internal read returned an unexpected type")
+        })
+    })
 }
 
 fn config(who: &Identity) -> Config {
     if !who.is_agent {
         // A human or a service using the gate on purpose: the same checks, the
         // conservative limits, and no DDL.
-        return Config { max_rows: 1000, allow_ddl: false, bindings: Vec::new(), allowed: Vec::new() };
+        return Config {
+            max_rows: 1000,
+            allow_ddl: false,
+            bindings: Vec::new(),
+            allowed: Vec::new(),
+        };
     }
-    let found: Option<JsonB> =
-        read_internal("select agent_gate_internal._agent($1)", &[who.agent.clone().into()]);
+    let found: Option<JsonB> = read_internal(
+        "select agent_gate_internal._agent($1)",
+        &[who.agent.clone().into()],
+    );
     let Some(JsonB(agent)) = found.filter(|j| !j.0.is_null()) else {
         error!(
             "pg_agent_gate: this role is marked as agent \"{}\", but no agent by that name is registered",
@@ -122,11 +142,19 @@ fn config(who: &Identity) -> Config {
         allow_ddl: agent["allow_ddl"].as_bool().unwrap_or(false),
         bindings: agent["bindings"]
             .as_array()
-            .map(|a| a.iter().filter_map(|b| b.as_str().map(str::to_string)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|b| b.as_str().map(str::to_string))
+                    .collect()
+            })
             .unwrap_or_default(),
         allowed: agent["allowed_writes"]
             .as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u32)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_u64().map(|n| n as u32))
+                    .collect()
+            })
             .unwrap_or_default(),
     }
 }
@@ -180,7 +208,8 @@ fn begin_verb() {
         );
     }
     if !state::txn_seen() {
-        let already_wrote = unsafe { pg_sys::GetTopTransactionIdIfAny() } != pg_sys::TransactionId::INVALID;
+        let already_wrote =
+            unsafe { pg_sys::GetTopTransactionIdIfAny() } != pg_sys::TransactionId::INVALID;
         state::mark_txn_seen(already_wrote);
     }
 }
@@ -237,7 +266,11 @@ pub fn discover(filter: default!(Option<&str>, "NULL"), max_objects: default!(i3
     let allowed: Vec<i64> = config(&who).allowed.iter().map(|o| *o as i64).collect();
     let found: Option<JsonB> = read_internal(
         crate::schema::DISCOVER_SQL,
-        &[filter.map(str::to_string).into(), max_objects.into(), allowed.into()],
+        &[
+            filter.map(str::to_string).into(),
+            max_objects.into(),
+            allowed.into(),
+        ],
     );
     let mut out = found.map(|j| j.0).unwrap_or_else(|| json!({}));
     out["agent"] = json!(who.agent);
@@ -246,7 +279,11 @@ pub fn discover(filter: default!(Option<&str>, "NULL"), max_objects: default!(i3
 
 /// Propose one statement. Nothing runs: it is verified and recorded.
 #[pg_extern]
-pub fn propose(sql: &str, intent: &str, params: default!(Option<Vec<Option<String>>>, "NULL")) -> JsonB {
+pub fn propose(
+    sql: &str,
+    intent: &str,
+    params: default!(Option<Vec<Option<String>>>, "NULL"),
+) -> JsonB {
     begin_verb();
     JsonB(propose_one(sql, intent, params))
 }
@@ -269,7 +306,11 @@ pub fn propose(sql: &str, intent: &str, params: default!(Option<Vec<Option<Strin
 /// `commit` would have kept the proposal; the server log keeps the verdict either way.
 /// That is the README's "the record is transactional", applied to a single call.
 #[pg_extern]
-pub fn propose_and_commit(sql: &str, intent: &str, params: default!(Option<Vec<Option<String>>>, "NULL")) -> JsonB {
+pub fn propose_and_commit(
+    sql: &str,
+    intent: &str,
+    params: default!(Option<Vec<Option<String>>>, "NULL"),
+) -> JsonB {
     begin_verb();
     let mut proposal = propose_one(sql, intent, params);
     let commit = match (proposal["ok"].as_bool(), proposal["proposal"].as_i64()) {
@@ -279,7 +320,11 @@ pub fn propose_and_commit(sql: &str, intent: &str, params: default!(Option<Vec<O
         }
         _ => Value::Null,
     };
-    let outcome = if commit.is_null() { json!("refused_at_propose") } else { commit["outcome"].clone() };
+    let outcome = if commit.is_null() {
+        json!("refused_at_propose")
+    } else {
+        commit["outcome"].clone()
+    };
     JsonB(json!({ "outcome": outcome, "proposal": proposal, "commit": commit }))
 }
 
@@ -293,7 +338,9 @@ fn propose_one(sql: &str, intent: &str, params: Option<Vec<Option<String>>>) -> 
     // 30 MB of SQL and 5 MB of intent were accepted and kept.
     let max_sql = crate::MAX_PROPOSAL_BYTES.get().max(0) as usize;
     let max_intent = crate::MAX_INTENT_BYTES.get().max(0) as usize;
-    let params_len: usize = params.as_ref().map_or(0, |p| p.iter().map(|x| x.as_ref().map_or(0, String::len)).sum());
+    let params_len: usize = params.as_ref().map_or(0, |p| {
+        p.iter().map(|x| x.as_ref().map_or(0, String::len)).sum()
+    });
     if sql.len() + params_len > max_sql {
         error!(
             "pg_agent_gate: the proposal is {} bytes with its parameters, over agent_gate.max_proposal_bytes ({max_sql}); the record keeps every proposal",
@@ -331,7 +378,13 @@ fn propose_one(sql: &str, intent: &str, params: Option<Vec<Option<String>>>) -> 
     // Verification ran the agent's SQL (a DDL's trial, the planner's folding): the context is still
     // the session's, or the verb refuses and the record of it goes with it (context.rs).
     crate::context::require(false);
-    log!("pg_agent_gate: agent={} proposal={} kind={} ok={}", who.agent, id, kind, verdict.ok);
+    log!(
+        "pg_agent_gate: agent={} proposal={} kind={} ok={}",
+        who.agent,
+        id,
+        kind,
+        verdict.ok
+    );
     state::written_to_record(format!(
         "proposal {id} of agent {} (role {}): kind={kind} ok={} intent={} sql={}",
         who.agent,
@@ -442,7 +495,9 @@ fn record_execution(
     let told = format!(
         "of proposal {proposal}: mode={} outcome={outcome} rows_affected={} reason={}",
         mode.as_str(),
-        rows_affected.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
+        rows_affected
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "-".into()),
         serde_json::to_string(&reason).unwrap_or_default(),
     );
     let id: Option<i64> = call_internal(
@@ -467,10 +522,34 @@ fn record_execution(
     id
 }
 
-fn refuse_execution(who: &Identity, proposal: i64, mode: Mode, started: Instant, reason: String, checks: Value) -> Value {
+fn refuse_execution(
+    who: &Identity,
+    proposal: i64,
+    mode: Mode,
+    started: Instant,
+    reason: String,
+    checks: Value,
+) -> Value {
     let ms = started.elapsed().as_secs_f64() * 1000.0;
-    let execution = record_execution(proposal, mode, "refused", Some(reason.clone()), None, None, None, json!([]), None, ms, None);
-    log!("pg_agent_gate: agent={} proposal={} mode={} outcome=refused", who.agent, proposal, mode.as_str());
+    let execution = record_execution(
+        proposal,
+        mode,
+        "refused",
+        Some(reason.clone()),
+        None,
+        None,
+        None,
+        json!([]),
+        None,
+        ms,
+        None,
+    );
+    log!(
+        "pg_agent_gate: agent={} proposal={} mode={} outcome=refused",
+        who.agent,
+        proposal,
+        mode.as_str()
+    );
     json!({
         "proposal": proposal,
         "mode": mode.as_str(),
@@ -576,7 +655,11 @@ fn relocated_rows(before: &Relocation, after: &Relocation, processed: i64) -> i6
     let updated = after.updated.saturating_sub(before.updated);
     let inserted = after.inserted.saturating_sub(before.inserted);
     let deleted = after.deleted.saturating_sub(before.deleted);
-    processed.saturating_sub(updated).min(inserted).min(deleted).max(0)
+    processed
+        .saturating_sub(updated)
+        .min(inserted)
+        .min(deleted)
+        .max(0)
 }
 
 /// THE SAME BACKSTOP FOR A DDL (0.4.3), per relation. A schema change runs code over rows -- a
@@ -640,9 +723,14 @@ fn execute(proposal: i64, mode: Mode) -> Value {
     // someone else's record -- and named the owner (external audit of 0.2.8, GATE-06). A proposal
     // that does not exist and one that belongs to another agent now get the same answer, and only
     // the server log tells them apart.
-    let peek: Option<JsonB> =
-        read_internal::<JsonB>("select agent_gate_internal._load_proposal($1)", &[proposal.into()]).filter(|j| !j.0.is_null());
-    let owner = peek.as_ref().and_then(|j| j.0["agent"].as_str().map(str::to_string));
+    let peek: Option<JsonB> = read_internal::<JsonB>(
+        "select agent_gate_internal._load_proposal($1)",
+        &[proposal.into()],
+    )
+    .filter(|j| !j.0.is_null());
+    let owner = peek
+        .as_ref()
+        .and_then(|j| j.0["agent"].as_str().map(str::to_string));
     // A proposal made under an earlier registration of this name belongs to that registration, not
     // to this one (0.2.14, external audit GATE-13): the same answer as another agent's.
     let earlier = peek.as_ref().and_then(|j| j.0["predates_agent"].as_bool()) == Some(true);
@@ -662,21 +750,42 @@ fn execute(proposal: i64, mode: Mode) -> Value {
         return json!({ "proposal": proposal, "mode": mode.as_str(), "outcome": "refused", "reason": "this agent has no proposal with that id" });
     }
     let loaded: Option<JsonB> = if mode == Mode::Commit {
-        call_internal("select agent_gate_internal._load_proposal($1, true)", &[proposal.into()])
+        call_internal(
+            "select agent_gate_internal._load_proposal($1, true)",
+            &[proposal.into()],
+        )
     } else {
         peek
     };
     let Some(JsonB(p)) = loaded.filter(|j| !j.0.is_null()) else {
-        log!("pg_agent_gate: agent={} asked for proposal {} which does not exist", who.agent, proposal);
+        log!(
+            "pg_agent_gate: agent={} asked for proposal {} which does not exist",
+            who.agent,
+            proposal
+        );
         return json!({ "proposal": proposal, "mode": mode.as_str(), "outcome": "refused", "reason": "this agent has no proposal with that id" });
     };
 
     if p["agent"].as_str() != Some(who.agent.as_str()) {
         let owner = p["agent"].as_str().unwrap_or("?").to_string();
-        return refuse_execution(&who, proposal, mode, started, format!("the proposal belongs to {owner}"), json!(null));
+        return refuse_execution(
+            &who,
+            proposal,
+            mode,
+            started,
+            format!("the proposal belongs to {owner}"),
+            json!(null),
+        );
     }
     if p["ok"].as_bool() != Some(true) {
-        return refuse_execution(&who, proposal, mode, started, "the proposal did not pass verification".into(), json!(null));
+        return refuse_execution(
+            &who,
+            proposal,
+            mode,
+            started,
+            "the proposal did not pass verification".into(),
+            json!(null),
+        );
     }
     let ttl = f64::from(crate::PROPOSAL_TTL_SECONDS.get());
     if p["age_seconds"].as_f64().unwrap_or(f64::MAX) > ttl {
@@ -690,7 +799,14 @@ fn execute(proposal: i64, mode: Mode) -> Value {
         );
     }
     if mode == Mode::Commit && p["committed"].as_bool() == Some(true) {
-        return refuse_execution(&who, proposal, mode, started, "it was already committed once".into(), json!(null));
+        return refuse_execution(
+            &who,
+            proposal,
+            mode,
+            started,
+            "it was already committed once".into(),
+            json!(null),
+        );
     }
     // A requires_approval agent commits only what an approver has approved. The
     // approval only lifts this block: the guards below still run. _load_proposal
@@ -733,7 +849,10 @@ fn execute(proposal: i64, mode: Mode) -> Value {
     let cfg = config(&who);
     let verdict = verify::verify(&sql, &params, cfg.allow_ddl, &cfg.allowed, false);
     if !verdict.ok {
-        let why = verdict.first_failure().map(|c| c.detail.clone()).unwrap_or_default();
+        let why = verdict
+            .first_failure()
+            .map(|c| c.detail.clone())
+            .unwrap_or_default();
         return refuse_execution(
             &who,
             proposal,
@@ -747,7 +866,10 @@ fn execute(proposal: i64, mode: Mode) -> Value {
     let cap = crate::MAX_RESULT_ROWS.get().max(0) as usize;
     let statement = if verdict.append_returning {
         // On its own line: a trailing -- comment must not swallow it.
-        format!("{}\nRETURNING to_jsonb(old) AS before, to_jsonb(new) AS after", verdict.statement)
+        format!(
+            "{}\nRETURNING to_jsonb(old) AS before, to_jsonb(new) AS after",
+            verdict.statement
+        )
     } else {
         verdict.statement.clone()
     };
@@ -755,7 +877,11 @@ fn execute(proposal: i64, mode: Mode) -> Value {
     let bindings = cfg.bindings.clone();
     let max_rows = cfg.max_rows;
     let (judge_alters, judge_redefinitions) = (verdict.judge_alters, verdict.judge_redefinitions);
-    let partitioned_update = if kind == Kind::Write { verdict.partitioned_update } else { None };
+    let partitioned_update = if kind == Kind::Write {
+        verdict.partitioned_update
+    } else {
+        None
+    };
 
     // THE WRITE BUDGET (0.4.0). max_rows bounds one proposal; an agent that loops split a write
     // it was refused into slices that each fit (agent-gate-demo/compare: a 6-row table emptied
@@ -786,9 +912,13 @@ fn execute(proposal: i64, mode: Mode) -> Value {
             // Whatever runs from here is judged by the floor as this kind of statement.
             let _kind = state::kind_scope();
             state::set_running_kind(verify::running(kind));
-            let tup_before = xact_tuples();   // the backstop's starting point, inside this subxact
+            let tup_before = xact_tuples(); // the backstop's starting point, inside this subxact
             let relocation_before = partitioned_update.and_then(relocation);
-            let ddl_before = if kind == Kind::Ddl { xact_tuples_by_relation() } else { None };
+            let ddl_before = if kind == Kind::Ddl {
+                xact_tuples_by_relation()
+            } else {
+                None
+            };
             // Hold the executing window across BOTH the verified statement and the gate's own SET
             // CONSTRAINTS below (where deferred constraint triggers fire): any utility a trigger,
             // constraint or function reaches is nested and refused, except the one the gate runs
@@ -822,7 +952,9 @@ fn execute(proposal: i64, mode: Mode) -> Value {
                         // "unrecognized SPI status code: 19" (second review of 0.4.3).
                         Kind::Write => unsafe { crate::exec::spi_write(statement.as_str(), &args) },
                         Kind::Ddl => {
-                            client.update(statement.as_str(), None, &args).expect("the statement failed");
+                            client
+                                .update(statement.as_str(), None, &args)
+                                .expect("the statement failed");
                         }
                     }
                     unsafe { collect_rows(cap) }
@@ -841,7 +973,7 @@ fn execute(proposal: i64, mode: Mode) -> Value {
                 // caller's commit where nothing would be watching.
                 {
                     let _running = state::proposal();
-                    state::allow_gate_utility();   // SET CONSTRAINTS is the gate's own utility
+                    state::allow_gate_utility(); // SET CONSTRAINTS is the gate's own utility
                     Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("constraints");
                 }
                 if kind == Kind::Write {
@@ -942,7 +1074,11 @@ fn execute(proposal: i64, mode: Mode) -> Value {
                 for name in &bindings {
                     let found: Option<JsonB> = Spi::connect_mut(|client| {
                         client
-                            .update("select agent_gate_internal._run_assertion($1)", Some(1), &[name.clone().into()])
+                            .update(
+                                "select agent_gate_internal._run_assertion($1)",
+                                Some(1),
+                                &[name.clone().into()],
+                            )
                             .expect("assertion")
                             .first()
                             .get::<JsonB>(1)
@@ -963,7 +1099,12 @@ fn execute(proposal: i64, mode: Mode) -> Value {
             // constraints and the DBA's assertions (which run outside the floor): the session's
             // context is still its own, or this subtransaction goes, and the move with it (context.rs).
             crate::context::require(true);
-            Outcome { rows, abort, assertions, moved: moved_total }
+            Outcome {
+                rows,
+                abort,
+                assertions,
+                moved: moved_total,
+            }
         },
         |o| mode == Mode::Commit && kind != Kind::Read && o.abort.is_none(),
     );
@@ -975,7 +1116,15 @@ fn execute(proposal: i64, mode: Mode) -> Value {
     let (outcome, reason, rows, processed, truncated, assertions, moved) = match result {
         Err(f) => {
             error = Some(f.json());
-            ("aborted", Some(format!("it ran and PostgreSQL raised {}", f.describe())), Vec::new(), None, None, Vec::new(), None)
+            (
+                "aborted",
+                Some(format!("it ran and PostgreSQL raised {}", f.describe())),
+                Vec::new(),
+                None,
+                None,
+                Vec::new(),
+                None,
+            )
         }
         Ok(o) => {
             let outcome = if o.abort.is_some() {
@@ -987,12 +1136,30 @@ fn execute(proposal: i64, mode: Mode) -> Value {
             } else {
                 "rolled_back"
             };
-            (outcome, o.abort, o.rows.rows, Some(o.rows.processed), Some(o.rows.truncated), o.assertions, o.moved)
+            (
+                outcome,
+                o.abort,
+                o.rows.rows,
+                Some(o.rows.processed),
+                Some(o.rows.truncated),
+                o.assertions,
+                o.moved,
+            )
         }
     };
 
-    let rows_affected = if kind == Kind::Read { None } else { processed.map(|n| n as i64) };
-    let sample = if kind == Kind::Read { None } else { Some(Value::Array(rows.iter().take(SAMPLE_ROWS).cloned().collect())) };
+    let rows_affected = if kind == Kind::Read {
+        None
+    } else {
+        processed.map(|n| n as i64)
+    };
+    let sample = if kind == Kind::Read {
+        None
+    } else {
+        Some(Value::Array(
+            rows.iter().take(SAMPLE_ROWS).cloned().collect(),
+        ))
+    };
     let execution = record_execution(
         proposal,
         mode,

@@ -80,7 +80,10 @@ pub(crate) fn attempt_durability_name() -> &'static str {
 static mut PRELOADED: bool = false;
 
 pub(crate) fn current_agent() -> Option<String> {
-    AGENT.get().and_then(|c| c.into_string().ok()).filter(|s| !s.is_empty())
+    AGENT
+        .get()
+        .and_then(|c| c.into_string().ok())
+        .filter(|s| !s.is_empty())
 }
 
 /// The hooks run on EVERY statement of EVERY session once the library is
@@ -180,7 +183,11 @@ pub(crate) fn startup_parameter_not_settable() -> Option<String> {
                     continue;
                 }
                 if (*g).source == client || (*g).reset_source == client {
-                    names.push(std::ffi::CStr::from_ptr((*g).name).to_string_lossy().to_lowercase());
+                    names.push(
+                        std::ffi::CStr::from_ptr((*g).name)
+                            .to_string_lossy()
+                            .to_lowercase(),
+                    );
                 }
             }
             names
@@ -210,8 +217,12 @@ pub extern "C-unwind" fn _PG_init() {
                     if g.is_null() || (*g).name.is_null() {
                         continue;
                     }
-                    let name = std::ffi::CStr::from_ptr((*g).name).to_string_lossy().to_lowercase();
-                    if name.starts_with("agent_gate.") && ((*g).source == client || (*g).reset_source == client) {
+                    let name = std::ffi::CStr::from_ptr((*g).name)
+                        .to_string_lossy()
+                        .to_lowercase();
+                    if name.starts_with("agent_gate.")
+                        && ((*g).source == client || (*g).reset_source == client)
+                    {
                         pgrx::pg_sys::panic::ErrorReport::new(
                             pgrx::pg_sys::errcodes::PgSqlErrorCode::ERRCODE_INSUFFICIENT_PRIVILEGE,
                             format!("pg_agent_gate: the client set {name} when the connection started"),
@@ -303,7 +314,9 @@ mod tests {
     use pgrx::prelude::*;
 
     fn id(v: &serde_json::Value) -> i64 {
-        v["proposal"].as_i64().unwrap_or_else(|| panic!("no proposal id in {v}"))
+        v["proposal"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("no proposal id in {v}"))
     }
 
     #[pg_test]
@@ -311,7 +324,12 @@ mod tests {
         Spi::run("create table gate_t (id int primary key, plan text not null)").unwrap();
         Spi::run("insert into gate_t values (1, 'free'), (2, 'pro')").unwrap();
 
-        let p = crate::verbs::propose("update gate_t set plan = 'pro' where id = 1", "upgrade client 1", None).0;
+        let p = crate::verbs::propose(
+            "update gate_t set plan = 'pro' where id = 1",
+            "upgrade client 1",
+            None,
+        )
+        .0;
         assert_eq!(p["ok"], true, "{p}");
         assert_eq!(p["kind"], "write", "{p}");
 
@@ -319,17 +337,26 @@ mod tests {
         assert_eq!(d["outcome"], "rolled_back", "{d}");
         assert_eq!(d["rows"][0]["before"]["plan"], "free", "{d}");
         assert_eq!(d["rows"][0]["after"]["plan"], "pro", "{d}");
-        let after_dry: Option<String> = Spi::get_one("select plan from gate_t where id = 1").unwrap();
-        assert_eq!(after_dry.as_deref(), Some("free"), "a dry run kept something");
+        let after_dry: Option<String> =
+            Spi::get_one("select plan from gate_t where id = 1").unwrap();
+        assert_eq!(
+            after_dry.as_deref(),
+            Some("free"),
+            "a dry run kept something"
+        );
 
         let c = crate::verbs::commit(id(&p)).0;
         assert_eq!(c["outcome"], "kept", "{c}");
         assert_eq!(c["rows_affected"], 1, "{c}");
-        let after_commit: Option<String> = Spi::get_one("select plan from gate_t where id = 1").unwrap();
+        let after_commit: Option<String> =
+            Spi::get_one("select plan from gate_t where id = 1").unwrap();
         assert_eq!(after_commit.as_deref(), Some("pro"));
 
         let again = crate::verbs::commit(id(&p)).0;
-        assert_eq!(again["outcome"], "refused", "a proposal was committed twice: {again}");
+        assert_eq!(
+            again["outcome"], "refused",
+            "a proposal was committed twice: {again}"
+        );
     }
 
     #[pg_test]
@@ -352,7 +379,12 @@ mod tests {
     fn a_read_returns_rows_and_keeps_nothing() {
         Spi::run("create table gate_r (id int primary key, n int)").unwrap();
         Spi::run("insert into gate_r select g, g * 10 from generate_series(1, 3) g").unwrap();
-        let p = crate::verbs::propose("select id, n from gate_r where n > $1::int order by id", "list big ones", Some(vec![Some("10".into())])).0;
+        let p = crate::verbs::propose(
+            "select id, n from gate_r where n > $1::int order by id",
+            "list big ones",
+            Some(vec![Some("10".into())]),
+        )
+        .0;
         assert_eq!(p["ok"], true, "{p}");
         let c = crate::verbs::commit(id(&p)).0;
         assert_eq!(c["outcome"], "read", "{c}");
@@ -389,7 +421,8 @@ mod tests {
             let p = crate::verbs::propose(sql, "a write hidden in a cte", None).0;
             assert_eq!(p["ok"], false, "{sql} passed verification: {p}");
         }
-        let untouched: Option<i64> = Spi::get_one("select count(*) from gate_c where plan = 'free'").unwrap();
+        let untouched: Option<i64> =
+            Spi::get_one("select count(*) from gate_c where plan = 'free'").unwrap();
         assert_eq!(untouched, Some(3), "a refused proposal changed rows");
     }
 
@@ -412,17 +445,26 @@ mod tests {
         assert_eq!(p["ok"], true, "{p}");
     }
 
-
     /// A pg_test runs inside a transaction that has already written (it created
     /// tables). Relaxing that commit would relax writes the gate never saw.
     #[pg_test]
     fn a_transaction_that_already_wrote_is_never_relaxed() {
         Spi::run("create table gate_d (id int primary key)").unwrap();
-        let before: Option<String> = Spi::get_one("select current_setting('synchronous_commit')").unwrap();
-        let p = crate::verbs::propose("select id from gate_d", "a read in a transaction that wrote", None).0;
+        let before: Option<String> =
+            Spi::get_one("select current_setting('synchronous_commit')").unwrap();
+        let p = crate::verbs::propose(
+            "select id from gate_d",
+            "a read in a transaction that wrote",
+            None,
+        )
+        .0;
         assert_eq!(p["ok"], true, "{p}");
-        let after: Option<String> = Spi::get_one("select current_setting('synchronous_commit')").unwrap();
-        assert_eq!(after, before, "the gate relaxed a transaction that had already written");
+        let after: Option<String> =
+            Spi::get_one("select current_setting('synchronous_commit')").unwrap();
+        assert_eq!(
+            after, before,
+            "the gate relaxed a transaction that had already written"
+        );
     }
 
     /// Whatever lowered durability earlier in the transaction, a change the gate
@@ -431,13 +473,24 @@ mod tests {
     fn a_kept_change_restores_durability() {
         Spi::run("create table gate_k (id int primary key, plan text not null)").unwrap();
         Spi::run("insert into gate_k values (1, 'free')").unwrap();
-        let configured: Option<String> = Spi::get_one("select reset_val from pg_settings where name = 'synchronous_commit'").unwrap();
+        let configured: Option<String> =
+            Spi::get_one("select reset_val from pg_settings where name = 'synchronous_commit'")
+                .unwrap();
         Spi::run("set local synchronous_commit = off").unwrap();
-        let p = crate::verbs::propose("update gate_k set plan = 'pro' where id = 1", "a change after durability was lowered", None).0;
+        let p = crate::verbs::propose(
+            "update gate_k set plan = 'pro' where id = 1",
+            "a change after durability was lowered",
+            None,
+        )
+        .0;
         let c = crate::verbs::commit(id(&p)).0;
         assert_eq!(c["outcome"], "kept", "{c}");
-        let now: Option<String> = Spi::get_one("select current_setting('synchronous_commit')").unwrap();
-        assert_eq!(now, configured, "a kept change did not restore the configured durability");
+        let now: Option<String> =
+            Spi::get_one("select current_setting('synchronous_commit')").unwrap();
+        assert_eq!(
+            now, configured,
+            "a kept change did not restore the configured durability"
+        );
     }
 
     /// The positive half of the control, missing at first: the two tests above
@@ -448,8 +501,13 @@ mod tests {
     fn an_attempt_in_a_clean_transaction_is_relaxed() {
         let p = crate::verbs::propose("select 1", "an attempt before anything was written", None).0;
         assert_eq!(p["ok"], true, "{p}");
-        let now: Option<String> = Spi::get_one("select current_setting('synchronous_commit')").unwrap();
-        assert_eq!(now.as_deref(), Some("off"), "a clean attempt was not relaxed");
+        let now: Option<String> =
+            Spi::get_one("select current_setting('synchronous_commit')").unwrap();
+        assert_eq!(
+            now.as_deref(),
+            Some("off"),
+            "a clean attempt was not relaxed"
+        );
     }
 
     #[pg_test]
@@ -458,7 +516,9 @@ mod tests {
         assert_eq!(w["attempt_durability"], "fast", "{w}");
         assert_eq!(w["enforced"], true, "{w}");
         assert!(
-            w["verbs"].as_array().is_some_and(|v| v.iter().any(|x| x == "propose_and_commit")),
+            w["verbs"]
+                .as_array()
+                .is_some_and(|v| v.iter().any(|x| x == "propose_and_commit")),
             "whoami does not list the one-call verb: {w}"
         );
     }
@@ -479,12 +539,19 @@ mod tests {
         assert_eq!(r["commit"]["rows_returned"], 2, "{r}");
         assert_eq!(r["commit"]["rows"][0]["n"], 20, "{r}");
         let p = id(&r["proposal"]);
-        assert_eq!(r["commit"]["proposal"], p, "the execution is not tied to its proposal: {r}");
+        assert_eq!(
+            r["commit"]["proposal"], p,
+            "the execution is not tied to its proposal: {r}"
+        );
         let recorded: Option<i64> = Spi::get_one(&format!(
             "select count(*) from agent_gate_internal.executions where proposal = {p} and mode = 'commit'"
         ))
         .unwrap();
-        assert_eq!(recorded, Some(1), "the execution of a one-call act was not recorded");
+        assert_eq!(
+            recorded,
+            Some(1),
+            "the execution of a one-call act was not recorded"
+        );
     }
 
     /// A statement that does not verify never reaches execute: no commit, nothing changed,
@@ -493,7 +560,11 @@ mod tests {
     fn a_one_call_act_refused_at_propose_runs_nothing() {
         Spi::run("create table gate_q (id int primary key)").unwrap();
         Spi::run("insert into gate_q select generate_series(1, 3)").unwrap();
-        for sql in ["drop table gate_q", "with d as (delete from gate_q returning 1) select count(*) from d", "selec 1"] {
+        for sql in [
+            "drop table gate_q",
+            "with d as (delete from gate_q returning 1) select count(*) from d",
+            "selec 1",
+        ] {
             let r = crate::verbs::propose_and_commit(sql, "something that must not run", None).0;
             assert_eq!(r["outcome"], "refused_at_propose", "{sql}: {r}");
             assert!(r["commit"].is_null(), "{sql} reached execute: {r}");
@@ -509,12 +580,23 @@ mod tests {
     fn a_one_call_write_has_the_guards_of_commit() {
         Spi::run("create table gate_w (id int primary key, plan text not null)").unwrap();
         Spi::run("insert into gate_w select g, 'free' from generate_series(1, 1500) g").unwrap();
-        let over = crate::verbs::propose_and_commit("update gate_w set plan = 'pro'", "upgrade everyone", None).0;
+        let over = crate::verbs::propose_and_commit(
+            "update gate_w set plan = 'pro'",
+            "upgrade everyone",
+            None,
+        )
+        .0;
         assert_eq!(over["outcome"], "aborted", "{over}");
-        let untouched: Option<i64> = Spi::get_one("select count(*) from gate_w where plan = 'free'").unwrap();
+        let untouched: Option<i64> =
+            Spi::get_one("select count(*) from gate_w where plan = 'free'").unwrap();
         assert_eq!(untouched, Some(1500), "an aborted one-call write kept rows");
 
-        let one = crate::verbs::propose_and_commit("update gate_w set plan = 'pro' where id = 1", "upgrade one", None).0;
+        let one = crate::verbs::propose_and_commit(
+            "update gate_w set plan = 'pro' where id = 1",
+            "upgrade one",
+            None,
+        )
+        .0;
         assert_eq!(one["outcome"], "kept", "{one}");
         let kept: Option<String> = Spi::get_one("select plan from gate_w where id = 1").unwrap();
         assert_eq!(kept.as_deref(), Some("pro"));

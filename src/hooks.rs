@@ -67,10 +67,18 @@ use pgrx::pg_sys::panic::ErrorReport;
 use pgrx::prelude::*;
 use std::ffi::{c_char, CStr};
 
-pub(crate) const VERBS: &[&str] =
-    &["discover", "propose", "dry_run", "commit", "propose_and_commit", "acts", "whoami"];
+pub(crate) const VERBS: &[&str] = &[
+    "discover",
+    "propose",
+    "dry_run",
+    "commit",
+    "propose_and_commit",
+    "acts",
+    "whoami",
+];
 
-const SHAPE: &str = "an agent session may only run SELECT agent_gate.<verb>(...) with literals or parameters";
+const SHAPE: &str =
+    "an agent session may only run SELECT agent_gate.<verb>(...) with literals or parameters";
 
 static mut PREV_POST_PARSE: pg_sys::post_parse_analyze_hook_type = None;
 static mut PREV_PROCESS_UTILITY: pg_sys::ProcessUtility_hook_type = None;
@@ -117,7 +125,10 @@ fn must_judge() -> bool {
     }
     crate::context::remember();
     if let Some(name) = crate::startup_parameter_not_settable() {
-        refuse(&crate::current_agent().unwrap_or_default(), started_with(&name));
+        refuse(
+            &crate::current_agent().unwrap_or_default(),
+            started_with(&name),
+        );
     }
     true
 }
@@ -236,7 +247,16 @@ unsafe extern "C-unwind" fn process_utility(
     let watch = !pstmt.is_null() && changes_membership((*pstmt).utilityStmt);
     let before = if watch { agent_memberships() } else { None };
     match PREV_PROCESS_UTILITY {
-        Some(prev) => prev(pstmt, query_string, read_only_tree, context, params, query_env, dest, qc),
+        Some(prev) => prev(
+            pstmt,
+            query_string,
+            read_only_tree,
+            context,
+            params,
+            query_env,
+            dest,
+            qc,
+        ),
         None => pg_sys::standard_ProcessUtility(
             pstmt,
             query_string,
@@ -251,7 +271,11 @@ unsafe extern "C-unwind" fn process_utility(
     if let (Some(before), Some(after)) = (before, if watch { agent_memberships() } else { None }) {
         let added: Vec<&String> = after.iter().filter(|m| !before.contains(m)).collect();
         if !added.is_empty() {
-            let added = added.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
+            let added = added
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
             error!(
                 "pg_agent_gate: this would make a role a member of an agent role ({added}); a member \
                  can SET ROLE into it in a session the gate does not watch. An agent role has no \
@@ -266,7 +290,9 @@ unsafe fn changes_membership(stmt: *mut pg_sys::Node) -> bool {
     !stmt.is_null()
         && matches!(
             (*stmt).type_,
-            pg_sys::NodeTag::T_GrantRoleStmt | pg_sys::NodeTag::T_CreateRoleStmt | pg_sys::NodeTag::T_AlterRoleStmt
+            pg_sys::NodeTag::T_GrantRoleStmt
+                | pg_sys::NodeTag::T_CreateRoleStmt
+                | pg_sys::NodeTag::T_AlterRoleStmt
         )
 }
 
@@ -282,7 +308,10 @@ fn agent_memberships() -> Option<Vec<String>> {
     if installed != Some(true) {
         return None;
     }
-    crate::verbs::read_internal::<Vec<String>>("select agent_gate_internal._agent_memberships()", &[])
+    crate::verbs::read_internal::<Vec<String>>(
+        "select agent_gate_internal._agent_memberships()",
+        &[],
+    )
 }
 
 #[pg_guard]
@@ -297,7 +326,8 @@ unsafe extern "C-unwind" fn executor_start(query_desc: *mut pg_sys::QueryDesc, e
             {
                 refuse(
                     &agent,
-                    "the executor was asked to run a plan that did not come through the gate".into(),
+                    "the executor was asked to run a plan that did not come through the gate"
+                        .into(),
                 );
             }
         }
@@ -330,13 +360,17 @@ unsafe extern "C-unwind" fn definer_guard(
     let agent = crate::agent_is_set();
     if agent
         && !flinfo.is_null()
-        && (event == pg_sys::FmgrHookEventType::FHET_END || event == pg_sys::FmgrHookEventType::FHET_ABORT)
+        && (event == pg_sys::FmgrHookEventType::FHET_END
+            || event == pg_sys::FmgrHookEventType::FHET_ABORT)
         && returns_event_trigger((*flinfo).fn_oid)
     {
         state::event_trigger_leave();
     }
     let floor_on = agent && state::floor_applies();
-    if event == pg_sys::FmgrHookEventType::FHET_START && (state::proposal_running() || floor_on) && !flinfo.is_null() {
+    if event == pg_sys::FmgrHookEventType::FHET_START
+        && (state::proposal_running() || floor_on)
+        && !flinfo.is_null()
+    {
         if let Some(name) = security_definer_name((*flinfo).fn_oid) {
             ErrorReport::new(
                 PgSqlErrorCode::ERRCODE_INSUFFICIENT_PRIVILEGE,
@@ -387,7 +421,10 @@ unsafe extern "C-unwind" fn needs_floor(oid: pg_sys::Oid) -> bool {
             return true;
         }
     }
-    if !crate::agent_is_set() || oid.to_u32() < pg_sys::FirstNormalObjectId || !pg_sys::IsTransactionState() {
+    if !crate::agent_is_set()
+        || oid.to_u32() < pg_sys::FirstNormalObjectId
+        || !pg_sys::IsTransactionState()
+    {
         return false;
     }
     crate::context::remember();
@@ -418,36 +455,54 @@ fn stop(what: String) -> ! {
 /// `schema.name` of the function if it is SECURITY DEFINER, else None. Read from the syscache: this
 /// runs inside the function manager, where SPI is not an option.
 unsafe fn security_definer_name(oid: pg_sys::Oid) -> Option<String> {
-    let tup = pg_sys::SearchSysCache1(pg_sys::SysCacheIdentifier::PROCOID as _, pg_sys::Datum::from(oid));
+    let tup = pg_sys::SearchSysCache1(
+        pg_sys::SysCacheIdentifier::PROCOID as _,
+        pg_sys::Datum::from(oid),
+    );
     if tup.is_null() {
         return None;
     }
     let form = pg_sys::heap_tuple_get_struct::<pg_sys::FormData_pg_proc>(tup);
     let secdef = (*form).prosecdef;
     let nsp = (*form).pronamespace;
-    let name = CStr::from_ptr((*form).proname.data.as_ptr()).to_string_lossy().into_owned();
+    let name = CStr::from_ptr((*form).proname.data.as_ptr())
+        .to_string_lossy()
+        .into_owned();
     pg_sys::ReleaseSysCache(tup);
     if !secdef {
         return None;
     }
     let schema = pg_sys::get_namespace_name(nsp);
-    let schema = if schema.is_null() { "?".into() } else { CStr::from_ptr(schema).to_string_lossy().into_owned() };
+    let schema = if schema.is_null() {
+        "?".into()
+    } else {
+        CStr::from_ptr(schema).to_string_lossy().into_owned()
+    };
     Some(format!("{schema}.{name}()"))
 }
 
 unsafe fn plan_reads_relations(rtable: *mut pg_sys::List) -> bool {
-    (0..list_len(rtable))
-        .any(|i| (*nth::<pg_sys::RangeTblEntry>(rtable, i)).rtekind == pg_sys::RTEKind::RTE_RELATION)
+    (0..list_len(rtable)).any(|i| {
+        (*nth::<pg_sys::RangeTblEntry>(rtable, i)).rtekind == pg_sys::RTEKind::RTE_RELATION
+    })
 }
 
 unsafe fn top_level_allowed(q: &pg_sys::Query) -> Result<(), String> {
     match q.commandType {
         pg_sys::CmdType::CMD_UTILITY => utility_allowed(q.utilityStmt),
         pg_sys::CmdType::CMD_SELECT => select_allowed(q),
-        pg_sys::CmdType::CMD_INSERT => Err("INSERT does not reach the database from an agent session".into()),
-        pg_sys::CmdType::CMD_UPDATE => Err("UPDATE does not reach the database from an agent session".into()),
-        pg_sys::CmdType::CMD_DELETE => Err("DELETE does not reach the database from an agent session".into()),
-        pg_sys::CmdType::CMD_MERGE => Err("MERGE does not reach the database from an agent session".into()),
+        pg_sys::CmdType::CMD_INSERT => {
+            Err("INSERT does not reach the database from an agent session".into())
+        }
+        pg_sys::CmdType::CMD_UPDATE => {
+            Err("UPDATE does not reach the database from an agent session".into())
+        }
+        pg_sys::CmdType::CMD_DELETE => {
+            Err("DELETE does not reach the database from an agent session".into())
+        }
+        pg_sys::CmdType::CMD_MERGE => {
+            Err("MERGE does not reach the database from an agent session".into())
+        }
         _ => Err(SHAPE.into()),
     }
 }
@@ -511,7 +566,10 @@ unsafe fn utility_allowed(stmt: *mut pg_sys::Node) -> Result<(), String> {
         // a temporary table it drops is the agent's own. DEALLOCATE drops the session's own
         // prepared statements, which is what a driver's statement cache sends.
         pg_sys::NodeTag::T_DiscardStmt | pg_sys::NodeTag::T_DeallocateStmt => Ok(()),
-        other => Err(format!("{other:?} is not one of the gate's verbs ({})", VERBS.join(", "))),
+        other => Err(format!(
+            "{other:?} is not one of the gate's verbs ({})",
+            VERBS.join(", ")
+        )),
     }
 }
 
@@ -584,7 +642,10 @@ unsafe fn verb_call(node: *mut pg_sys::Node) -> Result<(), String> {
         CStr::from_ptr(name_ptr).to_string_lossy().into_owned()
     };
     if pg_sys::get_func_namespace(f.funcid) != gate || !VERBS.contains(&name.as_str()) {
-        return Err(format!("{name}() is not one of the gate's verbs ({})", VERBS.join(", ")));
+        return Err(format!(
+            "{name}() is not one of the gate's verbs ({})",
+            VERBS.join(", ")
+        ));
     }
     for i in 0..list_len(f.args) {
         simple_argument(nth::<pg_sys::Node>(f.args, i))?;
@@ -600,7 +661,8 @@ unsafe fn verb_call(node: *mut pg_sys::Node) -> Result<(), String> {
 /// evaluated, before verify() raises the proposal flag, so the definer guard
 /// would not see it. All of those are refused here.
 unsafe fn simple_argument(node: *mut pg_sys::Node) -> Result<(), String> {
-    const ARGS: &str = "arguments of a verb must be literals or parameters, not expressions that run code";
+    const ARGS: &str =
+        "arguments of a verb must be literals or parameters, not expressions that run code";
     if node.is_null() {
         return Err(ARGS.into());
     }
@@ -649,7 +711,8 @@ unsafe fn simple_argument(node: *mut pg_sys::Node) -> Result<(), String> {
 /// The cast the parser inserts on its own, through a built-in function.
 unsafe fn implicit_catalog_cast(f: &pg_sys::FuncExpr) -> bool {
     let catalog = pg_sys::get_namespace_oid(c"pg_catalog".as_ptr(), false);
-    f.funcformat == pg_sys::CoercionForm::COERCE_IMPLICIT_CAST && pg_sys::get_func_namespace(f.funcid) == catalog
+    f.funcformat == pg_sys::CoercionForm::COERCE_IMPLICIT_CAST
+        && pg_sys::get_func_namespace(f.funcid) == catalog
 }
 
 /// The per-element step of an ArrayCoerceExpr: the element itself (CaseTestExpr), relabelled or
@@ -657,13 +720,16 @@ unsafe fn implicit_catalog_cast(f: &pg_sys::FuncExpr) -> bool {
 /// beside it (a typmod, an explicit flag). Anything else -- an I/O conversion, a cast through a
 /// user function -- is code, and refused.
 unsafe fn element_step(node: *mut pg_sys::Node) -> Result<(), String> {
-    const STEP: &str = "arguments of a verb must be literals or parameters, not expressions that run code";
+    const STEP: &str =
+        "arguments of a verb must be literals or parameters, not expressions that run code";
     if node.is_null() {
         return Err(STEP.into());
     }
     match (*node).type_ {
         pg_sys::NodeTag::T_CaseTestExpr => Ok(()),
-        pg_sys::NodeTag::T_RelabelType => element_step((*(node as *mut pg_sys::RelabelType)).arg as *mut pg_sys::Node),
+        pg_sys::NodeTag::T_RelabelType => {
+            element_step((*(node as *mut pg_sys::RelabelType)).arg as *mut pg_sys::Node)
+        }
         pg_sys::NodeTag::T_Const => built_in_type((*(node as *mut pg_sys::Const)).consttype),
         pg_sys::NodeTag::T_FuncExpr => {
             let f = &*(node as *mut pg_sys::FuncExpr);
@@ -817,25 +883,32 @@ unsafe fn floor(oid: pg_sys::Oid) -> Option<String> {
     let kind = state::running_kind();
     match builtin_class(target) {
         Builtin::Plain => None,
-        Builtin::SqlFromText => {
-            Some(format!("{}, which runs SQL it receives as text where no check of the gate sees it", function_name(oid)))
-        }
+        Builtin::SqlFromText => Some(format!(
+            "{}, which runs SQL it receives as text where no check of the gate sees it",
+            function_name(oid)
+        )),
         Builtin::ChangesState(crate::verify::StateChange::InARead)
             if matches!(kind, state::RUNNING_WRITE | state::RUNNING_DDL) =>
         {
             None
         }
-        Builtin::ChangesState(crate::verify::StateChange::InARead) if kind == state::RUNNING_TRIAL => {
+        Builtin::ChangesState(crate::verify::StateChange::InARead)
+            if kind == state::RUNNING_TRIAL =>
+        {
             // The DBA's event-trigger code is judged as the DDL that fired it (state::in_event_trigger),
             // and a sequence the trial itself created vanishes with it: serial numbers the rows of a
             // new column the way an identity column does (reach::nextval_in_trial checks, after the
             // trial, that no sequence that existed before it was taken).
             if state::in_event_trigger()
-                || (target == pg_sys::Oid::from(pg_sys::F_NEXTVAL) && crate::reach::nextval_in_trial())
+                || (target == pg_sys::Oid::from(pg_sys::F_NEXTVAL)
+                    && crate::reach::nextval_in_trial())
             {
                 None
             } else {
-                Some(format!("{}, which changes state, and proposing changes nothing", function_name(oid)))
+                Some(format!(
+                    "{}, which changes state, and proposing changes nothing",
+                    function_name(oid)
+                ))
             }
         }
         Builtin::ChangesState(crate::verify::StateChange::InARead) => Some(format!(
@@ -864,10 +937,15 @@ unsafe fn planted_verdict(oid: pg_sys::Oid, c: crate::verify::StateChange) -> Op
                           view, a type -- and code the agent placed is judged as the agent's own";
     let kind = state::running_kind();
     match c {
-        crate::verify::StateChange::InARead if matches!(kind, state::RUNNING_WRITE | state::RUNNING_DDL) => None,
-        crate::verify::StateChange::InARead => {
-            Some(format!("{}, {PLACED}: it may change state, and a read or a proposal changes nothing", function_name(oid)))
+        crate::verify::StateChange::InARead
+            if matches!(kind, state::RUNNING_WRITE | state::RUNNING_DDL) =>
+        {
+            None
         }
+        crate::verify::StateChange::InARead => Some(format!(
+            "{}, {PLACED}: it may change state, and a read or a proposal changes nothing",
+            function_name(oid)
+        )),
         crate::verify::StateChange::Always => Some(format!(
             "{}, {PLACED}: it is native code whose changes fall outside the rows the gate counts",
             function_name(oid)
@@ -895,7 +973,10 @@ unsafe fn builtin_class(oid: pg_sys::Oid) -> Builtin {
     if let Some(b) = BUILTINS.with(|m| m.borrow().get(&oid.to_u32()).copied()) {
         return b;
     }
-    let tup = pg_sys::SearchSysCache1(pg_sys::SysCacheIdentifier::PROCOID as _, pg_sys::Datum::from(oid));
+    let tup = pg_sys::SearchSysCache1(
+        pg_sys::SysCacheIdentifier::PROCOID as _,
+        pg_sys::Datum::from(oid),
+    );
     if tup.is_null() {
         return Builtin::Plain;
     }
@@ -904,12 +985,17 @@ unsafe fn builtin_class(oid: pg_sys::Oid) -> Builtin {
     let in_catalog = (*form).pronamespace == pg_sys::Oid::from(pg_sys::PG_CATALOG_NAMESPACE);
     let volatile = (*form).provolatile as u8 == b'v';
     let system_only = crate::verify::called_by_the_system_only((*form).prorettype.to_u32());
-    let name = CStr::from_ptr((*form).proname.data.as_ptr()).to_string_lossy().into_owned();
+    let name = CStr::from_ptr((*form).proname.data.as_ptr())
+        .to_string_lossy()
+        .into_owned();
     let from_text = (lang == 12 || lang == 13) && prosrc_runs_sql(tup, lang);
     pg_sys::ReleaseSysCache(tup);
     let b = if from_text {
         Builtin::SqlFromText
-    } else if let Some(c) = in_catalog.then(|| crate::verify::state_change(&name, volatile, system_only)).flatten() {
+    } else if let Some(c) = in_catalog
+        .then(|| crate::verify::state_change(&name, volatile, system_only))
+        .flatten()
+    {
         Builtin::ChangesState(c)
     } else {
         Builtin::Plain
@@ -962,8 +1048,16 @@ struct Judgment {
 }
 
 unsafe fn user_judgment(oid: pg_sys::Oid) -> Judgment {
-    let mut j = Judgment { stop: None, builtin: None, event_trigger: false, planted: None };
-    let tup = pg_sys::SearchSysCache1(pg_sys::SysCacheIdentifier::PROCOID as _, pg_sys::Datum::from(oid));
+    let mut j = Judgment {
+        stop: None,
+        builtin: None,
+        event_trigger: false,
+        planted: None,
+    };
+    let tup = pg_sys::SearchSysCache1(
+        pg_sys::SysCacheIdentifier::PROCOID as _,
+        pg_sys::Datum::from(oid),
+    );
     if tup.is_null() {
         return j;
     }
@@ -973,8 +1067,14 @@ unsafe fn user_judgment(oid: pg_sys::Oid) -> Judgment {
     j.event_trigger = (*form).prorettype.to_u32() == EVENT_TRIGGER_TYPE;
     let plain_function = (*form).prokind as u8 == b'f';
     let volatile = (*form).provolatile as u8 == b'v';
-    let src = if lang == 12 || lang == 13 { prosrc(tup) } else { None };
-    let from_text = src.as_deref().is_some_and(|s| crate::verify::runs_sql_from_text(lang, s));
+    let src = if lang == 12 || lang == 13 {
+        prosrc(tup)
+    } else {
+        None
+    };
+    let from_text = src
+        .as_deref()
+        .is_some_and(|s| crate::verify::runs_sql_from_text(lang, s));
     if lang == 12 && plain_function && !from_text {
         if let Some(s) = src.as_deref() {
             j.builtin = builtin_named(s);
@@ -992,9 +1092,13 @@ unsafe fn user_judgment(oid: pg_sys::Oid) -> Judgment {
     // DBA's". What the agent wrote stays its own claim whoever owns it now: is_member_of_role
     // ignores INHERIT, and ADMIN OPTION is a membership too since PostgreSQL 16.
     let alterable = pg_sys::is_member_of_role(pg_sys::GetSessionUserId(), owner);
-    let bad_set = if from_text || alterable
-        || pg_sys::heap_attisnull(tup, pg_sys::Anum_pg_proc_proconfig as _, std::ptr::null_mut())
-    {
+    let bad_set = if from_text
+        || alterable
+        || pg_sys::heap_attisnull(
+            tup,
+            pg_sys::Anum_pg_proc_proconfig as _,
+            std::ptr::null_mut(),
+        ) {
         None
     } else {
         let mut isnull = false;
@@ -1017,11 +1121,20 @@ unsafe fn user_judgment(oid: pg_sys::Oid) -> Judgment {
     };
     pg_sys::ReleaseSysCache(tup);
     if from_text {
-        j.stop = Some(format!("{}, which runs SQL it receives as text where no check of the gate sees it", function_name(oid)));
+        j.stop = Some(format!(
+            "{}, which runs SQL it receives as text where no check of the gate sees it",
+            function_name(oid)
+        ));
     } else if alterable {
-        j.stop = Some(format!("{}, a function this agent can alter, so what it is marked is its own claim", function_name(oid)));
+        j.stop = Some(format!(
+            "{}, a function this agent can alter, so what it is marked is its own claim",
+            function_name(oid)
+        ));
     } else if let Some(p) = bad_set {
-        j.stop = Some(format!("{}, whose SET clause sets {p}, which carries the context a policy may read", function_name(oid)));
+        j.stop = Some(format!(
+            "{}, whose SET clause sets {p}, which carries the context a policy may read",
+            function_name(oid)
+        ));
     } else if volatile && lang != 12 && crate::reach::called_by_agent_object(oid) {
         // Only a volatile function pays for the lookup, and only in an agent's session.
         let executor_runs_it = lang == SQL_LANGUAGE
@@ -1066,7 +1179,10 @@ unsafe fn returns_event_trigger(oid: pg_sys::Oid) -> bool {
     if oid.to_u32() < pg_sys::FirstNormalObjectId {
         return false;
     }
-    let tup = pg_sys::SearchSysCache1(pg_sys::SysCacheIdentifier::PROCOID as _, pg_sys::Datum::from(oid));
+    let tup = pg_sys::SearchSysCache1(
+        pg_sys::SysCacheIdentifier::PROCOID as _,
+        pg_sys::Datum::from(oid),
+    );
     if tup.is_null() {
         return false;
     }
@@ -1095,15 +1211,24 @@ unsafe fn fastpath_call() -> bool {
 
 /// (schema, name) of a function, from the syscache.
 unsafe fn function_identity(oid: pg_sys::Oid) -> (String, String) {
-    let tup = pg_sys::SearchSysCache1(pg_sys::SysCacheIdentifier::PROCOID as _, pg_sys::Datum::from(oid));
+    let tup = pg_sys::SearchSysCache1(
+        pg_sys::SysCacheIdentifier::PROCOID as _,
+        pg_sys::Datum::from(oid),
+    );
     if tup.is_null() {
         return ("?".into(), "?".into());
     }
     let form = pg_sys::heap_tuple_get_struct::<pg_sys::FormData_pg_proc>(tup);
     let nsp = (*form).pronamespace;
-    let name = CStr::from_ptr((*form).proname.data.as_ptr()).to_string_lossy().into_owned();
+    let name = CStr::from_ptr((*form).proname.data.as_ptr())
+        .to_string_lossy()
+        .into_owned();
     pg_sys::ReleaseSysCache(tup);
     let schema = pg_sys::get_namespace_name(nsp);
-    let schema = if schema.is_null() { "?".into() } else { CStr::from_ptr(schema).to_string_lossy().into_owned() };
+    let schema = if schema.is_null() {
+        "?".into()
+    } else {
+        CStr::from_ptr(schema).to_string_lossy().into_owned()
+    };
     (schema, name)
 }

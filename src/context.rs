@@ -40,7 +40,13 @@ thread_local! {
     static BASELINE: RefCell<Option<Vec<Param>>> = const { RefCell::new(None) };
 }
 
-const NAMED: &[&str] = &["role", "session_authorization", "row_security", "session_replication_role", "search_path"];
+const NAMED: &[&str] = &[
+    "role",
+    "session_authorization",
+    "row_security",
+    "session_replication_role",
+    "search_path",
+];
 
 unsafe fn value_of(name: &CStr) -> Option<String> {
     let v = pg_sys::GetConfigOption(name.as_ptr(), true, false);
@@ -70,7 +76,9 @@ unsafe fn context_now() -> Vec<Param> {
             continue;
         }
         let raw = CStr::from_ptr((*g).name);
-        let named = NAMED.iter().any(|n| raw.to_bytes().eq_ignore_ascii_case(n.as_bytes()));
+        let named = NAMED
+            .iter()
+            .any(|n| raw.to_bytes().eq_ignore_ascii_case(n.as_bytes()));
         if !named && ((*g).flags as u32 & pg_sys::GUC_CUSTOM_PLACEHOLDER) == 0 {
             continue;
         }
@@ -78,7 +86,11 @@ unsafe fn context_now() -> Vec<Param> {
         if crate::settable(&name) {
             continue;
         }
-        out.push(Param { c_name: raw.to_owned(), name, value: value_of(raw) });
+        out.push(Param {
+            c_name: raw.to_owned(),
+            name,
+            value: value_of(raw),
+        });
     }
     pg_sys::pfree(vars.cast());
     out
@@ -107,7 +119,10 @@ pub(crate) fn moved(new_too: bool) -> Option<String> {
         for p in base {
             let named = NAMED.contains(&p.name.as_str());
             // A placeholder that a module now defines is that module's parameter (see is_placeholder).
-            if !named && unsafe { !is_placeholder(&p.c_name) } && unsafe { value_of(&p.c_name) }.is_some() {
+            if !named
+                && unsafe { !is_placeholder(&p.c_name) }
+                && unsafe { value_of(&p.c_name) }.is_some()
+            {
                 continue;
             }
             if unsafe { value_of(&p.c_name) } != p.value {
@@ -120,7 +135,8 @@ pub(crate) fn moved(new_too: bool) -> Option<String> {
         unsafe { context_now() }
             .into_iter()
             .find(|n| {
-                n.value.as_deref().is_some_and(|v| !v.is_empty()) && !base.iter().any(|p| p.name == n.name)
+                n.value.as_deref().is_some_and(|v| !v.is_empty())
+                    && !base.iter().any(|p| p.name == n.name)
             })
             .map(|n| n.name)
     })

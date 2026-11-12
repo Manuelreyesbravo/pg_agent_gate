@@ -135,7 +135,9 @@ pub(crate) struct Guard(&'static AtomicU32);
 
 impl Drop for Guard {
     fn drop(&mut self) {
-        let _ = self.0.fetch_update(SeqCst, SeqCst, |v| Some(v.saturating_sub(1)));
+        let _ = self
+            .0
+            .fetch_update(SeqCst, SeqCst, |v| Some(v.saturating_sub(1)));
     }
 }
 

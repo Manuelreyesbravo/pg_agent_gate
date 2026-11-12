@@ -5,8 +5,8 @@
 //! to keep it -- and turning SPI rows into JSON without hiding that there were
 //! more.
 
-use pgrx::pg_sys::panic::CaughtError;
 use pgrx::datum::DatumWithOid;
+use pgrx::pg_sys::panic::CaughtError;
 use pgrx::prelude::*;
 use serde_json::{json, Map, Value};
 use std::ffi::CStr;
@@ -71,7 +71,10 @@ fn sqlstate(code: i32) -> String {
 /// The memory context and resource owner are restored by hand, as every
 /// procedural language does around `BeginInternalSubTransaction`: without it
 /// the caller's allocations would end up in a context that no longer exists.
-pub(crate) fn in_subxact<T>(f: impl FnOnce() -> T, keep: impl FnOnce(&T) -> bool) -> Result<T, Failure> {
+pub(crate) fn in_subxact<T>(
+    f: impl FnOnce() -> T,
+    keep: impl FnOnce(&T) -> bool,
+) -> Result<T, Failure> {
     unsafe {
         let old_context = pg_sys::CurrentMemoryContext;
         let old_owner = pg_sys::CurrentResourceOwner;
@@ -113,7 +116,11 @@ pub(crate) unsafe fn collect_rows(cap: usize) -> Rows {
     let processed = pg_sys::SPI_processed;
     let table = pg_sys::SPI_tuptable;
     if table.is_null() {
-        return Rows { processed, rows: Vec::new(), truncated: false };
+        return Rows {
+            processed,
+            rows: Vec::new(),
+            truncated: false,
+        };
     }
     let tupdesc = (*table).tupdesc;
     let natts = (*tupdesc).natts;
@@ -138,13 +145,20 @@ pub(crate) unsafe fn collect_rows(cap: usize) -> Rows {
             let value = if text_ptr.is_null() {
                 Value::Null
             } else {
-                typed(pg_sys::SPI_gettypeid(tupdesc, col), &CStr::from_ptr(text_ptr).to_string_lossy())
+                typed(
+                    pg_sys::SPI_gettypeid(tupdesc, col),
+                    &CStr::from_ptr(text_ptr).to_string_lossy(),
+                )
             };
             object.insert(name, value);
         }
         rows.push(Value::Object(object));
     }
-    Rows { processed, rows, truncated: available > take || processed as usize > take }
+    Rows {
+        processed,
+        rows,
+        truncated: available > take || processed as usize > take,
+    }
 }
 
 /// Run a write through SPI, inside the caller's SPI connection, and accept every status SPI reports
@@ -153,16 +167,36 @@ pub(crate) unsafe fn collect_rows(cap: usize) -> Rows {
 pub(crate) unsafe fn spi_write(sql: &str, args: &[DatumWithOid]) {
     let text = std::ffi::CString::new(sql).expect("a verified statement has no NUL byte");
     let mut types: Vec<pg_sys::Oid> = args.iter().map(|a| a.oid()).collect();
-    let mut values: Vec<pg_sys::Datum> =
-        args.iter().map(|a| a.datum().map(|d| d.sans_lifetime()).unwrap_or(pg_sys::Datum::from(0usize))).collect();
-    let nulls: Vec<std::ffi::c_char> =
-        args.iter().map(|a| if a.datum().is_some() { b' ' } else { b'n' } as std::ffi::c_char).collect();
+    let mut values: Vec<pg_sys::Datum> = args
+        .iter()
+        .map(|a| {
+            a.datum()
+                .map(|d| d.sans_lifetime())
+                .unwrap_or(pg_sys::Datum::from(0usize))
+        })
+        .collect();
+    let nulls: Vec<std::ffi::c_char> = args
+        .iter()
+        .map(|a| if a.datum().is_some() { b' ' } else { b'n' } as std::ffi::c_char)
+        .collect();
     let rc = pg_sys::SPI_execute_with_args(
         text.as_ptr(),
         args.len() as i32,
-        if types.is_empty() { std::ptr::null_mut() } else { types.as_mut_ptr() },
-        if values.is_empty() { std::ptr::null_mut() } else { values.as_mut_ptr() },
-        if nulls.is_empty() { std::ptr::null() } else { nulls.as_ptr() },
+        if types.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            types.as_mut_ptr()
+        },
+        if values.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            values.as_mut_ptr()
+        },
+        if nulls.is_empty() {
+            std::ptr::null()
+        } else {
+            nulls.as_ptr()
+        },
         false,
         0,
     );
@@ -179,7 +213,9 @@ fn typed(type_oid: pg_sys::Oid, text: &str) -> Value {
     if is(B::BOOLOID) {
         Value::Bool(text == "t")
     } else if is(B::INT2OID) || is(B::INT4OID) || is(B::INT8OID) {
-        text.parse::<i64>().map(Value::from).unwrap_or_else(|_| Value::String(text.into()))
+        text.parse::<i64>()
+            .map(Value::from)
+            .unwrap_or_else(|_| Value::String(text.into()))
     } else if is(B::FLOAT4OID) || is(B::FLOAT8OID) {
         text.parse::<f64>()
             .ok()
@@ -210,24 +246,29 @@ pub(crate) fn get_one_prepared<T: FromDatum + IntoDatum>(
     types: &[PgOid],
     args: &[DatumWithOid],
 ) -> Result<Option<T>, String> {
-    with_gate_search_path(|| Spi::connect(|client| {
-        let plan = match PLANS.with(|p| p.borrow_mut().remove(sql)) {
-            Some(plan) => plan,
-            // prepare_mut, not prepare: pgrx runs a non-mutating plan READ-ONLY, on the snapshot of
-            // the statement that called the verb, which does not see what earlier statements of
-            // the same transaction did -- a table they created, a trigger they added. The max_rows
-            // counter then missed a table created earlier in the transaction (caught by the pgrx
-            // unit test a_one_call_write_has_the_guards_of_commit in CI). A mutating plan runs on a
-            // fresh snapshot, as the gate's own statements do. It still only reads.
-            None => client.prepare_mut(sql, types).map_err(|e| e.to_string())?.keep(),
-        };
-        let result = client
-            .select(&plan, Some(1), args)
-            .and_then(|t| t.first().get_one::<T>())
-            .map_err(|e| e.to_string());
-        PLANS.with(|p| p.borrow_mut().insert(sql, plan));
-        result
-    }))
+    with_gate_search_path(|| {
+        Spi::connect(|client| {
+            let plan = match PLANS.with(|p| p.borrow_mut().remove(sql)) {
+                Some(plan) => plan,
+                // prepare_mut, not prepare: pgrx runs a non-mutating plan READ-ONLY, on the snapshot of
+                // the statement that called the verb, which does not see what earlier statements of
+                // the same transaction did -- a table they created, a trigger they added. The max_rows
+                // counter then missed a table created earlier in the transaction (caught by the pgrx
+                // unit test a_one_call_write_has_the_guards_of_commit in CI). A mutating plan runs on a
+                // fresh snapshot, as the gate's own statements do. It still only reads.
+                None => client
+                    .prepare_mut(sql, types)
+                    .map_err(|e| e.to_string())?
+                    .keep(),
+            };
+            let result = client
+                .select(&plan, Some(1), args)
+                .and_then(|t| t.first().get_one::<T>())
+                .map_err(|e| e.to_string());
+            PLANS.with(|p| p.borrow_mut().insert(sql, plan));
+            result
+        })
+    })
 }
 
 /// Runs `f` -- the gate's own fixed SQL, never the agent's -- with `search_path = pg_catalog, pg_temp`,

@@ -97,12 +97,20 @@ impl Verdict {
     }
 
     fn check(&mut self, name: &'static str, passed: bool, detail: impl Into<String>) {
-        self.checks.push(Check { name, passed, detail: detail.into() });
+        self.checks.push(Check {
+            name,
+            passed,
+            detail: detail.into(),
+        });
     }
 }
 
 pub(crate) fn text_args(params: &Option<Vec<Option<String>>>) -> Vec<DatumWithOid<'static>> {
-    params.iter().flatten().map(|p| DatumWithOid::from(p.clone())).collect()
+    params
+        .iter()
+        .flatten()
+        .map(|p| DatumWithOid::from(p.clone()))
+        .collect()
 }
 
 struct Parsed {
@@ -155,7 +163,11 @@ pub(crate) fn verify(
         }
     };
     if parsed.count != 1 {
-        v.check("parses", parsed.count > 0, "PostgreSQL's parser accepts the text");
+        v.check(
+            "parses",
+            parsed.count > 0,
+            "PostgreSQL's parser accepts the text",
+        );
         v.check(
             "single_statement",
             false,
@@ -214,7 +226,11 @@ pub(crate) fn verify(
         );
         return v;
     }
-    v.check("kind_allowed", true, format!("{} statement ({tag:?})", kind.as_str()));
+    v.check(
+        "kind_allowed",
+        true,
+        format!("{} statement ({tag:?})", kind.as_str()),
+    );
     // From here on, whatever runs is judged by the floor as this kind of statement (hooks::floor),
     // and the kind that ran before is back when verify returns.
     let _kind = state::kind_scope();
@@ -252,14 +268,21 @@ pub(crate) fn verify(
         kind == Kind::Ddl && (tag == pg_sys::NodeTag::T_CreateTableAsStmt || parsed.select_into);
     v.judge_alters = !matches!(
         tag,
-        pg_sys::NodeTag::T_GrantStmt | pg_sys::NodeTag::T_AlterOwnerStmt | pg_sys::NodeTag::T_CommentStmt
+        pg_sys::NodeTag::T_GrantStmt
+            | pg_sys::NodeTag::T_AlterOwnerStmt
+            | pg_sys::NodeTag::T_CommentStmt
     );
-    v.judge_redefinitions =
-        !matches!(tag, pg_sys::NodeTag::T_RenameStmt | pg_sys::NodeTag::T_AlterObjectSchemaStmt);
+    v.judge_redefinitions = !matches!(
+        tag,
+        pg_sys::NodeTag::T_RenameStmt | pg_sys::NodeTag::T_AlterObjectSchemaStmt
+    );
     let mut tree_relations: Vec<pg_sys::Oid> = Vec::new();
     if kind != Kind::Ddl || runs_a_query {
         let n_params = params.as_ref().map_or(0, |p| p.len());
-        let tree = match in_subxact(|| unsafe { analyze_tree(&v.statement, n_params) }, |_| false) {
+        let tree = match in_subxact(
+            || unsafe { analyze_tree(&v.statement, n_params) },
+            |_| false,
+        ) {
             Ok(tree) => tree,
             Err(f) => {
                 // A name or a type that does not resolve: the analyzer says so before the planner.
@@ -289,7 +312,11 @@ pub(crate) fn verify(
             );
             return v;
         }
-        v.check("no_writing_cte", true, "no CTE changes data: max_rows sees every row it touches");
+        v.check(
+            "no_writing_cte",
+            true,
+            "no CTE changes data: max_rows sees every row it touches",
+        );
         if tree.set_config {
             v.kind = Some(kind);
             v.check(
@@ -300,7 +327,11 @@ pub(crate) fn verify(
             );
             return v;
         }
-        v.check("keeps_its_context", true, "nothing in the statement calls set_config()");
+        v.check(
+            "keeps_its_context",
+            true,
+            "nothing in the statement calls set_config()",
+        );
         if kind != Kind::Ddl {
             // The allow-list does NOT skip the check -- it is consulted inside it, so an allowed
             // table still refuses an UNSAFE amplifier (a cascade the agent could not do directly,
@@ -312,8 +343,10 @@ pub(crate) fn verify(
                     v.check(
                         "no_amplification",
                         false,
-                        format!("the catalog lookup for cascading keys, triggers and rules failed, \
-                                 so this write cannot be proven bounded: {why}"),
+                        format!(
+                            "the catalog lookup for cascading keys, triggers and rules failed, \
+                                 so this write cannot be proven bounded: {why}"
+                        ),
                     );
                     return v;
                 }
@@ -366,8 +399,10 @@ pub(crate) fn verify(
                 v.check(
                     "no_opaque_function",
                     false,
-                    format!("the catalog lookup for the statement's functions failed, so it \
-                             cannot be proven safe: {why}"),
+                    format!(
+                        "the catalog lookup for the statement's functions failed, so it \
+                             cannot be proven safe: {why}"
+                    ),
                 );
                 return v;
             }
@@ -383,7 +418,11 @@ pub(crate) fn verify(
                 return v;
             }
             Ok(Some(Opaque::Body(f))) => {
-                v.check("no_hidden_sql", true, "no function that runs SQL from a text is called");
+                v.check(
+                    "no_hidden_sql",
+                    true,
+                    "no function that runs SQL from a text is called",
+                );
                 v.kind = Some(kind);
                 v.check(
                     "no_opaque_function",
@@ -397,7 +436,11 @@ pub(crate) fn verify(
                 return v;
             }
             Ok(None) => {
-                v.check("no_hidden_sql", true, "no function that runs SQL from a text is called");
+                v.check(
+                    "no_hidden_sql",
+                    true,
+                    "no function that runs SQL from a text is called",
+                );
                 v.check(
                     "no_opaque_function",
                     true,
@@ -422,7 +465,11 @@ pub(crate) fn verify(
         match stateful_builtin(&tree.funcs, kind) {
             Err(why) => {
                 v.kind = Some(kind);
-                v.check(name, false, format!("the catalog lookup for the statement's functions failed: {why}"));
+                v.check(
+                    name,
+                    false,
+                    format!("the catalog lookup for the statement's functions failed: {why}"),
+                );
                 return v;
             }
             Ok(Some(f)) if read => {
@@ -430,8 +477,10 @@ pub(crate) fn verify(
                 v.check(
                     name,
                     false,
-                    format!("a read calls {f}, which changes state outside the rows it returns, \
-                             and the record would say nothing changed"),
+                    format!(
+                        "a read calls {f}, which changes state outside the rows it returns, \
+                             and the record would say nothing changed"
+                    ),
                 );
                 return v;
             }
@@ -440,8 +489,10 @@ pub(crate) fn verify(
                 v.check(
                     name,
                     false,
-                    format!("the statement calls {f}, which changes state outside the rows max_rows \
-                             and the write budget count"),
+                    format!(
+                        "the statement calls {f}, which changes state outside the rows max_rows \
+                             and the write budget count"
+                    ),
                 );
                 return v;
             }
@@ -478,7 +529,11 @@ pub(crate) fn verify(
         // CASCADE or as the owner of the schema -- that is not the agent's own, a temporary object,
         // and an ALTER of a type that another role's table or function is made of stop the trial,
         // and with it the proposal: the same judgment runs again when the commit runs it for real.
-        let as_kind = if estimate { state::RUNNING_TRIAL } else { state::RUNNING_DDL };
+        let as_kind = if estimate {
+            state::RUNNING_TRIAL
+        } else {
+            state::RUNNING_DDL
+        };
         let (judge_alters, judge_redefinitions) = (v.judge_alters, v.judge_redefinitions);
         match in_subxact(
             || {
@@ -541,7 +596,8 @@ pub(crate) fn verify(
                 // function after the tree was built (0.2.8: 34 through such a helper, 1156 through
                 // two of them joined). Fail closed: a lookup that failed withholds it.
                 if estimate {
-                    let hidden = rows_hidden_from_agent(&tree_relations, &plan_relations).unwrap_or(true);
+                    let hidden =
+                        rows_hidden_from_agent(&tree_relations, &plan_relations).unwrap_or(true);
                     v.estimated_rows = if hidden { None } else { rows };
                 }
                 v.check(
@@ -623,7 +679,8 @@ unsafe fn collect_target(q: *mut pg_sys::Query, tree: &mut Tree) {
     ) {
         tree.modifies = true;
         if (*q).resultRelation > 0 {
-            let rte = pg_sys::list_nth((*q).rtable, (*q).resultRelation - 1) as *mut pg_sys::RangeTblEntry;
+            let rte = pg_sys::list_nth((*q).rtable, (*q).resultRelation - 1)
+                as *mut pg_sys::RangeTblEntry;
             if !rte.is_null() && (*rte).relid != pg_sys::InvalidOid {
                 tree.targets.push((*rte).relid);
             }
@@ -698,12 +755,18 @@ pub(crate) const SQL_FROM_TEXT: &[&str] = &[
 /// Whether a C entry point (with its language) is one of SQL_FROM_TEXT. LANGUAGE internal is 12 and
 /// C is 13, fixed in pg_language.dat; nothing else can name a C symbol.
 pub(crate) fn runs_sql_from_text(prolang: u32, prosrc: &str) -> bool {
-    (prolang == 12 || prolang == 13) && (SQL_FROM_TEXT.contains(&prosrc) || prosrc.starts_with("dblink"))
+    (prolang == 12 || prolang == 13)
+        && (SQL_FROM_TEXT.contains(&prosrc) || prosrc.starts_with("dblink"))
 }
 
 /// Parameters that carry the context a row-level policy reads, besides the custom ones: who is
 /// acting, and whether policies (and triggers) apply at all.
-pub(crate) const CONTEXT_PARAMETERS: &[&str] = &["role", "session_authorization", "row_security", "session_replication_role"];
+pub(crate) const CONTEXT_PARAMETERS: &[&str] = &[
+    "role",
+    "session_authorization",
+    "row_security",
+    "session_replication_role",
+];
 
 /// A parameter a function's SET clause may set and still be vouched for (0.4.3). What a SET clause
 /// must not do is move the context the agent's policies read while the body runs: a custom
@@ -732,7 +795,9 @@ pub(crate) fn set_clause_allowed(name: &str) -> bool {
     }
     match name.split_once('.') {
         None => true,
-        Some((prefix, _)) => prefix != "agent_gate" && unsafe { defined_by_a_module(&name, prefix) },
+        Some((prefix, _)) => {
+            prefix != "agent_gate" && unsafe { defined_by_a_module(&name, prefix) }
+        }
     }
 }
 
@@ -743,11 +808,13 @@ unsafe fn defined_by_a_module(name: &str, prefix: &str) -> bool {
         return false;
     };
     if !pg_sys::GetConfigOption(n.as_ptr(), true, false).is_null()
-        && (pg_sys::GetConfigOptionFlags(n.as_ptr(), true) as u32 & pg_sys::GUC_CUSTOM_PLACEHOLDER) == 0
+        && (pg_sys::GetConfigOptionFlags(n.as_ptr(), true) as u32 & pg_sys::GUC_CUSTOM_PLACEHOLDER)
+            == 0
     {
         return true;
     }
-    pg_sys::IsTransactionState() && pg_sys::get_extension_oid(p.as_ptr(), true) != pg_sys::InvalidOid
+    pg_sys::IsTransactionState()
+        && pg_sys::get_extension_oid(p.as_ptr(), true) != pg_sys::InvalidOid
 }
 
 /// How a built-in changes state outside the rows the gate counts.
@@ -781,10 +848,18 @@ pub(crate) enum StateChange {
 /// READS_ONLY, IN_A_READ, or neither -- a state change in any statement. Those returning trigger,
 /// event_trigger, internal or a handler type are called by the server, never by a statement
 /// (a function returning internal must take internal), so they are not judged here.
-pub(crate) fn state_change(proname: &str, volatile: bool, system_only: bool) -> Option<StateChange> {
+pub(crate) fn state_change(
+    proname: &str,
+    volatile: bool,
+    system_only: bool,
+) -> Option<StateChange> {
     if IN_A_READ.contains(&proname) {
         Some(StateChange::InARead)
-    } else if !volatile || system_only || READS_ONLY.contains(&proname) || proname.starts_with("pg_stat_get_") {
+    } else if !volatile
+        || system_only
+        || READS_ONLY.contains(&proname)
+        || proname.starts_with("pg_stat_get_")
+    {
         None
     } else {
         Some(StateChange::Always)
@@ -806,37 +881,109 @@ const IN_A_READ: &[&str] = &[
 /// Volatile because each call may answer differently, not because it writes.
 const READS_ONLY: &[&str] = &[
     // a random number or the clock
-    "random", "random_normal", "array_sample", "array_shuffle", "gen_random_uuid", "uuidv4", "uuidv7",
-    "clock_timestamp", "timeofday",
+    "random",
+    "random_normal",
+    "array_sample",
+    "array_shuffle",
+    "gen_random_uuid",
+    "uuidv4",
+    "uuidv7",
+    "clock_timestamp",
+    "timeofday",
     // waiting
-    "pg_sleep", "pg_sleep_for", "pg_sleep_until",
+    "pg_sleep",
+    "pg_sleep_for",
+    "pg_sleep_until",
     // what this session last drew from a sequence, and a sequence's state, read
-    "currval", "lastval", "pg_sequence_last_value", "pg_get_sequence_data",
+    "currval",
+    "lastval",
+    "pg_sequence_last_value",
+    "pg_get_sequence_data",
     // reading a large object: a descriptor lives as long as the transaction (lo_open, lo_close)
-    "lo_get", "loread", "lo_open", "lo_close", "lo_lseek", "lo_lseek64", "lo_tell", "lo_tell64",
+    "lo_get",
+    "loread",
+    "lo_open",
+    "lo_close",
+    "lo_lseek",
+    "lo_lseek64",
+    "lo_tell",
+    "lo_tell64",
     // sizes, locks, recovery, the WAL position, the control file, commit timestamps
-    "pg_database_size", "pg_relation_size", "pg_table_size", "pg_indexes_size", "pg_total_relation_size",
-    "pg_tablespace_size", "pg_stat_have_stats", "pg_stat_clear_snapshot", "pg_lock_status", "pg_blocking_pids",
-    "pg_safe_snapshot_blocking_pids", "pg_isolation_test_session_is_blocked", "pg_is_in_recovery",
-    "pg_is_wal_replay_paused", "pg_get_wal_replay_pause_state", "pg_last_wal_receive_lsn",
-    "pg_last_wal_replay_lsn", "pg_last_xact_replay_timestamp", "pg_last_committed_xact",
-    "pg_current_wal_lsn", "pg_current_wal_insert_lsn", "pg_current_wal_flush_lsn", "pg_control_checkpoint",
-    "pg_control_init", "pg_control_recovery", "pg_control_system", "pg_jit_available",
-    "pg_xact_commit_timestamp", "pg_xact_commit_timestamp_origin", "pg_xact_status", "txid_status",
-    "pg_notification_queue_usage", "pg_partition_tree", "pg_partition_ancestors",
-    "pg_collation_actual_version", "pg_database_collation_actual_version",
+    "pg_database_size",
+    "pg_relation_size",
+    "pg_table_size",
+    "pg_indexes_size",
+    "pg_total_relation_size",
+    "pg_tablespace_size",
+    "pg_stat_have_stats",
+    "pg_stat_clear_snapshot",
+    "pg_lock_status",
+    "pg_blocking_pids",
+    "pg_safe_snapshot_blocking_pids",
+    "pg_isolation_test_session_is_blocked",
+    "pg_is_in_recovery",
+    "pg_is_wal_replay_paused",
+    "pg_get_wal_replay_pause_state",
+    "pg_last_wal_receive_lsn",
+    "pg_last_wal_replay_lsn",
+    "pg_last_xact_replay_timestamp",
+    "pg_last_committed_xact",
+    "pg_current_wal_lsn",
+    "pg_current_wal_insert_lsn",
+    "pg_current_wal_flush_lsn",
+    "pg_control_checkpoint",
+    "pg_control_init",
+    "pg_control_recovery",
+    "pg_control_system",
+    "pg_jit_available",
+    "pg_xact_commit_timestamp",
+    "pg_xact_commit_timestamp_origin",
+    "pg_xact_status",
+    "txid_status",
+    "pg_notification_queue_usage",
+    "pg_partition_tree",
+    "pg_partition_ancestors",
+    "pg_collation_actual_version",
+    "pg_database_collation_actual_version",
     // the server's own state, read
-    "pg_get_aios", "pg_get_backend_memory_contexts", "pg_get_loaded_modules", "pg_get_multixact_members",
-    "pg_get_multixact_stats", "pg_get_shmem_allocations", "pg_get_shmem_allocations_numa",
-    "pg_get_dsm_registry_allocations", "pg_get_wait_events", "pg_get_wal_resource_managers",
-    "pg_get_wal_summarizer_state", "pg_available_wal_summaries", "pg_wal_summary_contents",
-    "pg_hba_file_rules", "pg_ident_file_mappings", "pg_show_all_file_settings",
-    "pg_show_replication_origin_status", "pg_replication_origin_session_is_setup", "pg_prepared_xact",
-    "pg_current_logfile", "current_query", "currtid2", "amvalidate", "plpgsql_validator",
+    "pg_get_aios",
+    "pg_get_backend_memory_contexts",
+    "pg_get_loaded_modules",
+    "pg_get_multixact_members",
+    "pg_get_multixact_stats",
+    "pg_get_shmem_allocations",
+    "pg_get_shmem_allocations_numa",
+    "pg_get_dsm_registry_allocations",
+    "pg_get_wait_events",
+    "pg_get_wal_resource_managers",
+    "pg_get_wal_summarizer_state",
+    "pg_available_wal_summaries",
+    "pg_wal_summary_contents",
+    "pg_hba_file_rules",
+    "pg_ident_file_mappings",
+    "pg_show_all_file_settings",
+    "pg_show_replication_origin_status",
+    "pg_replication_origin_session_is_setup",
+    "pg_prepared_xact",
+    "pg_current_logfile",
+    "current_query",
+    "currtid2",
+    "amvalidate",
+    "plpgsql_validator",
     // files and decoded changes, read -- what a role may read is its privileges' business
-    "pg_ls_dir", "pg_ls_logdir", "pg_ls_waldir", "pg_ls_archive_statusdir", "pg_ls_tmpdir",
-    "pg_ls_logicalmapdir", "pg_ls_logicalsnapdir", "pg_ls_replslotdir", "pg_ls_summariesdir",
-    "pg_read_file", "pg_read_binary_file", "pg_stat_file", "pg_logical_slot_peek_changes",
+    "pg_ls_dir",
+    "pg_ls_logdir",
+    "pg_ls_waldir",
+    "pg_ls_archive_statusdir",
+    "pg_ls_tmpdir",
+    "pg_ls_logicalmapdir",
+    "pg_ls_logicalsnapdir",
+    "pg_ls_replslotdir",
+    "pg_ls_summariesdir",
+    "pg_read_file",
+    "pg_read_binary_file",
+    "pg_stat_file",
+    "pg_logical_slot_peek_changes",
     "pg_logical_slot_peek_binary_changes",
 ];
 
@@ -894,7 +1041,9 @@ fn opaque_function(funcs: &[pg_sys::Oid]) -> Result<Option<Opaque>, String> {
     let ids: Vec<i64> = funcs.iter().map(|o| o.to_u32() as i64).collect();
     let symbols: Vec<String> = SQL_FROM_TEXT.iter().map(|s| s.to_string()).collect();
     let found = crate::exec::get_one_prepared::<String>(
-        concat!(called_cte!(), "select (
+        concat!(
+            called_cte!(),
+            "select (
            select case when x.from_text then 'T' else 'B' end ||
                   n.nspname || '.' || p.proname || '()' ||
                   case when x.from_text then '' else ' (' || x.why || ')' end
@@ -914,13 +1063,18 @@ fn opaque_function(funcs: &[pg_sys::Oid]) -> Result<Option<Opaque>, String> {
               and (x.from_text or x.why is not null)
             order by x.from_text desc
             limit 1
-         )"),
+         )"
+        ),
         &[
             PgOid::BuiltIn(PgBuiltInOids::INT8ARRAYOID),
             PgOid::BuiltIn(PgBuiltInOids::TEXTARRAYOID),
             PgOid::BuiltIn(PgBuiltInOids::BOOLOID),
         ],
-        &[ids.clone().into(), symbols.into(), crate::agent_is_set().into()],
+        &[
+            ids.clone().into(),
+            symbols.into(),
+            crate::agent_is_set().into(),
+        ],
     )?;
     if let Some(f) = found {
         return Ok(Some(match f.split_at(1) {
@@ -943,7 +1097,10 @@ fn opaque_function(funcs: &[pg_sys::Oid]) -> Result<Option<Opaque>, String> {
     Ok(clauses.unwrap_or_default().into_iter().find_map(|c| {
         let (f, p) = c.split_once('\u{1}')?;
         (!set_clause_allowed(p)).then(|| {
-            Opaque::Body(format!("{f} (its SET clause sets {}, which carries the context a policy may read)", p.to_lowercase()))
+            Opaque::Body(format!(
+                "{f} (its SET clause sets {}, which carries the context a policy may read)",
+                p.to_lowercase()
+            ))
         })
     }))
 }
@@ -995,7 +1152,10 @@ fn stateful_builtin(funcs: &[pg_sys::Oid], kind: Kind) -> Result<Option<String>,
 /// active for this role (PostgreSQL's row_security_active(), so a superuser, a BYPASSRLS role and an
 /// owner without FORCE keep the estimate), or a plan relation whose name does not resolve. Err = the
 /// lookup failed; the caller withholds the estimate (fail closed).
-fn rows_hidden_from_agent(relations: &[pg_sys::Oid], plan_relations: &[(String, String)]) -> Result<bool, String> {
+fn rows_hidden_from_agent(
+    relations: &[pg_sys::Oid],
+    plan_relations: &[(String, String)],
+) -> Result<bool, String> {
     if relations.is_empty() && plan_relations.is_empty() {
         return Ok(false);
     }
@@ -1033,7 +1193,11 @@ fn rows_hidden_from_agent(relations: &[pg_sys::Oid], plan_relations: &[(String, 
 /// launch, maintenance workers included); the other two keep the plan EXPLAIN shows the plan that
 /// runs. LOCAL: undone when the transaction ends, and the agent cannot SET them back (allowlist).
 fn keep_out_of_workers() {
-    for name in [c"max_parallel_workers", c"max_parallel_workers_per_gather", c"max_parallel_maintenance_workers"] {
+    for name in [
+        c"max_parallel_workers",
+        c"max_parallel_workers_per_gather",
+        c"max_parallel_maintenance_workers",
+    ] {
         // elevel 0 on a session source is ERROR: a setting that did not take fails the verb, closed.
         unsafe {
             pg_sys::set_config_option(
@@ -1059,9 +1223,16 @@ unsafe fn analyze_tree(statement: &str, n_params: usize) -> Tree {
     // The statement was already verified as one non-empty statement; re-parsing must
     // yield exactly that. Fail closed (the subtransaction catches a panic and verify
     // refuses) rather than indexing an empty list or dereferencing a null node.
-    assert_eq!(list_len(raws), 1, "the verified statement re-parses to one statement");
+    assert_eq!(
+        list_len(raws),
+        1,
+        "the verified statement re-parses to one statement"
+    );
     let raw = pg_sys::list_nth(raws, 0) as *mut pg_sys::RawStmt;
-    assert!(!(*raw).stmt.is_null(), "the verified statement re-parses to a non-empty node");
+    assert!(
+        !(*raw).stmt.is_null(),
+        "the verified statement re-parses to a non-empty node"
+    );
     let types = vec![pg_sys::TEXTOID; n_params];
     // pg_analyze_and_rewrite_fixedparams, in its two steps: what the AGENT wrote is read between
     // them, before the rewriter adds what the catalog attaches (see catalog_defaults).
@@ -1083,7 +1254,8 @@ unsafe fn analyze_tree(statement: &str, n_params: usize) -> Tree {
             && (*q).resultRelation > 0
             && (*q).resultRelation <= list_len((*q).rtable)
         {
-            let rte = pg_sys::list_nth((*q).rtable, (*q).resultRelation - 1) as *mut pg_sys::RangeTblEntry;
+            let rte = pg_sys::list_nth((*q).rtable, (*q).resultRelation - 1)
+                as *mut pg_sys::RangeTblEntry;
             if (*rte).rtekind == pg_sys::RTEKind::RTE_RELATION
                 && (*rte).relkind as u8 == pg_sys::RELKIND_PARTITIONED_TABLE
             {
@@ -1105,8 +1277,12 @@ unsafe fn analyze_tree(statement: &str, n_params: usize) -> Tree {
                 !inner.is_null() && (*inner).type_ == pg_sys::NodeTag::T_Query,
                 "the query of a CREATE TABLE AS is analyzed"
             );
-            let rewritten = pg_sys::QueryRewrite(pg_sys::copyObjectImpl(inner as *const c_void) as *mut pg_sys::Query);
-            (0..list_len(rewritten)).map(|j| pg_sys::list_nth(rewritten, j) as *mut pg_sys::Query).collect()
+            let rewritten = pg_sys::QueryRewrite(
+                pg_sys::copyObjectImpl(inner as *const c_void) as *mut pg_sys::Query
+            );
+            (0..list_len(rewritten))
+                .map(|j| pg_sys::list_nth(rewritten, j) as *mut pg_sys::Query)
+                .collect()
         } else {
             vec![q]
         };
@@ -1179,7 +1355,9 @@ unsafe fn assignment_lists(q: *mut pg_sys::Query) -> Vec<*mut pg_sys::List> {
         lists.push((*(*q).onConflict).onConflictSet);
     }
     for i in 0..list_len((*q).mergeActionList) {
-        lists.push((*(pg_sys::list_nth((*q).mergeActionList, i) as *mut pg_sys::MergeAction)).targetList);
+        lists.push(
+            (*(pg_sys::list_nth((*q).mergeActionList, i) as *mut pg_sys::MergeAction)).targetList,
+        );
     }
     lists
 }
@@ -1190,7 +1368,11 @@ unsafe fn is_set_to_default(node: *mut pg_sys::Node) -> bool {
 
 /// Records in `tree.owners_defaults` the column DEFAULTs the rewriter wrote into `q` from the
 /// catalog of a table the agent cannot alter (see agent_written for the rule).
-unsafe fn catalog_defaults(q: *mut pg_sys::Query, written: &std::collections::HashSet<usize>, tree: &mut Tree) {
+unsafe fn catalog_defaults(
+    q: *mut pg_sys::Query,
+    written: &std::collections::HashSet<usize>,
+    tree: &mut Tree,
+) {
     if !matches!(
         (*q).commandType,
         pg_sys::CmdType::CMD_INSERT | pg_sys::CmdType::CMD_UPDATE | pg_sys::CmdType::CMD_MERGE
@@ -1279,13 +1461,16 @@ unsafe extern "C-unwind" fn walk(node: *mut pg_sys::Node, context: *mut c_void) 
             }
             pg_sys::expression_tree_walker_impl(node, Some(walk), context)
         }
-        pg_sys::NodeTag::T_OpExpr | pg_sys::NodeTag::T_DistinctExpr | pg_sys::NodeTag::T_NullIfExpr => {
+        pg_sys::NodeTag::T_OpExpr
+        | pg_sys::NodeTag::T_DistinctExpr
+        | pg_sys::NodeTag::T_NullIfExpr => {
             tree.funcs.push((*(node as *mut pg_sys::OpExpr)).opfuncid);
             pg_sys::expression_tree_walker_impl(node, Some(walk), context)
         }
         pg_sys::NodeTag::T_ScalarArrayOpExpr => {
             // `x = ANY(...)`, `x IN (...)`: the operator's function, same as an OpExpr.
-            tree.funcs.push((*(node as *mut pg_sys::ScalarArrayOpExpr)).opfuncid);
+            tree.funcs
+                .push((*(node as *mut pg_sys::ScalarArrayOpExpr)).opfuncid);
             pg_sys::expression_tree_walker_impl(node, Some(walk), context)
         }
         pg_sys::NodeTag::T_Aggref => {
@@ -1293,7 +1478,8 @@ unsafe extern "C-unwind" fn walk(node: *mut pg_sys::Node, context: *mut c_void) 
             pg_sys::expression_tree_walker_impl(node, Some(walk), context)
         }
         pg_sys::NodeTag::T_WindowFunc => {
-            tree.funcs.push((*(node as *mut pg_sys::WindowFunc)).winfnoid);
+            tree.funcs
+                .push((*(node as *mut pg_sys::WindowFunc)).winfnoid);
             pg_sys::expression_tree_walker_impl(node, Some(walk), context)
         }
         pg_sys::NodeTag::T_Query => {
@@ -1305,7 +1491,6 @@ unsafe extern "C-unwind" fn walk(node: *mut pg_sys::Node, context: *mut c_void) 
         _ => pg_sys::expression_tree_walker_impl(node, Some(walk), context),
     }
 }
-
 
 unsafe fn parse(sql: &str, text: &CString) -> Parsed {
     let list = pg_sys::raw_parser(text.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT);
@@ -1333,7 +1518,11 @@ unsafe fn parse(sql: &str, text: &CString) -> Parsed {
     let tag = (*node).type_;
 
     let start = raw.stmt_location.max(0) as usize;
-    let end = if raw.stmt_len > 0 { start + raw.stmt_len as usize } else { sql.len() };
+    let end = if raw.stmt_len > 0 {
+        start + raw.stmt_len as usize
+    } else {
+        sql.len()
+    };
     parsed.statement = sql
         .get(start.min(sql.len())..end.min(sql.len()))
         .unwrap_or(sql)
@@ -1343,10 +1532,18 @@ unsafe fn parse(sql: &str, text: &CString) -> Parsed {
         .to_string();
 
     parsed.append_returning = match tag {
-        pg_sys::NodeTag::T_InsertStmt => (*(node as *mut pg_sys::InsertStmt)).returningClause.is_null(),
-        pg_sys::NodeTag::T_UpdateStmt => (*(node as *mut pg_sys::UpdateStmt)).returningClause.is_null(),
-        pg_sys::NodeTag::T_DeleteStmt => (*(node as *mut pg_sys::DeleteStmt)).returningClause.is_null(),
-        pg_sys::NodeTag::T_MergeStmt => (*(node as *mut pg_sys::MergeStmt)).returningClause.is_null(),
+        pg_sys::NodeTag::T_InsertStmt => (*(node as *mut pg_sys::InsertStmt))
+            .returningClause
+            .is_null(),
+        pg_sys::NodeTag::T_UpdateStmt => (*(node as *mut pg_sys::UpdateStmt))
+            .returningClause
+            .is_null(),
+        pg_sys::NodeTag::T_DeleteStmt => (*(node as *mut pg_sys::DeleteStmt))
+            .returningClause
+            .is_null(),
+        pg_sys::NodeTag::T_MergeStmt => (*(node as *mut pg_sys::MergeStmt))
+            .returningClause
+            .is_null(),
         _ => false,
     };
     if tag == pg_sys::NodeTag::T_SelectStmt {
@@ -1372,7 +1569,9 @@ fn explain_plan(explain: &str, args: &[DatumWithOid<'static>]) -> Value {
 
 fn run_statement(statement: &str) {
     Spi::connect_mut(|client| {
-        client.update(statement, None, &[]).expect("statement failed");
+        client
+            .update(statement, None, &[])
+            .expect("statement failed");
     })
 }
 
@@ -1395,7 +1594,10 @@ fn read_plan(plan: &Value) -> (Option<f64>, bool, Vec<(String, String)>) {
 /// withheld rather than guessed.
 fn plan_relations(node: &Value, out: &mut Vec<(String, String)>) {
     if let Some(name) = node["Relation Name"].as_str() {
-        out.push((node["Schema"].as_str().unwrap_or("").to_string(), name.to_string()));
+        out.push((
+            node["Schema"].as_str().unwrap_or("").to_string(),
+            name.to_string(),
+        ));
     }
     if let Some(children) = node["Plans"].as_array() {
         for child in children {
@@ -1406,7 +1608,9 @@ fn plan_relations(node: &Value, out: &mut Vec<(String, String)>) {
 
 fn modifies(node: &Value) -> bool {
     node["Node Type"] == "ModifyTable"
-        || node["Plans"].as_array().is_some_and(|children| children.iter().any(modifies))
+        || node["Plans"]
+            .as_array()
+            .is_some_and(|children| children.iter().any(modifies))
 }
 
 /// The statements an allow_ddl agent may propose: they change the schema. An allowlist, so a
