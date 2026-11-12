@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+No change to the extension's code or SQL: a build of this is 0.4.3. From the package review of
+0.4.3 (2026-11-11):
+
+* Setup runs `cargo pgrx init` before `cargo pgrx install` (without it the install fails on a
+  clean machine); META.json recommends pg_living_assertions 0.5.6.
+* `make verify` counts the cases that did not run for a missing module and says so ("N passed,
+  0 failed, M skipped"); `GATE_PORT` alone moves both the cluster and the suites.
+* `Cargo.lock` is tracked; a bare `make` prints the targets instead of running `make bench`.
+* README: current counts and PostgreSQL versions, dates on the "Measured" table, the
+  membership guarantee qualified (it holds with `shared_preload_libraries`), and the counts of
+  a private Qwen3-8B run withdrawn.
+* `cargo fmt`, and the 13 clippy doc warnings fixed.
+
 ## 0.4.3 -- 2026-11-05
 
 **Security release.** 0.4.2 was never released: its fixes ship here, together with what a review
