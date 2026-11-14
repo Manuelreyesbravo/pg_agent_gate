@@ -20,6 +20,9 @@ inside the server, so there is no client, driver or protocol path around it.
 **No MCP server required.** The gate lives in the database, so an agent reaches it over
 `psql`, a driver or direct SQL — there is nothing to put in front of it (see
 [a client that only speaks MCP](#for-a-client-that-only-speaks-mcp-a-shim-with-no-power)).
+For the model's side there is [ygg-agent](#the-loop-with-no-mcp-ygg-agent): the model writes
+SQL over PostgreSQL's own protocol, and since 0.2.0 it can run in the same process, with no
+HTTP anywhere.
 A small, free model operating it live, verified end to end:
 **[see the demo ▶](https://manuelreyesbravo.github.io/agent-gate-demo/)**.
 
@@ -28,6 +31,7 @@ A small, free model operating it live, verified end to end:
 [The seven verbs](#the-seven-verbs) · [Setup](#setup) ·
 [Run the two side by side](#run-the-two-side-by-side) ·
 [The pipe: what JSON costs](#the-pipe-what-json-costs) ·
+[The loop with no MCP: ygg-agent](#the-loop-with-no-mcp-ygg-agent) ·
 [A client that only speaks MCP](#for-a-client-that-only-speaks-mcp-a-shim-with-no-power) ·
 [Measured](#measured) · [What it costs](#what-it-costs) · [Threat model](#threat-model) ·
 [What it does not cover](#what-it-does-not-cover)
@@ -486,6 +490,36 @@ For the same reason it refuses `REPLICATION` and `BYPASSRLS` roles, and members
 `pg_execute_server_program` or `pg_write_server_files`. A session loaded this
 way ends (FATAL) if its client set any `agent_gate.*` parameter at startup. It
 takes effect on the role's **next** connection.
+
+## The loop with no MCP: ygg-agent
+
+[ygg-agent](https://github.com/Manuelreyesbravo/ygg-agent) (Python, Apache-2.0, on
+[PyPI](https://pypi.org/project/ygg-agent/)) is the loop between a language model and a
+database that runs this gate. The model writes one SQL statement; ygg-agent hands it to
+`agent_gate.propose()` over PostgreSQL's own protocol; the gate decides; the verdict goes back
+to the model; repeat. There is no MCP server, no tool schema in the model's context, and no
+JSON between the model and its data.
+
+It is a messenger with no power, on purpose. It connects as the agent role, refuses to work
+unless `agent_gate.whoami()` says the session is behind the gate, never executes the model's
+SQL itself, and stops after three refusals in a row. Replace it with anything and it still can
+only call the seven verbs: the guarantees come from the database, not from the loop.
+
+```sh
+pip install "ygg-agent[binary]"          # model served over /v1/chat/completions
+pip install "ygg-agent[binary,local]"    # 0.2.0: the model in the same process
+```
+
+With `LlamaCpp` (0.2.0) the model is a GGUF file loaded in the agent's own process: no model
+server and no HTTP, and the only connection the loop opens is PostgreSQL's.
+
+Measured with gate 0.4.0 and a model served by llama.cpp (not 0.2.0's in-process model), on a
+[CPU-only CI run](https://github.com/Manuelreyesbravo/agent-gate-demo/actions/runs/41184106078)
+anyone can re-run: with the same gate behind both, the agent without MCP used 5x fewer prompt
+tokens than through MCP (24k vs 126k for 13 tasks) and finished each task 13x faster: a median
+of 14 s against 185 s. Through a popular Postgres MCP server, 4 of 7 trap tasks broke out;
+with the database deciding, 0 of 7. Every figure is tied to its raw data in
+[pg-evidence](https://github.com/Manuelreyesbravo/pg-evidence).
 
 ## For a client that only speaks MCP: a shim with no power
 
