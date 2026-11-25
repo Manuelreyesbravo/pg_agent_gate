@@ -1,9 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.4.4 -- 2026-11-25
 
-No change to the extension's code or SQL: a build of this is 0.4.3. From the package review of
-0.4.3 (2026-11-11):
+No change to the extension's code or SQL: the library is 0.4.3's (`cargo fmt` aside), and
+`ALTER EXTENSION pg_agent_gate UPDATE` moves the version and nothing else. Tested on is
+restated for PostgreSQL 19.0, released on 2026-11-19: the CI of 2026-11-23 ran `make verify` on
+18.7 and 19.0: 592 checks passed (579 of the suites and the 13 pgrx unit tests) and 0 failed on
+each, one case not run (a case of `audit7.sh` needs pgvector, which the CI container does not
+have). From the
+package review of 0.4.3 (2026-11-11):
 
 * Setup runs `cargo pgrx init` before `cargo pgrx install` (without it the install fails on a
   clean machine); META.json recommends pg_living_assertions 0.5.6.

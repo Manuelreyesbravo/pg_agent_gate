@@ -139,16 +139,19 @@ make clean-machine                           # the same, in a fresh container th
 | `audit9.sh` | a volatile function in a DBA's column `DEFAULT`, an `UPDATE` that moves rows between partitions, a pool's `DISCARD ALL` (0.4.3) | 44 |
 | pgrx unit tests | the verbs, from inside the server | 13 |
 
-For 0.4.3, the suites above: **580 checks passed, 0 failed** on PostgreSQL 18.6 with its
-contrib modules and pgvector, and **578 passed, 0 failed** on 19 (19beta2, and again 19rc1 on
-2026-11-12), whose builds had no pgcrypto for two of `audit9.sh`'s checks; `make verify` adds
-the 13 pgrx unit tests, which pass on both. A case whose module is missing does not run, and
-`make verify` says so in its summary ("N passed, 0 failed, M skipped"). The fresh Debian
-container receiving only what git has committed runs the same suites, with 18 and the newest
-19 from PGDG (19rc1 as of 2026-11-12). CI runs the same container for 18 and 19 on every push.
+For 0.4.4, whose code is 0.4.3's, the CI of 2026-11-23
+([run 45242582748](https://github.com/Manuelreyesbravo/pg_agent_gate/actions/runs/45242582748)):
+**592 checks passed, 0 failed** on PostgreSQL 18.7 and on 19.0, the first release of 19: 579
+of the suites above and the 13 pgrx unit tests, with one case not run on each (a case of
+`audit7.sh` needs pgvector, which the CI container does not have). A case whose module is missing does not run,
+and `make verify` says so in its summary ("N passed, 0 failed, M skipped"). That CI is a fresh
+Debian container receiving only what git has committed, with 18 and 19 from PGDG; it runs on
+every push and every Monday. Before that, 0.4.3 was measured locally: 580 passed, 0 failed on
+18.6 with its contrib modules and pgvector, and 578 on 19beta2 and again 19rc1 (2026-11-12),
+whose builds had no pgcrypto for two of `audit9.sh`'s checks.
 `VERIFY_DRIVERS=1` adds real pgjdbc and node-pg sessions.
 
-Those 580 are the hand-written suites above. The amplification class that `0.2.2` and `0.2.3`
+Those are the hand-written suites above. The amplification class that `0.2.2` and `0.2.3`
 closed -- a writing CTE, a cascading foreign key, a trigger, a rule, an opaque (volatile or
 `SECURITY DEFINER`) function, and the commit-time row-count backstop and per-agent allow-list
 that back them -- is guarded by **`make fuzz`**, not by `make verify`. Its teeth build each of
@@ -449,7 +452,7 @@ first verb ran: those writes are not the gate's to relax.
 
 PostgreSQL **18 or later** (`dry_run` uses `RETURNING old/new`). Built with
 [pgrx](https://github.com/pgcentralfoundation/pgrx) 0.19.2; the test suite
-passes on 18 and 19 (tested on 18.6 and 19rc1). `Cargo.lock` is committed, so a build
+passes on 18 and 19 (tested on 18.7 and 19.0). `Cargo.lock` is committed, so a build
 from a tag uses the crates its suites ran against.
 
 ```sh
@@ -634,7 +637,7 @@ declared before the code that it measures.
 
 Those counts are the ones measured then. The cases behind every row are in
 `tests/adversarial.sh` and `tests/hostile.sh`, which `make verify` runs: on
-2026-11-12 they passed in full on 18.6 and 19rc1, for 0.4.3 plus this README.
+2026-11-23 they passed in full in the CI on 18.7 and 19.0, for the code of 0.4.3 and 0.4.4.
 
 **Two of those rows found real defects, which is why they exist.** `TRUNCATE`
 emptied the whole record: the append-only triggers were `FOR EACH ROW`, and

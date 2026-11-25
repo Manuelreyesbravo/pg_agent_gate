@@ -1,0 +1,6 @@
+-- 0.4.3 -> 0.4.4
+--
+-- No change to the extension's code or SQL: no object changes and the library is 0.4.3's
+-- (cargo fmt aside). 0.4.4 carries the package review of 0.4.3 (setup, test harness,
+-- Cargo.lock) and a README restated for PostgreSQL 19.0; see CHANGELOG.md. This script
+-- exists so that the version the catalog reports is the version installed.
